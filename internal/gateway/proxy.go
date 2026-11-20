@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -132,7 +134,7 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		w.Header().Set("Retry-After", "2")
-		http.Error(w, fmt.Sprintf(`{"error":"sandbox wakeup failed: %s"}`, err.Error()), http.StatusServiceUnavailable)
+		writeUpstreamError(w, r, http.StatusServiceUnavailable, "sandbox_unavailable", "sandbox is temporarily unavailable", err)
 		return
 	}
 
@@ -163,11 +165,18 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		Transport: g.transport,
-		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, pErr error) {
-			http.Error(rw, fmt.Sprintf(`{"error":"upstream sandbox unreachable: %v"}`, pErr), http.StatusBadGateway)
+		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, pErr error) {
+			writeUpstreamError(rw, req, http.StatusBadGateway, "sandbox_unreachable", "sandbox could not be reached", pErr)
 		},
 	}
 	proxy.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func writeUpstreamError(w http.ResponseWriter, r *http.Request, statusCode int, code, message string, err error) {
+	log.Printf("sandbox proxy failed trace_id=%q status=%d code=%s detail=%q", telemetry.TraceIDFromContext(r.Context()), statusCode, code, err)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(map[string]string{"code": code, "error": message})
 }
 
 // Stop forwarding a long-lived stream if its gateway loses the admission lease.
