@@ -329,6 +329,7 @@ func (r *CarrierPoolReplenisher) createDirectBoundPod(ctx context.Context, nodeI
 	pod := newCarrierPod(r.cfg.Namespace, r.cfg.CarrierImage, nodeID, tier)
 	if life != "" {
 		pod.Labels[protocol.LabelColdLifecycle] = life
+		pod.Labels[protocol.LabelColdNetworkOnly] = "true"
 		// Keep this request's capacity out of the shared idle pool while it waits.
 		if err := r.catalog.ExpectColdCarrier(ctx, life, "slot-"+pod.Name, 45*time.Second); err != nil {
 			retErr = err

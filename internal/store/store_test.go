@@ -239,7 +239,7 @@ func TestColdCarrierGoesToWaitingLifecycle(t *testing.T) {
 		if err := cat.ExpectColdCarrier(ctx, life, slot.SlotID, time.Minute); err != nil {
 			t.Fatal(err)
 		}
-		if err := cat.RegisterColdCarrier(ctx, slot, life); err != nil {
+		if _, err := cat.RegisterColdCarrier(ctx, slot, life); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := cat.ReserveIdleSlot(ctx, slot.NodeID, slot.Tier, "other-"+life, false); !errors.Is(err, store.ErrNoIdleCarrierSlot) {
@@ -252,7 +252,7 @@ func TestColdCarrierGoesToWaitingLifecycle(t *testing.T) {
 		if err := cat.FinishReservation(ctx, life, false); err != nil {
 			t.Fatal(err)
 		}
-		if err := cat.RegisterColdCarrier(ctx, slot, life); err != nil {
+		if _, err := cat.RegisterColdCarrier(ctx, slot, life); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := cat.ClaimIdleSlot(ctx, slot.NodeID, slot.Tier); !errors.Is(err, store.ErrNoIdleCarrierSlot) {
@@ -267,12 +267,35 @@ func TestColdCarrierGoesToWaitingLifecycle(t *testing.T) {
 		if err := cat.FinishReservation(ctx, cancelled, true); err != nil {
 			t.Fatal(err)
 		}
-		if err := cat.RegisterColdCarrier(ctx, slot, cancelled); err != nil {
+		if _, err := cat.RegisterColdCarrier(ctx, slot, cancelled); err != nil {
 			t.Fatal(err)
 		}
 		shared, err := cat.ClaimIdleSlot(ctx, slot.NodeID, slot.Tier)
 		if err != nil || *shared != slot {
 			t.Fatalf("late registration did not return to the shared pool: %+v %v", shared, err)
+		}
+
+		early := "network-" + life
+		slot.SlotID = "slot-" + early
+		slot.NetworkReadyOnly = true
+		if published, err := cat.RegisterColdCarrier(ctx, slot, early); err != nil || published {
+			t.Fatalf("published a network-only Carrier without a matching expectation: %t %v", published, err)
+		}
+		if err := cat.ExpectColdCarrier(ctx, early, slot.SlotID, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if published, err := cat.RegisterColdCarrier(ctx, slot, early); err != nil || !published {
+			t.Fatalf("did not reserve the expected network-only Carrier: %t %v", published, err)
+		}
+		if err := cat.FinishReservation(ctx, early, true); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cat.ClaimIdleSlot(ctx, slot.NodeID, slot.Tier); !errors.Is(err, store.ErrNoIdleCarrierSlot) {
+			t.Fatalf("cancellation exposed a network-only Carrier to the shared pool: %v", err)
+		}
+		slot.NetworkReadyOnly = false
+		if published, err := cat.RegisterColdCarrier(ctx, slot, early); err != nil || !published {
+			t.Fatalf("the completed placeholder could not be discovered after cancellation: %t %v", published, err)
 		}
 	}
 	t.Run("memory", func(t *testing.T) { check(t, store.NewMemoryRuntimeCatalog()) })

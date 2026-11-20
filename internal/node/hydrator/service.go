@@ -116,12 +116,12 @@ func (s *Service) ActiveCount() int {
 	return len(s.activeSlots)
 }
 
-func (s *Service) PrepareCheckpoint(ctx context.Context, req *protocol.PrepareCheckpointRequest) (*protocol.PrepareCheckpointResponse, error) {
-	_, span := telemetry.StartSpan(ctx, "kontinued", "hydrator.prepare_checkpoint",
+func (s *Service) PrepareCheckpoint(ctx context.Context, req *protocol.PrepareCheckpointRequest) (_ *protocol.PrepareCheckpointResponse, retErr error) {
+	ctx, span := telemetry.StartSpan(ctx, "kontinued", "hydrator.prepare_checkpoint",
 		attribute.String(telemetry.AttrSandboxID, req.SandboxID),
 		attribute.String(telemetry.AttrSnapshotID, req.TargetSnapshotID),
 	)
-	defer telemetry.EndSpan(span, nil)
+	defer func() { telemetry.EndSpan(span, retErr) }()
 
 	s.mu.Lock()
 	st := s.activeSlots[req.SlotID]
@@ -132,12 +132,80 @@ func (s *Service) PrepareCheckpoint(ctx context.Context, req *protocol.PrepareCh
 	st.releaseMu.Lock()
 	defer st.releaseMu.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.byContainer[st.ContainerID] != st || st.Phase != activeExecution || st.SandboxID != req.SandboxID || (req.ExecutionID != 0 && req.ExecutionID != st.ExecutionID) || (req.LifecycleID != "" && req.LifecycleID != st.LifecycleID) {
+	current := s.byContainer[st.ContainerID] == st
+	s.mu.Unlock()
+	if !current || st.Phase != activeExecution || st.SandboxID != req.SandboxID || (req.ExecutionID != 0 && req.ExecutionID != st.ExecutionID) || (req.LifecycleID != "" && req.LifecycleID != st.LifecycleID) {
 		return nil, store.ErrStaleExecutionFence
 	}
+	if st.Slot.NetworkReadyOnly {
+		if err := s.bindCheckpointPlaceholder(ctx, st); err != nil {
+			return nil, err
+		}
+	}
+	s.mu.Lock()
 	s.pendingCkpt[st.ContainerID] = req
+	s.mu.Unlock()
 	return &protocol.PrepareCheckpointResponse{Accepted: true}, nil
+}
+
+// The standalone guest can serve on a confirmed Pod network before kubelet
+// starts its placeholder. A native checkpoint needs the real CRI container ID.
+func (s *Service) bindCheckpointPlaceholder(ctx context.Context, st *activeSlotState) error {
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	slot := st.Slot
+	if err := s.confirmCarrier(ctx, slot); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		list, err := s.cfg.Carriers.ListContainers(ctx, &runtimeapi.ListContainersRequest{
+			Filter: &runtimeapi.ContainerFilter{
+				PodSandboxId: slot.PodSandboxID,
+				State:        &runtimeapi.ContainerStateValue{State: runtimeapi.ContainerState_CONTAINER_RUNNING},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		for _, container := range list.GetContainers() {
+			if container.GetMetadata().GetName() != protocol.ContainerNameSandbox ||
+				container.PodSandboxId != slot.PodSandboxID || container.Labels[protocol.K8sLabelPodUID] != slot.PodUID {
+				continue
+			}
+			resp, err := s.cfg.Carriers.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: container.Id})
+			if err != nil {
+				return err
+			}
+			criStatus := resp.GetStatus()
+			if criStatus == nil || criStatus.State != runtimeapi.ContainerState_CONTAINER_RUNNING {
+				continue
+			}
+			slot.PlaceholderID = container.Id
+			slot.ExpectedContainerHash = container.Labels[protocol.K8sLabelContainerHash]
+			slot.LogPath = criStatus.LogPath
+			slot.NetworkReadyOnly = false
+			next := st.ownership
+			next.Slot = slot
+			if err := s.mapSlot(ctx, &activeSlotState{ownership: next}); err != nil {
+				return err
+			}
+			if err := s.journal.write(next, false); err != nil {
+				return err
+			}
+			// Readers of the slot identity either hold releaseMu or s.mu.
+			s.mu.Lock()
+			st.Slot = slot
+			s.mu.Unlock()
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for checkpoint placeholder: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // ExecuteCheckpoint is invoked by kontinue-cri-shim when Kubelet's native POST /checkpoint/{ns}/{pod}/{ctr} arrives.
@@ -300,6 +368,14 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 
 	if req.Slot.SlotID == "" || req.SandboxID == "" || req.ExecutionID <= 0 {
 		return nil, fmt.Errorf("hydrate requires slot, sandbox and execution IDs")
+	}
+	if req.Slot.NetworkReadyOnly {
+		if _, ok := s.cfg.Driver.(*GVisorSandboxDriver); !ok || s.cfg.Carriers == nil {
+			return nil, status.Error(codes.FailedPrecondition, "network-only Carrier requires the standalone driver and CRI")
+		}
+		if err := s.confirmCarrier(ctx, req.Slot); err != nil {
+			return nil, fmt.Errorf("confirm cold Carrier network: %w", err)
+		}
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -591,6 +667,8 @@ func (s *Service) GetLatestSnapshotResult(_ context.Context, req *protocol.GetLa
 
 func (s *Service) SetCarrierWatcher(w *CarrierPodWatcher) {
 	w.cfg.IsClaimed = func(slotID string) bool { s.mu.Lock(); defer s.mu.Unlock(); return s.activeSlots[slotID] != nil }
+	_, standalone := s.cfg.Driver.(*GVisorSandboxDriver)
+	w.cfg.ColdNetworkOnly = standalone && s.cfg.Carriers != nil
 	s.cfg.CarrierWatcher = w
 }
 
@@ -619,7 +697,7 @@ func (s *Service) waitAndHeldInit(ctx context.Context, ktdEndpoint, bootstrapTok
 }
 
 func (s *Service) mapSlot(ctx context.Context, st *activeSlotState) error {
-	if s.cfg.ShimAdminURL == "" {
+	if s.cfg.ShimAdminURL == "" || st.Slot.NetworkReadyOnly {
 		return nil
 	}
 	slot := st.Slot

@@ -112,13 +112,15 @@ if ARGV[3]~="" and redis.call("GET",KEYS[4])==ARGV[2] and redis.call("EXISTS",KE
     redis.call("SET",KEYS[5],cjson.encode({slot=cjson.decode(ARGV[1]),cold=true}))
     return 1
 end
+if ARGV[4]=="1" then return 0 end
 redis.call("SET",KEYS[2],ARGV[1],"EX",86400)
 redis.call("SADD",KEYS[3],ARGV[2])
 return 1
 `)
 
 func (c *RedisRuntimeCatalog) RegisterIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error {
-	return c.RegisterColdCarrier(ctx, slot, "")
+	_, err := c.RegisterColdCarrier(ctx, slot, "")
+	return err
 }
 
 func (c *RedisRuntimeCatalog) ExpectColdCarrier(ctx context.Context, life, slotID string, ttl time.Duration) error {
@@ -133,16 +135,17 @@ func (c *RedisRuntimeCatalog) ExpectedColdCarrier(ctx context.Context, life stri
 	return slot, err
 }
 
-func (c *RedisRuntimeCatalog) RegisterColdCarrier(ctx context.Context, slot protocol.CarrierSlot, life string) error {
+func (c *RedisRuntimeCatalog) RegisterColdCarrier(ctx context.Context, slot protocol.CarrierSlot, life string) (bool, error) {
 	if slot.Tier == "" {
 		slot.Tier = protocol.DefaultCarrierTier
 	}
 	raw, err := json.Marshal(slot)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return luaRegisterIdleSlot.Run(ctx, c.rdb, []string{"kt:carrier:used:" + slot.SlotID, protocol.CarrierMetaKey(slot.SlotID),
-		protocol.IdlePoolKey(slot.NodeID, slot.Tier), "kt:cold:expected:" + life, "kt:placement:" + life}, raw, slot.SlotID, life).Err()
+	result, err := luaRegisterIdleSlot.Run(ctx, c.rdb, []string{"kt:carrier:used:" + slot.SlotID, protocol.CarrierMetaKey(slot.SlotID),
+		protocol.IdlePoolKey(slot.NodeID, slot.Tier), "kt:cold:expected:" + life, "kt:placement:" + life}, raw, slot.SlotID, life, slot.NetworkReadyOnly).Int()
+	return result == 1, err
 }
 
 func (c *RedisRuntimeCatalog) RemoveIdleSlot(ctx context.Context, nodeID, tier, slotID string) error {
@@ -191,8 +194,10 @@ if ARGV[2]=="1" then
     local used="kt:carrier:used:"..slot.slotId
     if redis.call("GET",used)==ARGV[1] then
         redis.call("DEL",used)
-        redis.call("SET",ARGV[3]..slot.slotId,cjson.encode(slot),"EX",86400)
-        redis.call("SADD",ARGV[4]..slot.nodeId..":"..slot.tier,slot.slotId)
+        if not slot.networkReadyOnly then
+            redis.call("SET",ARGV[3]..slot.slotId,cjson.encode(slot),"EX",86400)
+            redis.call("SADD",ARGV[4]..slot.nodeId..":"..slot.tier,slot.slotId)
+        end
     end
 end
 redis.call("DEL",KEYS[1])

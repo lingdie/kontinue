@@ -17,11 +17,12 @@ import (
 )
 
 type WatcherConfig struct {
-	IsClaimed    func(string) bool
-	NodeID       string
-	NodeIP       string
-	NodeGRPCAddr string
-	PollInterval time.Duration
+	IsClaimed       func(string) bool
+	NodeID          string
+	NodeIP          string
+	NodeGRPCAddr    string
+	PollInterval    time.Duration
+	ColdNetworkOnly bool
 }
 
 // CarrierPodWatcher discovers ready Carrier Pods on the local worker node via containerd CRI,
@@ -171,6 +172,42 @@ func (w *CarrierPodWatcher) registerCarrier(ctx context.Context, sb *runtimeapi.
 	if netnsPath == "" {
 		return
 	}
+	tier := sb.Labels[protocol.LabelCarrierTier]
+	if tier == "" {
+		tier = protocol.DefaultCarrierTier
+	}
+	slot := protocol.CarrierSlot{
+		SlotID:       "slot-" + sb.Metadata.Name,
+		NodeID:       w.cfg.NodeID,
+		NodeIP:       w.cfg.NodeIP,
+		NodeGRPCAddr: w.cfg.NodeGRPCAddr,
+		Tier:         tier,
+		PodNamespace: sb.Metadata.Namespace,
+		PodName:      sb.Metadata.Name,
+		PodUID:       sb.Metadata.Uid,
+		PodIP:        podIP,
+		PodSandboxID: sb.Id,
+		NetNSPath:    netnsPath,
+	}
+	life := sb.Labels[protocol.LabelColdLifecycle]
+	if w.cfg.ColdNetworkOnly && life != "" && sb.Labels[protocol.LabelColdNetworkOnly] == "true" &&
+		stResp.Status.State == runtimeapi.PodSandboxState_SANDBOX_READY &&
+		stResp.Status.Id == sb.Id && stResp.Status.GetMetadata().GetUid() == slot.PodUID {
+		expected, err := w.catalog.ExpectedColdCarrier(ctx, life)
+		if err != nil {
+			return
+		}
+		if expected == slot.SlotID {
+			slot.NetworkReadyOnly = true
+			if published, err := w.catalog.RegisterColdCarrier(ctx, slot, life); err == nil && published {
+				log.Printf("kontinued registered idle Carrier Slot %s (pod=%s/%s uid=%s networkOnly=true)",
+					slot.SlotID, slot.PodNamespace, slot.PodName, slot.PodUID)
+			}
+			// Keep it discoverable. If the reservation is cancelled before
+			// activation, the fully started Pod can later join the idle pool.
+			return
+		}
+	}
 	// Never register a Carrier Pod into the idle pool if a live ktd sandbox is already listening on :49983!
 	if conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", podIP, protocol.DefaultKtdPort), 40*time.Millisecond); dialErr == nil {
 		_ = conn.Close()
@@ -205,28 +242,10 @@ func (w *CarrierPodWatcher) registerCarrier(ctx context.Context, sb *runtimeapi.
 		logPath = cSt.Status.LogPath
 	}
 
-	tier := sb.Labels[protocol.LabelCarrierTier]
-	if tier == "" {
-		tier = protocol.DefaultCarrierTier
-	}
-	slot := protocol.CarrierSlot{
-		SlotID:                "slot-" + sb.Metadata.Name,
-		NodeID:                w.cfg.NodeID,
-		NodeIP:                w.cfg.NodeIP,
-		NodeGRPCAddr:          w.cfg.NodeGRPCAddr,
-		Tier:                  tier,
-		PodNamespace:          sb.Metadata.Namespace,
-		PodName:               sb.Metadata.Name,
-		PodUID:                sb.Metadata.Uid,
-		PodIP:                 podIP,
-		PodSandboxID:          sb.Id,
-		NetNSPath:             netnsPath,
-		PlaceholderID:         placeholder.Id,
-		ExpectedContainerHash: placeholder.Labels[protocol.K8sLabelContainerHash],
-		LogPath:               logPath,
-	}
-
-	if err := w.catalog.RegisterColdCarrier(ctx, slot, sb.Labels[protocol.LabelColdLifecycle]); err == nil {
+	slot.PlaceholderID = placeholder.Id
+	slot.ExpectedContainerHash = placeholder.Labels[protocol.K8sLabelContainerHash]
+	slot.LogPath = logPath
+	if published, err := w.catalog.RegisterColdCarrier(ctx, slot, life); err == nil && published {
 		w.mu.Lock()
 		w.seen[sb.Id] = slot
 		w.mu.Unlock()

@@ -39,6 +39,7 @@ const (
 	LabelRole            = "kontinue.sh/role"
 	LabelCarrierTier     = "kontinue.sh/tier"
 	LabelColdLifecycle   = "kontinue.sh/cold-lifecycle"
+	LabelColdNetworkOnly = "kontinue.sh/cold-network-only"
 	LabelCPUProfile      = "kontinue.sh/cpu-profile"
 	LabelMemoryCkptReady = "kontinue.sh/memory-ckpt-ready"
 

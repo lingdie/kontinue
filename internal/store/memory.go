@@ -420,7 +420,8 @@ func NewMemoryRuntimeCatalog() *MemoryRuntimeCatalog {
 }
 
 func (c *MemoryRuntimeCatalog) RegisterIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error {
-	return c.RegisterColdCarrier(ctx, slot, "")
+	_, err := c.RegisterColdCarrier(ctx, slot, "")
+	return err
 }
 
 func (c *MemoryRuntimeCatalog) ExpectColdCarrier(_ context.Context, life, slotID string, ttl time.Duration) error {
@@ -446,7 +447,7 @@ func (c *MemoryRuntimeCatalog) ExpectedColdCarrier(_ context.Context, life strin
 	return "", nil
 }
 
-func (c *MemoryRuntimeCatalog) RegisterColdCarrier(_ context.Context, slot protocol.CarrierSlot, life string) error {
+func (c *MemoryRuntimeCatalog) RegisterColdCarrier(_ context.Context, slot protocol.CarrierSlot, life string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if slot.Tier == "" {
@@ -454,7 +455,7 @@ func (c *MemoryRuntimeCatalog) RegisterColdCarrier(_ context.Context, slot proto
 	}
 	k := protocol.IdlePoolKey(slot.NodeID, slot.Tier)
 	if _, used := c.usedSlots[slot.SlotID]; used {
-		return nil
+		return false, nil
 	}
 	expected := c.expectedCold[life]
 	if _, reserved := c.reservations[life]; life != "" && expected.slotID == slot.SlotID && time.Now().Before(expected.expires) && !reserved {
@@ -467,16 +468,19 @@ func (c *MemoryRuntimeCatalog) RegisterColdCarrier(_ context.Context, slot proto
 				break
 			}
 		}
-		return nil
+		return true, nil
+	}
+	if slot.NetworkReadyOnly {
+		return false, nil
 	}
 	for i, prior := range c.idlePools[k] {
 		if prior.SlotID == slot.SlotID {
 			c.idlePools[k][i] = slot
-			return nil
+			return true, nil
 		}
 	}
 	c.idlePools[k] = append(c.idlePools[k], slot)
-	return nil
+	return true, nil
 }
 
 func (c *MemoryRuntimeCatalog) RemoveIdleSlot(_ context.Context, nodeID, tier, slotID string) error {
@@ -512,8 +516,10 @@ func (c *MemoryRuntimeCatalog) FinishReservation(_ context.Context, life string,
 	r, ok := c.reservations[life]
 	if ok && returnUnused && c.usedSlots[r.Slot.SlotID] == life {
 		delete(c.usedSlots, r.Slot.SlotID)
-		k := protocol.IdlePoolKey(r.Slot.NodeID, r.Slot.Tier)
-		c.idlePools[k] = append(c.idlePools[k], r.Slot)
+		if !r.Slot.NetworkReadyOnly {
+			k := protocol.IdlePoolKey(r.Slot.NodeID, r.Slot.Tier)
+			c.idlePools[k] = append(c.idlePools[k], r.Slot)
+		}
 	}
 	delete(c.reservations, life)
 	return nil

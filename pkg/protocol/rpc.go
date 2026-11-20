@@ -37,6 +37,7 @@ type CarrierSlot struct {
 	PlaceholderID         string `json:"placeholderContainerId"`
 	ExpectedContainerHash string `json:"expectedContainerHash"`
 	LogPath               string `json:"logPath,omitempty"`
+	NetworkReadyOnly      bool   `json:"networkReadyOnly,omitempty"`
 }
 
 // RouteRecord is stored at kt:route:{sandbox_id} in Redis, guarded by Lua ExecutionID fencing.
