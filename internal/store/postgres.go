@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
+	"github.com/kontinue-sh/kontinue/pkg/telemetry"
 )
 
 const schemaDDL = `
@@ -120,7 +121,9 @@ func advisoryKey(name string) int64 {
 // TryLeader holds a session-scoped pg_try_advisory_lock on a dedicated connection
 // so multi-replica apiservers do not double-run replenish / eviction sweeps.
 func (s *PostgresMetadataStore) TryLeader(ctx context.Context, name string) (func(), bool, error) {
-	conn, err := s.locks.Acquire(ctx)
+	acquireCtx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "postgres.acquire_advisory_connection")
+	conn, err := s.locks.Acquire(acquireCtx)
+	telemetry.EndSpan(span, err)
 	if err != nil {
 		return nil, false, err
 	}

@@ -305,15 +305,15 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (_
 	)
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
-	unlock, err := s.lockExecution(ctx, req.SandboxID)
+	lock, err := s.lockActivation(ctx, req.SandboxID)
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	defer lock.close()
 	if existing, err := s.cfg.Meta.GetSandbox(ctx, req.SandboxID); err == nil {
 		if createKey != "" && existing.CreateKey == createKey && existing.CreateRequestHash == requestHash && visible(ctx, existing.TenantID) {
 			if existing.State == store.SandboxStateCreating {
-				return s.advanceActivation(ctx, existing)
+				return s.advanceActivation(ctx, existing, lock)
 			}
 			return existing, nil
 		}
@@ -365,7 +365,7 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (_
 	if err := s.cfg.Meta.CreateSandbox(ctx, sbx); err != nil {
 		return nil, err
 	}
-	return s.advanceActivation(ctx, sbx)
+	return s.advanceActivation(ctx, sbx, lock)
 }
 
 // A session-scoped lock covers checkpoint, upload and commit, regardless of their duration.
@@ -593,12 +593,12 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
-	unlock, err := s.lockExecution(ctx, sandboxID)
+	lock, err := s.lockActivation(ctx, sandboxID)
 	if err != nil {
 		retErr = err
 		return nil, err
 	}
-	defer unlock()
+	defer lock.close()
 
 	sbx, err := s.sandbox(ctx, sandboxID)
 	if err != nil {
@@ -630,7 +630,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 	}
 
 	if sbx.State == store.SandboxStateCreating || sbx.State == store.SandboxStateResuming {
-		return s.advanceActivation(ctx, sbx)
+		return s.advanceActivation(ctx, sbx, lock)
 	}
 	if sbx.State != store.SandboxStateSuspended || sbx.PendingFork != nil {
 		return nil, store.ErrTransitionLocked
@@ -645,7 +645,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 	if err := s.cfg.Meta.SaveSandbox(ctx, sbx); err != nil {
 		return nil, err
 	}
-	return s.advanceActivation(ctx, sbx)
+	return s.advanceActivation(ctx, sbx, lock)
 }
 
 func (s *Server) routeForExecution(ctx context.Context, sbx *store.SandboxRecord) (*protocol.RouteRecord, error) {

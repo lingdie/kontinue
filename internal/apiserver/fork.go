@@ -30,11 +30,11 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceID string, req ForkSandb
 	var workers errgroup.Group
 	for i, id := range receipt.ChildIDs {
 		workers.Go(func() error {
-			unlock, err := s.lockExecution(ctx, id)
+			lock, err := s.lockActivation(ctx, id)
 			if err != nil {
 				return err
 			}
-			defer unlock()
+			defer lock.close()
 			child, err := s.sandbox(ctx, id)
 			if err != nil {
 				return err
@@ -44,7 +44,7 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceID string, req ForkSandb
 				return store.ErrStaleExecutionFence
 			}
 			if child.State == store.SandboxStateCreating {
-				child, err = s.advanceActivation(ctx, child)
+				child, err = s.advanceActivation(ctx, child, lock)
 				if err != nil {
 					return err
 				}

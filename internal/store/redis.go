@@ -125,6 +125,14 @@ func (c *RedisRuntimeCatalog) ExpectColdCarrier(ctx context.Context, life, slotI
 	return c.rdb.Set(ctx, "kt:cold:expected:"+life, slotID, ttl).Err()
 }
 
+func (c *RedisRuntimeCatalog) ExpectedColdCarrier(ctx context.Context, life string) (string, error) {
+	slot, err := c.rdb.Get(ctx, "kt:cold:expected:"+life).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	return slot, err
+}
+
 func (c *RedisRuntimeCatalog) RegisterColdCarrier(ctx context.Context, slot protocol.CarrierSlot, life string) error {
 	if slot.Tier == "" {
 		slot.Tier = protocol.DefaultCarrierTier

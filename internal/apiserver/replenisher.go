@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/kontinue-sh/kontinue/pkg/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -174,7 +176,30 @@ func (r *CarrierPoolReplenisher) reconcilePoolWatermarks(ctx context.Context) {
 	wg.Wait()
 }
 
-func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, node protocol.NodeHeartbeat, tier, lifecycleID string) (*store.SlotReservation, error) {
+func (r *CarrierPoolReplenisher) PendingColdNode(ctx context.Context, tier, life string) (string, error) {
+	if r.kube == nil || life == "" {
+		return "", nil
+	}
+	slot, err := r.catalog.ExpectedColdCarrier(ctx, life)
+	if err != nil || slot == "" {
+		return "", err
+	}
+	pod, err := r.kube.CoreV1().Pods(r.cfg.Namespace).Get(ctx, strings.TrimPrefix(slot, "slot-"), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if pod.Labels[protocol.LabelRole] != protocol.RoleCarrierPod || pod.Labels[protocol.LabelColdLifecycle] != life ||
+		pod.Labels[protocol.LabelCarrierTier] != tier || pod.DeletionTimestamp != nil ||
+		pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+		return "", nil
+	}
+	return pod.Spec.NodeName, nil
+}
+
+func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, node protocol.NodeHeartbeat, tier, lifecycleID string, pending bool, wait coldCarrierWait) (*store.SlotReservation, error) {
 	if r.kube == nil {
 		return nil, store.ErrNoIdleCarrierSlot
 	}
@@ -185,29 +210,54 @@ func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, no
 	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
-	toCreate := 1 + r.cfg.ColdBurstExtra
-	var createWG sync.WaitGroup
-	errs := make([]error, toCreate)
-	for i := 0; i < toCreate; i++ {
-		createWG.Add(1)
-		go func(idx int) {
-			defer createWG.Done()
-			life := ""
-			if idx == 0 {
-				life = lifecycleID
-			}
-			_, err := r.createDirectBoundPod(ctx, node.NodeID, tier, life)
-			errs[idx] = err
-		}(i)
-	}
-	createWG.Wait()
-	if errs[0] != nil {
-		retErr = errs[0]
-		return nil, retErr
+	if !pending {
+		toCreate := 1 + r.cfg.ColdBurstExtra
+		var createWG sync.WaitGroup
+		errs := make([]error, toCreate)
+		for i := range toCreate {
+			createWG.Go(func() {
+				life := ""
+				if i == 0 {
+					life = lifecycleID
+				}
+				_, errs[i] = r.createDirectBoundPod(ctx, node.NodeID, tier, life)
+			})
+		}
+		createWG.Wait()
+		if errs[0] != nil {
+			retErr = errs[0]
+			return nil, retErr
+		}
 	}
 
 	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	if wait != nil {
+		for {
+			if err := wait(waitCtx, func(ctx context.Context) error {
+				return r.waitForCarrier(ctx, node.NodeID, tier, lifecycleID)
+			}); err != nil {
+				retErr = err
+				return nil, err
+			}
+			slot, err := r.catalog.ReserveIdleSlot(waitCtx, node.NodeID, tier, lifecycleID, true)
+			if !errors.Is(err, store.ErrNoIdleCarrierSlot) {
+				retErr = err
+				return slot, err
+			}
+			// A shared idle slot may have been taken while we re-acquired
+			// the lock. Rejoin the original wait while the Pod is expected.
+			expected, err := r.catalog.ExpectedColdCarrier(waitCtx, lifecycleID)
+			if err != nil {
+				retErr = err
+				return nil, err
+			}
+			if expected == "" {
+				retErr = store.ErrNoIdleCarrierSlot
+				return nil, retErr
+			}
+		}
+	}
 	waitCtx, waitSpan := telemetry.StartSpan(waitCtx, "kontinue-apiserver", "replenisher.wait_slot_ready",
 		attribute.String(telemetry.AttrNodeID, node.NodeID),
 	)
@@ -228,6 +278,32 @@ func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, no
 		case <-waitCtx.Done():
 			retErr = fmt.Errorf("waiting for a Carrier on %s: %w", node.NodeID, waitCtx.Err())
 			return nil, retErr
+		case <-ticker.C:
+		}
+	}
+}
+
+// Read-only so cancellation or deletion can win while no lifecycle lock is held.
+func (r *CarrierPoolReplenisher) waitForCarrier(ctx context.Context, nodeID, tier, life string) (retErr error) {
+	ctx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "replenisher.wait_slot_ready", attribute.String(telemetry.AttrNodeID, nodeID))
+	defer func() { telemetry.EndSpan(span, retErr) }()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		slot, err := r.catalog.ExpectedColdCarrier(ctx, life)
+		if err != nil || slot == "" {
+			// Discovery consumes the expectation and records the reservation
+			// atomically. Deletion can also clear it.
+			return err
+		}
+		// During a rolling upgrade an older worker can publish to the idle pool.
+		n, err := r.catalog.CountIdleSlots(ctx, nodeID, tier)
+		if err != nil || n > 0 {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-ticker.C:
 		}
 	}

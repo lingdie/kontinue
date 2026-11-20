@@ -436,6 +436,16 @@ func (c *MemoryRuntimeCatalog) ExpectColdCarrier(_ context.Context, life, slotID
 	return nil
 }
 
+func (c *MemoryRuntimeCatalog) ExpectedColdCarrier(_ context.Context, life string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	expected := c.expectedCold[life]
+	if time.Now().Before(expected.expires) {
+		return expected.slotID, nil
+	}
+	return "", nil
+}
+
 func (c *MemoryRuntimeCatalog) RegisterColdCarrier(_ context.Context, slot protocol.CarrierSlot, life string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
