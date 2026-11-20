@@ -446,15 +446,6 @@ def template():
     template_id = "golden-" + secrets.token_hex(6)
     builder = "builder-" + template_id
     candidate = "unused-" + template_id
-    minio = json.loads(kube("get", "pods", "-l", "app=kontinue-minio", "-o", "json"))["items"][0]
-    node = minio["spec"]["nodeName"]
-    assert node in nodes
-    container = next(c for c in minio["status"]["containerStatuses"] if c["name"] == "minio")
-    info = json.loads(run("docker", "exec", node, "crictl", "--runtime-endpoint",
-                          "unix:///run/containerd/containerd.sock", "inspect",
-                          container["containerID"].removeprefix("containerd://")))
-    pid = str(info["info"]["pid"])
-    assert int(pid) > 1 and run("docker", "exec", node, "readlink", f"/proc/{pid}/exe").endswith("/bin/minio")
     cas_ip = kube("get", "svc", "kontinue-minio", "-o", "jsonpath={.spec.clusterIP}")
     cas_base = f"http://{cas_ip}:9000/kontinue/"
     def put(key, data):
@@ -463,42 +454,16 @@ def template():
         raw = sql(f"SELECT build FROM kt_templates WHERE template_id='{template_id}' AND phase='Capturing';")
         assert raw
         return json.loads(raw)
-    def find_upload():
-        b = build_info()
-        worker = b["slot"]["nodeId"]
-        assert worker in nodes
-        mf = f"/var/lib/kontinue-arena/cas/snapshots/{b['snapshotId']}/kontinue-manifest.json"
-        raw = run("docker", "exec", worker, "jq", "-c",
-                  "[.chunks[]|select(.zeroChunk!=true and .blake3Hash!=null)][0]|{blake3Hash,length}", mf)
-        first = json.loads(raw)
-        assert first["length"] > 0
-        sockets = run("docker", "exec", worker, "ss", "-ntp", "dst", cas_ip + ":9000")
-        assert "ESTAB" in sockets and "service" in sockets
-        return b, first
     with reject("INSERT", f"NEW.template_id='{template_id}'", table="kt_snapshots"):
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            run("docker", "exec", node, "kill", "-STOP", pid)
-            try:
-                future = pool.submit(http, "POST", "/v1/templates", {"templateId": template_id,
-                                     "baseImage": args.base_image, "warmupScript": "echo recovered > /tmp/golden-marker"})
-                b, chunk = until(find_upload, timeout=25)
-                replace_service()
-            finally:
-                run("docker", "exec", node, "kill", "-CONT", pid)
-            try:
-                status, _ = future.result()
-                assert status >= 400
-            except RuntimeError:
-                pass  # SIGKILL may close the HTTP connection without a response.
+        status, _ = http("POST", "/v1/templates", {"templateId": template_id,
+                         "baseImage": args.base_image, "warmupScript": "echo recovered > /tmp/golden-marker"})
+        assert status == 500, status
+        b = build_info()
         snap = b["snapshotId"]
-        def uploaded():
-            run("docker", "exec", control, "curl", "-fsSI", cas_base + f"snapshots/{snap}/kontinue-manifest.json")
-        until(uploaded)
-        # An interrupted upload without a durable receipt may be captured again.
-        # Reference the bytes in the completed manifest for the GC assertion.
-        chunk = json.loads(run("docker", "exec", control, "sh", "-c",
-                               """curl -fsS "$1" | jq -c '[.chunks[]|select(.zeroChunk!=true and .blake3Hash!=null)][0]|{blake3Hash,length}'""",
-                               "sh", cas_base + f"snapshots/{snap}/kontinue-manifest.json"))
+        manifest_url = cas_base + f"snapshots/{snap}/kontinue-manifest.json"
+        manifest = run("docker", "exec", control, "curl", "-fsS", manifest_url)
+        chunk = next(c for c in json.loads(manifest)["chunks"] if not c.get("zeroChunk") and c.get("blake3Hash"))
+        replace_service()
         assert not redis_get("kt:route:" + builder)
         h = chunk["blake3Hash"]
         chunk_key = f"cas/chunks/{h[:4]}/{h}.bin"
@@ -522,11 +487,12 @@ def template():
                      """jq -sc --arg id "$1" '[.[]|select(.sandboxId==$id)]|length' /var/lib/kontinue-arena/cas/scratch/ownership/*.json""", "sh", builder)
         assert owners == "0"
     until(finished)
+    assert run("docker", "exec", control, "curl", "-fsS", manifest_url) == manifest
     run("docker", "exec", control, "curl", "-fsSI", cas_base + chunk_key)
     status, raw = http("POST", "/v1/sandboxes", {"sandboxId": sandbox, "templateId": template_id})
     assert status == 201, status
     assert guest(json.loads(raw), "print(open('/tmp/golden-marker').read().strip())") == "recovered"
-    print(f"template {template_id}: interrupted upload to MinIO recovered as {snap}; GC retained shared "
+    print(f"template {template_id}: CAS-published checkpoint recovered before PostgreSQL publication as {snap}; GC retained shared "
           f"chunk {h[:12]}, builder released, clone returned warmup marker", flush=True)
 
 

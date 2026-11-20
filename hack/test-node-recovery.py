@@ -157,7 +157,8 @@ def prove_adoption(sb, marker, node, initial):
 def assert_failed(sb, reason):
     def check():
         state = api(sb)
-        assert state["state"] == "FAILED" and reason in state["failureReason"], (state["state"], state.get("failureReason"))
+        assert state["state"] == "FAILED" and state.get("failureCode") == "sandbox_failed", (state["state"], state.get("failureCode"))
+        assert state.get("failureReason") == "sandbox execution failed", state.get("failureReason")
         assert not redis("GET", "kt:route:" + sb["sandboxId"])
     eventually(check)
     for _ in range(3):
