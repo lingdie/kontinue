@@ -497,6 +497,31 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 	_ = json.NewDecoder(cResp.Body).Decode(&sbx)
 	_ = cResp.Body.Close()
 
+	if sbx.AccessToken == "" || sbx.BootstrapToken != "" || len(sbx.EnvVars) > 0 {
+		t.Fatal("unexpected credentials in create response")
+	}
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		path := apiHTTP.URL + "/v1/sandboxes/" + sbx.SandboxID
+		if method == http.MethodPost {
+			path += "/resume"
+		}
+		check, _ := http.NewRequest(method, path, nil)
+		result, err := httpClient.Do(check)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]json.RawMessage
+		err = json.NewDecoder(result.Body).Decode(&payload)
+		result.Body.Close()
+		if err != nil || result.StatusCode != http.StatusOK || payload["sandboxId"] == nil {
+			t.Fatalf("metadata response: %v, %d", err, result.StatusCode)
+		}
+		for _, key := range []string{"envVars", "accessToken", "bootstrapToken", "pendingPlacement", "pendingFork"} {
+			if _, exists := payload[key]; exists {
+				t.Fatalf("metadata response contains %s", key)
+			}
+		}
+	}
 	if _, err := apiSrvImpl.CreateSandbox(ctx, apiserver.CreateSandboxRequest{SandboxID: sbx.SandboxID}); !errors.Is(err, store.ErrSandboxExists) {
 		t.Fatalf("duplicate create: %v", err)
 	}
@@ -608,6 +633,9 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 	_ = suspResp.Body.Close()
 
 	// Verify 2MiB Blake3 incremental deduplication reused unchanged template chunk!
+	if suspSnap.BootstrapToken != "" {
+		t.Fatal("suspend disclosed the bootstrap credential")
+	}
 	if suspSnap.DirtyChunks != 1 || suspSnap.ReusedChunks != 1 {
 		t.Fatalf("expected incremental Blake3 dedup (1 dirty, 1 reused), got dirty=%d reused=%d", suspSnap.DirtyChunks, suspSnap.ReusedChunks)
 	}

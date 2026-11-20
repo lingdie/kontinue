@@ -132,7 +132,11 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, list)
+		public := make([]templateResponse, 0, len(list))
+		for i := range list {
+			public = append(public, publicTemplate(&list[i]))
+		}
+		writeJSON(w, http.StatusOK, public)
 	case http.MethodPost:
 		var req CreateTemplateRequest
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
@@ -144,7 +148,7 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusCreated, tpl)
+		writeJSON(w, http.StatusCreated, publicTemplate(tpl))
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -161,7 +165,7 @@ func (s *Server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, tpl)
+	writeJSON(w, http.StatusOK, publicTemplate(tpl))
 }
 
 func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -171,6 +175,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 	}
 	idemKey := r.Header.Get(protocol.HeaderIdempotencyKey)
 	if idemKey != "" {
+		idemKey = "create-v2/" + idemKey
 		if code, body, ok, _ := s.cfg.Catalog.GetIdempotency(r.Context(), idemKey); ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(code)
@@ -196,7 +201,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, status, err.Error())
 		return
 	}
-	raw, _ := json.Marshal(redactSandbox(sbx))
+	raw, _ := json.Marshal(issueSandbox(sbx))
 	if idemKey != "" {
 		_ = s.cfg.Catalog.SaveIdempotency(r.Context(), idemKey, http.StatusCreated, raw, 10*time.Minute)
 	}
@@ -226,7 +231,7 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			writeJSON(w, http.StatusOK, redactSandbox(sbx))
+			writeJSON(w, http.StatusOK, publicSandbox(sbx))
 		case http.MethodDelete:
 			if err := s.DeleteSandbox(r.Context(), sandboxID); err != nil {
 				writeErr(w, http.StatusInternalServerError, err.Error())
@@ -254,14 +259,14 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, snap)
+		writeJSON(w, http.StatusOK, publicSnapshot(snap))
 	case "resume":
 		sbx, err := s.ResumeSandbox(r.Context(), sandboxID)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, redactSandbox(sbx))
+		writeJSON(w, http.StatusOK, publicSandbox(sbx))
 	case "fork":
 		var fReq ForkSandboxRequest
 		if r.Body != nil && r.ContentLength != 0 {
@@ -280,10 +285,9 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		pub := make([]*store.SandboxRecord, 0, len(forks))
+		pub := make([]issuedSandbox, 0, len(forks))
 		for _, f := range forks {
-			cp := redactSandbox(f)
-			pub = append(pub, &cp)
+			pub = append(pub, issueSandbox(f))
 		}
 		writeJSON(w, http.StatusCreated, pub)
 	default:
@@ -375,7 +379,10 @@ func (s *Server) BuildGoldenTemplate(ctx context.Context, req CreateTemplateRequ
 			TimeoutMs: 120_000,
 		})
 		if execErr != nil || execOut.ExitCode != 0 {
-			msg := fmt.Sprintf("warmup script failed (err=%v, exit=%v)", execErr, execOut)
+			msg := "warmup command failed"
+			if execOut != nil {
+				msg = fmt.Sprintf("warmup command exited with status %d", execOut.ExitCode)
+			}
 			_ = s.cfg.Meta.UpdateTemplateStatus(ctx, tpl.TemplateID, "Failed", "", msg)
 			retErr = errors.New(msg)
 			return nil, retErr
@@ -1124,18 +1131,6 @@ func randHex(nBytes int) string {
 	b := make([]byte, nBytes)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-func redactSandbox(sbx *store.SandboxRecord) store.SandboxRecord {
-	if sbx == nil {
-		return store.SandboxRecord{}
-	}
-	cp := *sbx
-	cp.PendingPlacement = nil
-	cp.PendingFork = nil
-	cp.ForkOperationID = ""
-	cp.BootstrapToken = ""
-	return cp
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
