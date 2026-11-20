@@ -63,7 +63,10 @@ func (m *MemoryMetadataStore) CreateTemplate(_ context.Context, tpl *TemplateRec
 		tpl.CreatedAt = now
 	}
 	tpl.UpdatedAt = now
-	m.templates[tpl.TemplateID] = *tpl
+	if _, ok := m.templates[tpl.TemplateID]; ok {
+		return ErrTransitionLocked
+	}
+	m.templates[tpl.TemplateID] = cloneTemplate(*tpl)
 	return nil
 }
 
@@ -74,25 +77,39 @@ func (m *MemoryMetadataStore) GetTemplate(_ context.Context, templateID string) 
 	if !ok {
 		return nil, ErrNotFound
 	}
-	cp := t
+	cp := cloneTemplate(t)
 	return &cp, nil
 }
 
-func (m *MemoryMetadataStore) UpdateTemplateStatus(_ context.Context, templateID, phase, goldenSnapshotID, msg string) error {
+func cloneTemplate(t TemplateRecord) TemplateRecord {
+	if t.Build != nil {
+		b := *t.Build
+		t.Build = &b
+	}
+	return t
+}
+
+func (m *MemoryMetadataStore) SaveTemplateBuild(_ context.Context, tpl *TemplateRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	t, ok := m.templates[templateID]
-	if !ok {
+	if _, ok := m.templates[tpl.TemplateID]; !ok {
 		return ErrNotFound
 	}
-	t.Phase = phase
-	if goldenSnapshotID != "" {
-		t.GoldenSnapshotID = goldenSnapshotID
-	}
-	t.StatusMessage = msg
-	t.UpdatedAt = time.Now().UTC()
-	m.templates[templateID] = t
+	tpl.UpdatedAt = time.Now().UTC()
+	m.templates[tpl.TemplateID] = cloneTemplate(*tpl)
 	return nil
+}
+
+func (m *MemoryMetadataStore) ListPendingTemplateIDs(_ context.Context) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var ids []string
+	for _, t := range m.templates {
+		if t.Build != nil {
+			ids = append(ids, t.TemplateID)
+		}
+	}
+	return ids, nil
 }
 
 func (m *MemoryMetadataStore) ListTemplates(_ context.Context) ([]TemplateRecord, error) {
@@ -100,7 +117,7 @@ func (m *MemoryMetadataStore) ListTemplates(_ context.Context) ([]TemplateRecord
 	defer m.mu.RUnlock()
 	out := make([]TemplateRecord, 0, len(m.templates))
 	for _, v := range m.templates {
-		out = append(out, v)
+		out = append(out, cloneTemplate(v))
 	}
 	return out, nil
 }
@@ -173,6 +190,31 @@ func (m *MemoryMetadataStore) ListGCandidateSnapshots(_ context.Context) ([]Snap
 		}
 	}
 	return out, nil
+}
+
+func (m *MemoryMetadataStore) UnpublishedSnapshot(_ context.Context) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, t := range m.templates {
+		if t.Phase == TemplateCapturing && t.Build != nil {
+			if _, ok := m.snapshots[t.Build.SnapshotID]; !ok {
+				return t.Build.SnapshotID, nil
+			}
+		}
+	}
+	for _, sb := range m.sandboxes {
+		if id := sb.PendingSnapshotID; id != "" {
+			if _, ok := m.snapshots[id]; !ok {
+				return id, nil
+			}
+		}
+		if f := sb.PendingFork; f != nil {
+			if _, ok := m.snapshots[f.SnapshotID]; !ok {
+				return f.SnapshotID, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 func (m *MemoryMetadataStore) ListAllSnapshots(_ context.Context) ([]SnapshotRecord, error) {

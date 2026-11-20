@@ -65,6 +65,13 @@ func TestSnapshotGCRetriesWithoutDeletingSharedPages(t *testing.T) {
 		t.Fatalf("incomplete mark: err=%v deletes=%d", err, cas.deletes)
 	}
 	cas.unreadable = ""
+	pending := &store.SandboxRecord{SandboxID: "publisher", State: store.SandboxStateSuspending, PendingSnapshotID: "new"}
+	if err := meta.CreateSandbox(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.collectSnapshots(ctx); err == nil || cas.deletes != 0 {
+		t.Fatalf("collection after publisher replacement: err=%v deletes=%d", err, cas.deletes)
+	}
 	publish, err := meta.LockSnapshotSet(ctx, false)
 	if err != nil {
 		t.Fatal(err)

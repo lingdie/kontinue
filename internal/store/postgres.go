@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS kt_templates (
     updated_at         TIMESTAMPTZ NOT NULL
 );
 
+ALTER TABLE kt_templates ADD COLUMN IF NOT EXISTS build JSONB;
+
 CREATE TABLE IF NOT EXISTS kt_snapshots (
     snapshot_id        TEXT PRIMARY KEY,
     kind               TEXT NOT NULL,
@@ -151,10 +153,10 @@ func (s *PostgresMetadataStore) CreateTemplate(ctx context.Context, tpl *Templat
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO kt_templates (
 			template_id, name, base_image, warmup_script, tier, pin_in_l1_tmpfs,
-			trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, build
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		tpl.TemplateID, tpl.Name, tpl.BaseImage, tpl.WarmupScript, tpl.Tier, tpl.PinInL1Tmpfs,
-		tpl.TraceHotPages, tpl.Phase, tpl.GoldenSnapshotID, tpl.StatusMessage, tpl.CreatedAt, tpl.UpdatedAt,
+		tpl.TraceHotPages, tpl.Phase, tpl.GoldenSnapshotID, tpl.StatusMessage, tpl.CreatedAt, tpl.UpdatedAt, tpl.Build,
 	)
 	return err
 }
@@ -163,11 +165,11 @@ func (s *PostgresMetadataStore) GetTemplate(ctx context.Context, templateID stri
 	var t TemplateRecord
 	err := s.pool.QueryRow(ctx, `
 		SELECT template_id, name, base_image, warmup_script, tier, pin_in_l1_tmpfs,
-		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at
+		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at,build
 		FROM kt_templates WHERE template_id = $1`, templateID,
 	).Scan(
 		&t.TemplateID, &t.Name, &t.BaseImage, &t.WarmupScript, &t.Tier, &t.PinInL1Tmpfs,
-		&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt,
+		&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt, &t.Build,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -175,15 +177,21 @@ func (s *PostgresMetadataStore) GetTemplate(ctx context.Context, templateID stri
 	return &t, err
 }
 
-func (s *PostgresMetadataStore) UpdateTemplateStatus(ctx context.Context, templateID, phase, goldenSnapshotID, msg string) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE kt_templates
-		SET phase = $2, golden_snapshot_id = COALESCE(NULLIF($3, ''), golden_snapshot_id),
-		    status_message = $4, updated_at = $5
-		WHERE template_id = $1`,
-		templateID, phase, goldenSnapshotID, msg, time.Now().UTC(),
-	)
+func (s *PostgresMetadataStore) SaveTemplateBuild(ctx context.Context, t *TemplateRecord) error {
+	t.UpdatedAt = time.Now().UTC()
+	tag, err := s.pool.Exec(ctx, `UPDATE kt_templates SET phase=$2,golden_snapshot_id=$3,status_message=$4,build=$5,updated_at=$6 WHERE template_id=$1`, t.TemplateID, t.Phase, t.GoldenSnapshotID, t.StatusMessage, t.Build, t.UpdatedAt)
+	if err == nil && tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
 	return err
+}
+
+func (s *PostgresMetadataStore) ListPendingTemplateIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT template_id FROM kt_templates WHERE build IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 func (s *PostgresMetadataStore) ListTemplates(ctx context.Context) ([]TemplateRecord, error) {
@@ -314,6 +322,26 @@ func (s *PostgresMetadataStore) ListGCandidateSnapshots(ctx context.Context) ([]
 		out = append(out, snap)
 	}
 	return out, rows.Err()
+}
+
+// API process loss releases its advisory lock while the worker can still be
+// uploading. The sandbox intent identifies the capture across that gap.
+func (s *PostgresMetadataStore) UnpublishedSnapshot(ctx context.Context) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `
+        SELECT p.id FROM kt_sandboxes AS b
+        CROSS JOIN LATERAL (VALUES (b.payload_json->>'pendingSnapshotId'),
+                                   (b.payload_json->'pendingFork'->>'snapshotId')) AS p(id)
+        WHERE p.id <> '' AND NOT EXISTS (SELECT 1 FROM kt_snapshots s WHERE s.snapshot_id=p.id)
+        UNION ALL
+        SELECT t.build->>'snapshotId' FROM kt_templates AS t
+        WHERE t.phase=$1 AND t.build IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM kt_snapshots s WHERE s.snapshot_id=t.build->>'snapshotId')
+        LIMIT 1`, TemplateCapturing).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
 }
 
 func (s *PostgresMetadataStore) ListAllSnapshots(ctx context.Context) ([]SnapshotRecord, error) {

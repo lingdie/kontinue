@@ -295,166 +295,6 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// BuildGoldenTemplate boots a builder sandbox in a Carrier Slot, runs WarmupScript to prime RAM,
-// triggers Kubelet's native POST :10250/checkpoint API, stores the Golden Snapshot, and prewarms L1 tmpfs.
-func (s *Server) BuildGoldenTemplate(ctx context.Context, req CreateTemplateRequest) (*store.TemplateRecord, error) {
-	ctx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "apiserver.build_golden_template",
-		attribute.String("template.name", req.Name),
-	)
-	var retErr error
-	defer func() { telemetry.EndSpan(span, retErr) }()
-
-	if req.TemplateID == "" {
-		req.TemplateID = "tpl-" + randHex(6)
-	}
-	if req.Tier == "" {
-		req.Tier = protocol.DefaultCarrierTier
-	}
-	tpl := &store.TemplateRecord{
-		TemplateID:    req.TemplateID,
-		Name:          req.Name,
-		BaseImage:     req.BaseImage,
-		WarmupScript:  req.WarmupScript,
-		Tier:          req.Tier,
-		PinInL1Tmpfs:  req.PinInL1Tmpfs,
-		TraceHotPages: req.TraceHotPages,
-		Phase:         "WarmingUp",
-	}
-	if err := s.cfg.Meta.CreateTemplate(ctx, tpl); err != nil {
-		retErr = err
-		return nil, err
-	}
-
-	dec, err := s.cfg.Placement.SelectAndClaimSlot(ctx, PlacementRequest{Tier: req.Tier})
-	if err != nil {
-		_ = s.cfg.Meta.UpdateTemplateStatus(ctx, tpl.TemplateID, "Failed", "", err.Error())
-		retErr = err
-		return nil, err
-	}
-	nodeClient, err := s.nodeClient(dec.Node.GRPCAddr)
-	if err != nil {
-		retErr = err
-		return nil, err
-	}
-
-	builderID := "builder-" + tpl.TemplateID
-	bootTok := "boot-" + randHex(12)
-	builderLife := "life-" + randHex(6)
-	warmupTok := "warmup-" + randHex(12)
-
-	hydrateResp, err := nodeClient.HydrateSlot(ctx, &protocol.HydrateSlotRequest{
-		Slot:           dec.Slot,
-		SandboxID:      builderID,
-		TemplateID:     tpl.TemplateID,
-		ExecutionID:    1,
-		LifecycleID:    builderLife,
-		BaseImage:      tpl.BaseImage,
-		RestoreMode:    protocol.RestoreModeCold,
-		BootstrapToken: bootTok,
-		AccessToken:    warmupTok,
-		SkipThaw:       false,
-	})
-	if err != nil {
-		_ = s.cfg.Meta.UpdateTemplateStatus(ctx, tpl.TemplateID, "Failed", "", err.Error())
-		retErr = err
-		return nil, err
-	}
-	defer func() {
-		released, err := nodeClient.ReleaseSlot(context.Background(), &protocol.ReleaseSlotRequest{
-			SlotID:      dec.Slot.SlotID,
-			SandboxID:   builderID,
-			ExecutionID: 1,
-			LifecycleID: builderLife,
-			ReuseSlot:   s.cfg.ReuseSlots,
-		})
-		if err == nil && released.Released && !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
-			s.cfg.Replenisher.EnqueueTaintedPod(dec.Slot.PodNamespace, dec.Slot.PodName, released.PodUID)
-		}
-	}()
-
-	// Execute WarmupScript inside the running container to bake libraries/models into RAM!
-	if req.WarmupScript != "" {
-		execOut, execErr := s.ktdClient.Exec(ctx, hydrateResp.PodIP, warmupTok, protocol.ExecRequest{
-			Command:   []string{"/bin/sh", "-c", req.WarmupScript},
-			TimeoutMs: 120_000,
-		})
-		if execErr != nil || execOut.ExitCode != 0 {
-			msg := "warmup command failed"
-			if execOut != nil {
-				msg = fmt.Sprintf("warmup command exited with status %d", execOut.ExitCode)
-			}
-			_ = s.cfg.Meta.UpdateTemplateStatus(ctx, tpl.TemplateID, "Failed", "", msg)
-			retErr = errors.New(msg)
-			return nil, retErr
-		}
-	}
-
-	releaseSnapshots, err := s.cfg.Meta.LockSnapshotSet(ctx, false)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseSnapshots()
-	goldenSnapID := "snap-golden-" + randHex(6)
-	if _, err := nodeClient.PrepareCheckpoint(ctx, &protocol.PrepareCheckpointRequest{
-		SandboxID:        builderID,
-		ExecutionID:      1,
-		LifecycleID:      builderLife,
-		TemplateID:       tpl.TemplateID,
-		BaseImage:        tpl.BaseImage,
-		SlotID:           dec.Slot.SlotID,
-		PodNamespace:     dec.Slot.PodNamespace,
-		PodName:          dec.Slot.PodName,
-		PodIP:            dec.Slot.PodIP,
-		TargetSnapshotID: goldenSnapID,
-		Kind:             protocol.SnapshotKindGoldenTemplate,
-		LeaveRunning:     false,
-		TraceHotPages:    req.TraceHotPages,
-		BootstrapToken:   bootTok,
-	}); err != nil {
-		retErr = err
-		return nil, err
-	}
-
-	if _, err := s.cfg.Kubelet.CheckpointContainer(ctx, dec.Node.NodeIP, dec.Node.KubeletPort,
-		dec.Slot.PodNamespace, dec.Slot.PodName, protocol.ContainerNameSandbox, 60); err != nil {
-		_ = s.cfg.Meta.UpdateTemplateStatus(ctx, tpl.TemplateID, "Failed", "", err.Error())
-		retErr = err
-		return nil, err
-	}
-
-	snapRes, err := nodeClient.GetLatestSnapshotResult(ctx, &protocol.GetLatestSnapshotResultRequest{SnapshotID: goldenSnapID})
-	if err != nil || !snapRes.Found {
-		retErr = fmt.Errorf("retrieve golden snapshot result %s: %w", goldenSnapID, err)
-		return nil, retErr
-	}
-
-	if err := s.cfg.Meta.CreateSnapshot(ctx, &store.SnapshotRecord{
-		SnapshotID:       goldenSnapID,
-		Kind:             protocol.SnapshotKindGoldenTemplate,
-		TemplateID:       tpl.TemplateID,
-		BaseImage:        tpl.BaseImage,
-		ManifestURI:      snapRes.ManifestURI,
-		OriginNodeID:     dec.Node.NodeID,
-		OriginPeerAddr:   dec.Node.P2PAddr,
-		TotalMemoryBytes: snapRes.Manifest.PagesImgTotalSize,
-		DirtyMemoryBytes: snapRes.Manifest.DirtyMemoryBytes,
-		DirtyChunks:      snapRes.Manifest.DirtyChunkCount,
-		ReusedChunks:     snapRes.Manifest.ReusedChunkCount,
-		BootstrapToken:   bootTok,
-		Fingerprint:      snapRes.Manifest.Fingerprint,
-	}); err != nil {
-		retErr = err
-		return nil, err
-	}
-
-	if req.PinInL1Tmpfs {
-		s.broadcastL1Prewarm(ctx, goldenSnapID)
-	}
-
-	_ = s.cfg.Meta.UpdateTemplateStatus(ctx, tpl.TemplateID, "Ready", goldenSnapID, "golden memory snapshot ready")
-	return s.cfg.Meta.GetTemplate(ctx, tpl.TemplateID)
-}
-
 // CreateSandbox clones a new 1-to-N sandbox from a Golden Template in ~100ms with 0 K8s etcd writes!
 func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*store.SandboxRecord, error) {
 	if req.SandboxID == "" {
@@ -486,6 +326,9 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 		if err != nil {
 			retErr = fmt.Errorf("load template %s: %w", req.TemplateID, err)
 			return nil, retErr
+		}
+		if tpl.Phase != "Ready" || tpl.GoldenSnapshotID == "" {
+			return nil, store.ErrTransitionLocked
 		}
 		baseImage = tpl.BaseImage
 		if tier == "" {
@@ -655,18 +498,8 @@ func (s *Server) releaseExecution(ctx context.Context, sbx *store.SandboxRecord)
 }
 
 func (s *Server) captureSandbox(ctx context.Context, sbx *store.SandboxRecord, route *protocol.RouteRecord, newSnapID string, kind protocol.SnapshotKind) (*store.SnapshotRecord, error) {
-	releaseSnapshots, err := s.cfg.Meta.LockSnapshotSet(ctx, false)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseSnapshots()
-	nodeClient, err := s.nodeClient(route.NodeGRPCAddr)
-	if err != nil {
-		return nil, err
-	}
-	sandboxID := sbx.SandboxID
 	prep := &protocol.PrepareCheckpointRequest{
-		SandboxID:        sandboxID,
+		SandboxID:        sbx.SandboxID,
 		ExecutionID:      sbx.ExecutionID,
 		LifecycleID:      sbx.LifecycleID,
 		TemplateID:       sbx.TemplateID,
@@ -681,6 +514,20 @@ func (s *Server) captureSandbox(ctx context.Context, sbx *store.SandboxRecord, r
 		LeaveRunning:     true,
 		BootstrapToken:   sbx.BootstrapToken,
 	}
+	return s.publishCheckpoint(ctx, prep, route.NodeID, route.NodeIP, route.NodeGRPCAddr, route.NodeGRPCAddr)
+}
+
+func (s *Server) publishCheckpoint(ctx context.Context, prep *protocol.PrepareCheckpointRequest, nodeID, nodeIP, grpcAddr, peerAddr string) (*store.SnapshotRecord, error) {
+	releaseSnapshots, err := s.cfg.Meta.LockSnapshotSet(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSnapshots()
+	nodeClient, err := s.nodeClient(grpcAddr)
+	if err != nil {
+		return nil, err
+	}
+	newSnapID := prep.TargetSnapshotID
 	query := &protocol.GetLatestSnapshotResultRequest{SnapshotID: newSnapID, Expected: prep}
 	snapRes, err := nodeClient.GetLatestSnapshotResult(ctx, query)
 	if err != nil {
@@ -691,9 +538,9 @@ func (s *Server) captureSandbox(ctx context.Context, sbx *store.SandboxRecord, r
 			return nil, err
 		}
 
-		kubeletPort := s.lookupNodeKubeletPort(ctx, route.NodeID)
-		if _, err := s.cfg.Kubelet.CheckpointContainer(ctx, route.NodeIP, kubeletPort,
-			sbx.CarrierPodNamespace, sbx.CarrierPodName, protocol.ContainerNameSandbox, 60); err != nil {
+		kubeletPort := s.lookupNodeKubeletPort(ctx, nodeID)
+		if _, err := s.cfg.Kubelet.CheckpointContainer(ctx, nodeIP, kubeletPort,
+			prep.PodNamespace, prep.PodName, protocol.ContainerNameSandbox, 60); err != nil {
 			return nil, err
 		}
 
@@ -706,22 +553,22 @@ func (s *Server) captureSandbox(ctx context.Context, sbx *store.SandboxRecord, r
 		}
 
 	}
-	prevSnapID := sbx.ActiveSnapshotID
+
 	snapRec := &store.SnapshotRecord{
 		SnapshotID:       newSnapID,
-		Kind:             kind,
-		TemplateID:       sbx.TemplateID,
-		SourceSandboxID:  sandboxID,
-		ParentSnapshotID: prevSnapID,
-		BaseImage:        sbx.BaseImage,
+		Kind:             prep.Kind,
+		TemplateID:       prep.TemplateID,
+		SourceSandboxID:  prep.SandboxID,
+		ParentSnapshotID: prep.ParentSnapshotID,
+		BaseImage:        prep.BaseImage,
 		ManifestURI:      snapRes.ManifestURI,
-		OriginNodeID:     route.NodeID,
-		OriginPeerAddr:   route.NodeGRPCAddr,
+		OriginNodeID:     nodeID,
+		OriginPeerAddr:   peerAddr,
 		TotalMemoryBytes: snapRes.Manifest.PagesImgTotalSize,
 		DirtyMemoryBytes: snapRes.Manifest.DirtyMemoryBytes,
 		DirtyChunks:      snapRes.Manifest.DirtyChunkCount,
 		ReusedChunks:     snapRes.Manifest.ReusedChunkCount,
-		BootstrapToken:   sbx.BootstrapToken,
+		BootstrapToken:   prep.BootstrapToken,
 		Fingerprint:      snapRes.Manifest.Fingerprint,
 	}
 	if err := s.cfg.Meta.CreateSnapshot(ctx, snapRec); err != nil {
@@ -897,6 +744,7 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 	}
 	defer release()
 
+	s.reconcileTemplateBuilds(ctx)
 	now := time.Now().UTC()
 	running, err := s.cfg.Meta.ListSandboxesToSweep(ctx)
 	if err == nil {
@@ -994,6 +842,11 @@ func (s *Server) collectSnapshots(ctx context.Context) error {
 		return err
 	}
 	defer release()
+	if pending, err := s.cfg.Meta.UnpublishedSnapshot(ctx); err != nil {
+		return err
+	} else if pending != "" {
+		return fmt.Errorf("snapshot %s awaits publication", pending)
+	}
 	// A publisher may have added references while the collector waited.
 	candidates, err = s.cfg.Meta.ListGCandidateSnapshots(ctx)
 	if err != nil || len(candidates) == 0 {

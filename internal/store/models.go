@@ -30,19 +30,32 @@ const (
 	SandboxStateFailed     SandboxState = "FAILED"
 )
 
+const TemplateCapturing = "Capturing"
+
+type TemplateBuild struct {
+	SnapshotID     string               `json:"snapshotId"`
+	LifecycleID    string               `json:"lifecycleId"`
+	BootstrapToken string               `json:"bootstrapToken"`
+	AccessToken    string               `json:"accessToken"`
+	Slot           protocol.CarrierSlot `json:"slot"`
+	PeerAddr       string               `json:"peerAddr,omitempty"`
+	GuestEndpoint  string               `json:"guestEndpoint,omitempty"`
+}
+
 type TemplateRecord struct {
-	TemplateID       string    `json:"templateId"`
-	Name             string    `json:"name"`
-	BaseImage        string    `json:"baseImage"`
-	WarmupScript     string    `json:"warmupScript,omitempty"`
-	Tier             string    `json:"tier"`
-	PinInL1Tmpfs     bool      `json:"pinInL1Tmpfs"`
-	TraceHotPages    bool      `json:"traceHotPages"`
-	Phase            string    `json:"phase"`
-	GoldenSnapshotID string    `json:"goldenSnapshotId,omitempty"`
-	StatusMessage    string    `json:"statusMessage,omitempty"`
-	CreatedAt        time.Time `json:"createdAt"`
-	UpdatedAt        time.Time `json:"updatedAt"`
+	Build            *TemplateBuild `json:"-"`
+	TemplateID       string         `json:"templateId"`
+	Name             string         `json:"name"`
+	BaseImage        string         `json:"baseImage"`
+	WarmupScript     string         `json:"warmupScript,omitempty"`
+	Tier             string         `json:"tier"`
+	PinInL1Tmpfs     bool           `json:"pinInL1Tmpfs"`
+	TraceHotPages    bool           `json:"traceHotPages"`
+	Phase            string         `json:"phase"`
+	GoldenSnapshotID string         `json:"goldenSnapshotId,omitempty"`
+	StatusMessage    string         `json:"statusMessage,omitempty"`
+	CreatedAt        time.Time      `json:"createdAt"`
+	UpdatedAt        time.Time      `json:"updatedAt"`
 }
 
 type SnapshotRecord struct {
@@ -121,7 +134,8 @@ type MetadataStore interface {
 
 	CreateTemplate(ctx context.Context, tpl *TemplateRecord) error
 	GetTemplate(ctx context.Context, templateID string) (*TemplateRecord, error)
-	UpdateTemplateStatus(ctx context.Context, templateID, phase, goldenSnapshotID, msg string) error
+	SaveTemplateBuild(ctx context.Context, tpl *TemplateRecord) error
+	ListPendingTemplateIDs(ctx context.Context) ([]string, error)
 	ListTemplates(ctx context.Context) ([]TemplateRecord, error)
 
 	// LockSnapshotSet lets publications overlap and excludes physical collection.
@@ -131,6 +145,7 @@ type MetadataStore interface {
 	MarkSnapshotSuperseded(ctx context.Context, snapshotID string) error
 	ListGCandidateSnapshots(ctx context.Context) ([]SnapshotRecord, error)
 	ListAllSnapshots(ctx context.Context) ([]SnapshotRecord, error)
+	UnpublishedSnapshot(ctx context.Context) (string, error)
 	DeleteSnapshot(ctx context.Context, snapshotID string) error
 
 	CreateSandbox(ctx context.Context, sbx *SandboxRecord) error
