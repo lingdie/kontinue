@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -367,6 +368,11 @@ func (s *Server) BuildGoldenTemplate(ctx context.Context, req CreateTemplateRequ
 		}
 	}
 
+	releaseSnapshots, err := s.cfg.Meta.LockSnapshotSet(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSnapshots()
 	goldenSnapID := "snap-golden-" + randHex(6)
 	if _, err := nodeClient.PrepareCheckpoint(ctx, &protocol.PrepareCheckpointRequest{
 		SandboxID:        builderID,
@@ -679,6 +685,11 @@ func (s *Server) finishSuspendRelease(ctx context.Context, sbx *store.SandboxRec
 }
 
 func (s *Server) captureSuspend(ctx context.Context, sbx *store.SandboxRecord, route *protocol.RouteRecord) (*store.SnapshotRecord, error) {
+	releaseSnapshots, err := s.cfg.Meta.LockSnapshotSet(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSnapshots()
 	nodeClient, err := s.nodeClient(route.NodeGRPCAddr)
 	if err != nil {
 		return nil, err
@@ -989,6 +1000,11 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 	}
 	defer unlock()
 
+	releaseSnapshots, err := s.cfg.Meta.LockSnapshotSet(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSnapshots()
 	src, err := s.cfg.Meta.GetSandbox(ctx, sourceSandboxID)
 	if err != nil {
 		retErr = err
@@ -1242,66 +1258,113 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 		}
 	}
 
-	candidates, err := s.cfg.Meta.ListGCandidateSnapshots(ctx)
-	if err == nil {
-		var doomed []store.SnapshotRecord
-		for _, snap := range candidates {
-			doomed = append(doomed, snap)
-			_ = s.cfg.Meta.DeleteSnapshot(ctx, snap.SnapshotID)
-		}
-		s.physicallyGCSnapshots(ctx, doomed)
+	if err := s.collectSnapshots(ctx); err != nil {
+		log.Printf("snapshot GC: %v", err)
 	}
 }
 
-func (s *Server) physicallyGCSnapshots(ctx context.Context, doomed []store.SnapshotRecord) {
-	if s.cfg.CAS == nil || len(doomed) == 0 {
-		return
+func (s *Server) collectSnapshots(ctx context.Context) error {
+	if s.cfg.CAS == nil {
+		return nil
 	}
-	live := map[string]struct{}{}
-	if remaining, err := s.cfg.Meta.ListAllSnapshots(ctx); err == nil {
-		for _, snap := range remaining {
-			mf, mErr := s.cfg.CAS.GetManifest(ctx, snap.SnapshotID)
-			if mErr != nil || mf == nil {
-				continue
-			}
-			for _, ch := range mf.Chunks {
-				if ch.Blake3Hash != "" && !ch.ZeroChunk {
-					live[ch.Blake3Hash] = struct{}{}
-				}
+	candidates, err := s.cfg.Meta.ListGCandidateSnapshots(ctx)
+	if err != nil || len(candidates) == 0 {
+		return err
+	}
+	release, err := s.cfg.Meta.LockSnapshotSet(ctx, true)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// A publisher may have added references while the collector waited.
+	candidates, err = s.cfg.Meta.ListGCandidateSnapshots(ctx)
+	if err != nil || len(candidates) == 0 {
+		return err
+	}
+	doomed := make(map[string]bool, len(candidates))
+	for _, snap := range candidates {
+		doomed[snap.SnapshotID] = true
+	}
+	remaining, err := s.cfg.Meta.ListAllSnapshots(ctx)
+	if err != nil {
+		return err
+	}
+	live := map[string]bool{}
+	for _, snap := range remaining {
+		if doomed[snap.SnapshotID] {
+			continue
+		}
+		mf, err := s.gcManifest(ctx, snap)
+		if err != nil {
+			return err
+		}
+		for _, ch := range mf.Chunks {
+			if !ch.ZeroChunk {
+				live[ch.Blake3Hash] = true
 			}
 		}
 	}
-	for _, snap := range doomed {
-		mf, err := s.cfg.CAS.GetManifest(ctx, snap.SnapshotID)
-		if err == nil && mf != nil {
+	for _, snap := range candidates {
+		mf, err := s.gcManifest(ctx, snap)
+		if err != nil && !errors.Is(err, storage.ErrObjectNotFound) {
+			return err
+		}
+		if mf != nil {
 			for _, ch := range mf.Chunks {
-				if ch.Blake3Hash == "" || ch.ZeroChunk {
+				if ch.ZeroChunk || live[ch.Blake3Hash] {
 					continue
 				}
-				if _, ok := live[ch.Blake3Hash]; ok {
-					continue
+				if err := s.cfg.CAS.DeleteBlob(ctx, storage.ChunkKey(ch.Blake3Hash)); err != nil {
+					return err
 				}
-				_ = s.cfg.CAS.DeleteBlob(ctx, storage.ChunkKey(ch.Blake3Hash))
-			}
-			if mf.CheckpointImgHash != "" {
-				_ = s.cfg.CAS.DeleteBlob(ctx, storage.ArtifactKey(snap.SnapshotID, protocol.GVisorCheckpointImg))
-			}
-			if mf.PagesMetaImgHash != "" {
-				_ = s.cfg.CAS.DeleteBlob(ctx, storage.ArtifactKey(snap.SnapshotID, protocol.GVisorPagesMetaImg))
 			}
 		}
-		_ = s.cfg.CAS.DeleteBlob(ctx, storage.ArtifactKey(snap.SnapshotID, protocol.ManifestFileName))
+		// Deletions are idempotent. Keep the manifest and candidate row until
+		// their dependent objects are gone so an interrupted sweep can retry.
+		for _, name := range []string{protocol.GVisorCheckpointImg, protocol.GVisorPagesMetaImg, protocol.RootfsUpperTar, protocol.ManifestFileName} {
+			if err := s.cfg.CAS.DeleteBlob(ctx, storage.ArtifactKey(snap.SnapshotID, name)); err != nil {
+				return err
+			}
+		}
+		if err := s.cfg.Meta.DeleteSnapshot(ctx, snap.SnapshotID); err != nil {
+			return err
+		}
 	}
-	// Local FS backends: sweep any leftover chunk files not referenced by remaining manifests.
 	if local, ok := s.cfg.CAS.(*storage.LocalFSBackend); ok {
-		hashes, _ := local.ListLocalChunkHashes()
+		hashes, err := local.ListLocalChunkHashes()
+		if err != nil {
+			return err
+		}
 		for _, h := range hashes {
-			if _, ok := live[h]; ok {
-				continue
+			if !live[h] {
+				if err := local.DeleteBlob(ctx, storage.ChunkKey(h)); err != nil {
+					return err
+				}
 			}
-			_ = local.DeleteBlob(ctx, storage.ChunkKey(h))
 		}
 	}
+	return nil
+}
+
+func (s *Server) gcManifest(ctx context.Context, snap store.SnapshotRecord) (*protocol.SnapshotManifest, error) {
+	mf, err := s.cfg.CAS.GetManifest(ctx, snap.SnapshotID)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest %s: %w", snap.SnapshotID, err)
+	}
+	if mf == nil || mf.SnapshotID != snap.SnapshotID || mf.PagesImgTotalSize != snap.TotalMemoryBytes {
+		return nil, fmt.Errorf("invalid manifest for %s", snap.SnapshotID)
+	}
+	var size int64
+	for _, ch := range mf.Chunks {
+		if ch.Offset != size || ch.Length <= 0 || (!ch.ZeroChunk && ch.Blake3Hash == "") {
+			return nil, fmt.Errorf("invalid chunk in manifest %s", snap.SnapshotID)
+		}
+		size += int64(ch.Length)
+	}
+	if size != mf.PagesImgTotalSize {
+		return nil, fmt.Errorf("incomplete manifest %s", snap.SnapshotID)
+	}
+	return mf, nil
 }
 
 func (s *Server) broadcastL1Prewarm(ctx context.Context, snapshotID string) {

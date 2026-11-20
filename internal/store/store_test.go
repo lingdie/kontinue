@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -85,4 +86,38 @@ func TestLeaderLockAndInflight(t *testing.T) {
 	if n, _ = cat.AdjustInflight(ctx, "sbx", -1); n != 0 {
 		t.Fatalf("inflight back to 0, got %d", n)
 	}
+}
+
+func TestPostgresPublicationBarrierAcrossReplicas(t *testing.T) {
+	dsn := os.Getenv("KONTINUE_TEST_POSTGRES")
+	if dsn == "" {
+		t.Skip("set KONTINUE_TEST_POSTGRES to a disposable PostgreSQL database")
+	}
+	ctx := context.Background()
+	connect := func() *store.PostgresMetadataStore {
+		s, err := store.NewPostgresMetadataStore(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(s.Close)
+		return s
+	}
+	publisher, collector := connect(), connect()
+	done, err := publisher.LockSnapshotSet(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bounded, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	release, err := collector.LockSnapshotSet(bounded, true)
+	cancel()
+	done()
+	if err == nil {
+		release()
+		t.Fatal("exclusive collector overlapped active publisher")
+	}
+	release, err = collector.LockSnapshotSet(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
 }

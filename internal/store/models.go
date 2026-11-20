@@ -101,6 +101,8 @@ type MetadataStore interface {
 	UpdateTemplateStatus(ctx context.Context, templateID, phase, goldenSnapshotID, msg string) error
 	ListTemplates(ctx context.Context) ([]TemplateRecord, error)
 
+	// LockSnapshotSet lets publications overlap and excludes physical collection.
+	LockSnapshotSet(ctx context.Context, exclusive bool) (release func(), err error)
 	CreateSnapshot(ctx context.Context, snap *SnapshotRecord) error
 	GetSnapshot(ctx context.Context, snapshotID string) (*SnapshotRecord, error)
 	MarkSnapshotSuperseded(ctx context.Context, snapshotID string) error

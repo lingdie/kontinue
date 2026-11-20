@@ -62,8 +62,9 @@ CREATE INDEX IF NOT EXISTS idx_kt_snapshots_superseded ON kt_snapshots(supersede
 
 // PostgresMetadataStore implements MetadataStore backed by PostgreSQL (pgxpool).
 type PostgresMetadataStore struct {
-	pool  *pgxpool.Pool
-	locks *pgxpool.Pool
+	pool          *pgxpool.Pool
+	locks         *pgxpool.Pool
+	snapshotLocks *pgxpool.Pool
 }
 
 func NewPostgresMetadataStore(ctx context.Context, connString string) (*PostgresMetadataStore, error) {
@@ -79,10 +80,17 @@ func NewPostgresMetadataStore(ctx context.Context, connString string) (*Postgres
 		pool.Close()
 		return nil, err
 	}
-	return &PostgresMetadataStore{pool: pool, locks: locks}, nil
+	// Publishers can already hold a lifecycle lock while waiting for GC.
+	snapshotLocks, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		locks.Close()
+		pool.Close()
+		return nil, err
+	}
+	return &PostgresMetadataStore{pool: pool, locks: locks, snapshotLocks: snapshotLocks}, nil
 }
 
-func (s *PostgresMetadataStore) Close() { s.locks.Close(); s.pool.Close() }
+func (s *PostgresMetadataStore) Close() { s.snapshotLocks.Close(); s.locks.Close(); s.pool.Close() }
 
 func (s *PostgresMetadataStore) Migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, schemaDDL)
@@ -190,6 +198,27 @@ func (s *PostgresMetadataStore) ListTemplates(ctx context.Context) ([]TemplateRe
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+func (s *PostgresMetadataStore) LockSnapshotSet(ctx context.Context, exclusive bool) (func(), error) {
+	tx, err := s.snapshotLocks.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	release := func() {
+		clean, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(clean)
+	}
+	query := "SELECT pg_advisory_xact_lock_shared($1)"
+	if exclusive {
+		query = "SELECT pg_advisory_xact_lock($1)"
+	}
+	if _, err := tx.Exec(ctx, query, advisoryKey("snapshot-publications")); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
 }
 
 func (s *PostgresMetadataStore) CreateSnapshot(ctx context.Context, snap *SnapshotRecord) error {

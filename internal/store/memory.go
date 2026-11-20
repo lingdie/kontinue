@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/semaphore"
+
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
 )
 
@@ -15,19 +17,21 @@ func toSnapshotKind(s string) protocol.SnapshotKind {
 // MemoryMetadataStore provides an in-memory transactional MetadataStore with 100% behavioral parity
 // to PostgresMetadataStore for fast unit tests, e2e tests, and standalone dev clusters.
 type MemoryMetadataStore struct {
-	mu        sync.RWMutex
-	templates map[string]TemplateRecord
-	snapshots map[string]SnapshotRecord
-	sandboxes map[string]SandboxRecord
-	leaders   map[string]bool
+	snapshotLocks *semaphore.Weighted
+	mu            sync.RWMutex
+	templates     map[string]TemplateRecord
+	snapshots     map[string]SnapshotRecord
+	sandboxes     map[string]SandboxRecord
+	leaders       map[string]bool
 }
 
 func NewMemoryMetadataStore() *MemoryMetadataStore {
 	return &MemoryMetadataStore{
-		templates: make(map[string]TemplateRecord),
-		snapshots: make(map[string]SnapshotRecord),
-		sandboxes: make(map[string]SandboxRecord),
-		leaders:   make(map[string]bool),
+		snapshotLocks: semaphore.NewWeighted(snapshotLockCapacity),
+		templates:     make(map[string]TemplateRecord),
+		snapshots:     make(map[string]SnapshotRecord),
+		sandboxes:     make(map[string]SandboxRecord),
+		leaders:       make(map[string]bool),
 	}
 }
 
@@ -95,6 +99,19 @@ func (m *MemoryMetadataStore) ListTemplates(_ context.Context) ([]TemplateRecord
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+const snapshotLockCapacity = 1 << 30
+
+func (m *MemoryMetadataStore) LockSnapshotSet(ctx context.Context, exclusive bool) (func(), error) {
+	weight := int64(1)
+	if exclusive {
+		weight = snapshotLockCapacity
+	}
+	if err := m.snapshotLocks.Acquire(ctx, weight); err != nil {
+		return nil, err
+	}
+	return func() { m.snapshotLocks.Release(weight) }, nil
 }
 
 func (m *MemoryMetadataStore) CreateSnapshot(_ context.Context, snap *SnapshotRecord) error {
