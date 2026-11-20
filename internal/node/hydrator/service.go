@@ -571,6 +571,20 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	if !current {
 		return s.journal.previousRelease(req)
 	}
+	// A crash can leave both the receipt and the claim. Only an exact match
+	// can retire the claim without running teardown again.
+	if st.Phase == releasing && req.LifecycleID == st.LifecycleID {
+		receipt, err := s.journal.previousRelease(req)
+		if err != nil {
+			return nil, err
+		}
+		if receipt.Released {
+			if receipt.PodUID != st.Slot.PodUID {
+				return nil, fmt.Errorf("release receipt Pod UID does not match slot %s", st.Slot.SlotID)
+			}
+			return s.finishRelease(st, receipt)
+		}
+	}
 	if s.cfg.Routes != nil {
 		if err := s.cfg.Routes.ReportExecution(ctx, st.route(s.cfg), store.ExecutionReport{State: store.OwnerChecking}); err != nil {
 			return nil, err
@@ -609,6 +623,11 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	if err := s.journal.persist(s.journal.receipt(req), response, false); err != nil {
 		return nil, err
 	}
+	return s.finishRelease(st, response)
+}
+
+// finishRelease runs under st.releaseMu after the release receipt is persisted.
+func (s *Service) finishRelease(st *activeSlotState, receipt *protocol.ReleaseSlotResponse) (*protocol.ReleaseSlotResponse, error) {
 	if err := s.journal.remove(st.Slot.SlotID); err != nil {
 		return nil, err
 	}
@@ -616,15 +635,15 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	if st.LastCheckpoint != nil {
 		delete(s.results, st.LastCheckpoint.Result.Manifest.SnapshotID)
 	}
-	if s.activeSlots[req.SlotID] == st {
-		delete(s.activeSlots, req.SlotID)
+	if s.activeSlots[st.Slot.SlotID] == st {
+		delete(s.activeSlots, st.Slot.SlotID)
 	}
 	if s.byContainer[st.ContainerID] == st {
 		delete(s.byContainer, st.ContainerID)
 		delete(s.pendingCkpt, st.ContainerID)
 	}
 	s.mu.Unlock()
-	return response, nil
+	return receipt, nil
 }
 
 func (s *Service) PrewarmTemplate(ctx context.Context, req *protocol.PrewarmTemplateRequest) (*protocol.PrewarmTemplateResponse, error) {

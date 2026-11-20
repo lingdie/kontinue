@@ -98,3 +98,54 @@ func TestReleaseReceiptSurvivesRestartAndDistinguishesUnknownLife(t *testing.T) 
 		t.Fatalf("unconfirmed release %v %v", resp, err)
 	}
 }
+
+func TestReleaseRetryFinishesClaimAfterReceiptWasPersisted(t *testing.T) {
+	ctx := context.Background()
+	driver := &inspectingDriver{inspectErr: errInstanceLost}
+	cfg := ServiceConfig{Driver: driver, ScratchDir: t.TempDir(), NodeID: "node"}
+	previous := NewService(cfg)
+	req := protocol.ReleaseSlotRequest{SlotID: "slot", SandboxID: "box", ExecutionID: 1, LifecycleID: "old-life"}
+	claim := ownership{
+		Version: 1, Phase: releasing, ContainerID: "kt-original",
+		Slot:      protocol.CarrierSlot{SlotID: req.SlotID, NodeID: cfg.NodeID, PodUID: "original-pod"},
+		SandboxID: req.SandboxID, ExecutionID: req.ExecutionID, LifecycleID: req.LifecycleID,
+	}
+	receipt := protocol.ReleaseSlotResponse{Released: true, Tainted: true, PodUID: claim.Slot.PodUID}
+	if err := previous.journal.write(claim, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := previous.journal.persist(previous.journal.receipt(&req), receipt, false); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := NewService(cfg)
+	if err := restarted.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	req.ReuseSlot = true // Replay the original response even if the retry changes this flag.
+	response, err := restarted.ReleaseSlot(ctx, &req)
+	if err != nil || response == nil || *response != receipt || len(driver.stopped) != 0 || restarted.ActiveCount() != 0 {
+		t.Fatalf("retry after restart: response=%v err=%v stops=%v active=%d", response, err, driver.stopped, restarted.ActiveCount())
+	}
+
+	// A new lifecycle can reuse the same slot and execution number after deletion.
+	replacement := claim
+	replacement.LifecycleID = "new-life"
+	replacement.Slot.PodUID = "replacement-pod"
+	replacement.ContainerID = "kt-replacement"
+	replacement.Phase = activeExecution
+	if err := restarted.journal.write(replacement, true); err != nil {
+		t.Fatalf("old claim still on disk: %v", err)
+	}
+	current := &activeSlotState{ownership: replacement}
+	restarted.activeSlots[req.SlotID] = current
+	restarted.byContainer[replacement.ContainerID] = current
+	response, err = restarted.ReleaseSlot(ctx, &req)
+	if err != nil || response == nil || *response != receipt || len(driver.stopped) != 0 {
+		t.Fatalf("retry with reused slot: response=%v err=%v stops=%v", response, err, driver.stopped)
+	}
+	claims, err := restarted.journal.load(cfg.NodeID)
+	if err != nil || len(claims) != 1 || claims[0] != replacement || restarted.activeSlots[req.SlotID] != current || restarted.byContainer[replacement.ContainerID] != current {
+		t.Fatalf("replacement claim lost: claims=%v err=%v", claims, err)
+	}
+}

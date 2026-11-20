@@ -98,7 +98,7 @@ func (j ownershipJournal) persist(path string, value any, create bool) error {
 }
 
 func (j ownershipJournal) remove(slotID string) error {
-	if err := os.Remove(j.path(slotID)); err != nil {
+	if err := os.Remove(j.path(slotID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return syncDirectory(string(j))
