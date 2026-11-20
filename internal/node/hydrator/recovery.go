@@ -113,6 +113,9 @@ func (s *Service) Recover(ctx context.Context) error {
 	for _, o := range claims {
 		st := &activeSlotState{ownership: o, restored: true}
 		s.activeSlots[o.Slot.SlotID] = st
+		if r := o.LastCheckpoint; r != nil {
+			s.results[r.Result.Manifest.SnapshotID] = r
+		}
 		pending = append(pending, st)
 	}
 	// Withdraw all old routes before the first potentially slow runsc or guest probe.

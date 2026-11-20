@@ -681,11 +681,20 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 	if err := catalog.RegisterIdleSlot(ctx, slotB); err != nil {
 		t.Fatal(err)
 	}
-	branches, err := apiSrvImpl.ForkSandbox(ctx, sbx.SandboxID, apiserver.ForkSandboxRequest{Count: 1})
+	forkReq := apiserver.ForkSandboxRequest{Count: 1, RequestKey: "resume-and-fork"}
+	branches, err := apiSrvImpl.ForkSandbox(ctx, sbx.SandboxID, forkReq)
 	if err != nil {
 		t.Fatalf("fork resumed sandbox: %v", err)
 	}
 	branch := branches[0]
+	replay, err := apiSrvImpl.ForkSandbox(ctx, sbx.SandboxID, forkReq)
+	if err != nil || len(replay) != 1 || replay[0].SandboxID != branch.SandboxID || replay[0].LifecycleID != branch.LifecycleID || replay[0].AccessToken != branch.AccessToken {
+		t.Fatalf("lost fork response failed to replay: %v", err)
+	}
+	forkReq.Count++
+	if _, err := apiSrvImpl.ForkSandbox(ctx, sbx.SandboxID, forkReq); !errors.Is(err, store.ErrTransitionLocked) {
+		t.Fatalf("reused fork key accepted changed request: %v", err)
+	}
 	health, err := protocol.NewKtdClient(time.Second).Health(ctx, branch.PodIP, branch.AccessToken)
 	if err != nil || health.SandboxID != branch.SandboxID || health.ExecutionID != branch.ExecutionID || branch.ExecutionID <= resumedSbx.ExecutionID {
 		t.Fatalf("fork guest identity: %+v err=%v", health, err)

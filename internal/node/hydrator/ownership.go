@@ -23,7 +23,13 @@ const (
 
 // Each file is a write-ahead claim on one carrier. The private file contains the
 // guest bootstrap credential needed to resume checkpoint operations after restart.
+type checkpointReceipt struct {
+	RequestHash string                             `json:"requestHash"`
+	Result      protocol.ExecuteCheckpointResponse `json:"result"`
+}
+
 type ownership struct {
+	LastCheckpoint *checkpointReceipt            `json:"lastCheckpoint,omitempty"`
 	RequestHash    string                        `json:"requestHash,omitempty"`
 	Activation     *protocol.HydrateSlotResponse `json:"activation,omitempty"`
 	FailureReason  string                        `json:"failureReason,omitempty"`

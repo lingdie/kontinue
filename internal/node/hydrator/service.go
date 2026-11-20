@@ -89,7 +89,7 @@ type Service struct {
 	pendingCkpt map[string]*protocol.PrepareCheckpointRequest // keyed by verified runtime container ID
 	activeSlots map[string]*activeSlotState                   // keyed by slotID
 	byContainer map[string]*activeSlotState                   // keyed by activeContainerID
-	results     map[string]*protocol.ExecuteCheckpointResponse
+	results     map[string]*checkpointReceipt
 }
 
 func NewService(cfg ServiceConfig) *Service {
@@ -106,7 +106,7 @@ func NewService(cfg ServiceConfig) *Service {
 		pendingCkpt: make(map[string]*protocol.PrepareCheckpointRequest),
 		activeSlots: make(map[string]*activeSlotState),
 		byContainer: make(map[string]*activeSlotState),
-		results:     make(map[string]*protocol.ExecuteCheckpointResponse),
+		results:     make(map[string]*checkpointReceipt),
 	}
 }
 
@@ -173,6 +173,18 @@ func (s *Service) ExecuteCheckpoint(ctx context.Context, req *protocol.ExecuteCh
 		attribute.String(telemetry.AttrSnapshotID, prep.TargetSnapshotID),
 	)
 
+	requestHash := checkpointRequestHash(prep)
+	if saved := active.LastCheckpoint; saved != nil && saved.Result.Manifest.SnapshotID == prep.TargetSnapshotID {
+		if saved.RequestHash != requestHash {
+			return nil, store.ErrStaleExecutionFence
+		}
+		if req.KubeletLocation != "" {
+			if err := s.cfg.Arena.WriteCheckpointDescriptor(req.KubeletLocation, &saved.Result.Manifest, saved.Result.ManifestURI); err != nil {
+				return nil, err
+			}
+		}
+		return &saved.Result, nil
+	}
 	ktdAddr := prep.PodIP
 	if ktdAddr != "" && !strings.Contains(ktdAddr, ":") {
 		ktdAddr = fmt.Sprintf("%s:%d", ktdAddr, protocol.DefaultKtdPort)
@@ -241,8 +253,17 @@ func (s *Service) ExecuteCheckpoint(ctx context.Context, req *protocol.ExecuteCh
 		ManifestURI: uri,
 		ArenaTier:   arena.TierL2NVMe,
 	}
+	next := active.ownership
+	next.LastCheckpoint = &checkpointReceipt{RequestHash: requestHash, Result: *out}
+	if err := s.journal.write(next, false); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
-	s.results[prep.TargetSnapshotID] = out
+	if previous := active.LastCheckpoint; previous != nil {
+		delete(s.results, previous.Result.Manifest.SnapshotID)
+	}
+	active.LastCheckpoint = next.LastCheckpoint
+	s.results[prep.TargetSnapshotID] = next.LastCheckpoint
 	s.mu.Unlock()
 	return out, nil
 }
@@ -512,6 +533,9 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 		return nil, err
 	}
 	s.mu.Lock()
+	if st.LastCheckpoint != nil {
+		delete(s.results, st.LastCheckpoint.Result.Manifest.SnapshotID)
+	}
 	if s.activeSlots[req.SlotID] == st {
 		delete(s.activeSlots, req.SlotID)
 	}
@@ -539,6 +563,11 @@ func (s *Service) PrewarmTemplate(ctx context.Context, req *protocol.PrewarmTemp
 	}, nil
 }
 
+func checkpointRequestHash(req *protocol.PrepareCheckpointRequest) string {
+	raw, _ := json.Marshal(req)
+	return fmt.Sprintf("%x", sha256.Sum256(raw))
+}
+
 func (s *Service) GetLatestSnapshotResult(_ context.Context, req *protocol.GetLatestSnapshotResultRequest) (*protocol.GetLatestSnapshotResultResponse, error) {
 	s.mu.Lock()
 	res, ok := s.results[req.SnapshotID]
@@ -546,10 +575,13 @@ func (s *Service) GetLatestSnapshotResult(_ context.Context, req *protocol.GetLa
 	if !ok {
 		return &protocol.GetLatestSnapshotResultResponse{Found: false}, nil
 	}
+	if req.Expected != nil && checkpointRequestHash(req.Expected) != res.RequestHash {
+		return nil, store.ErrStaleExecutionFence
+	}
 	return &protocol.GetLatestSnapshotResultResponse{
 		Found:       true,
-		Manifest:    res.Manifest,
-		ManifestURI: res.ManifestURI,
+		Manifest:    res.Result.Manifest,
+		ManifestURI: res.Result.ManifestURI,
 	}, nil
 }
 

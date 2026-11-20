@@ -867,6 +867,12 @@ func cloneDirHardlinks(srcDir, dstDir string) error {
 	return nil
 }
 
+// WriteCheckpointDescriptor supplies Kubelet's requested output on a replayed CRI call.
+func (m *Manager) WriteCheckpointDescriptor(path string, mf *protocol.SnapshotManifest, uri string) error {
+	localManifest := filepath.Join(m.cfg.L2CASDir, storage.ArtifactKey(mf.SnapshotID, protocol.ManifestFileName))
+	return writeKubeletCheckpointTar(path, mf, uri, localManifest)
+}
+
 func writeKubeletCheckpointTar(tarPath string, mf *protocol.SnapshotManifest, manifestURI, localArenaPath string) error {
 	if err := os.MkdirAll(filepath.Dir(tarPath), 0o700); err != nil {
 		return err

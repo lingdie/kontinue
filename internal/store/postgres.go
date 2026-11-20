@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kontinue-sh/kontinue/pkg/protocol"
 )
 
 const schemaDDL = `
@@ -54,6 +56,13 @@ CREATE TABLE IF NOT EXISTS kt_sandboxes (
     state                 TEXT NOT NULL,
     active_snapshot_id    TEXT NOT NULL DEFAULT '',
     updated_at            TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kt_fork_receipts (
+    source_id TEXT NOT NULL REFERENCES kt_sandboxes(sandbox_id) ON DELETE CASCADE,
+    request_key TEXT NOT NULL,
+    receipt JSONB NOT NULL,
+    PRIMARY KEY (source_id, request_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_kt_sandboxes_state ON kt_sandboxes(state);
@@ -344,6 +353,14 @@ func (s *PostgresMetadataStore) DeleteSnapshot(ctx context.Context, snapshotID s
 }
 
 func (s *PostgresMetadataStore) CreateSandbox(ctx context.Context, sbx *SandboxRecord) error {
+	return insertSandbox(ctx, s.pool, sbx)
+}
+
+type sandboxWriter interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func insertSandbox(ctx context.Context, db sandboxWriter, sbx *SandboxRecord) error {
 	now := time.Now().UTC()
 	if sbx.CreatedAt.IsZero() {
 		sbx.CreatedAt = now
@@ -353,7 +370,7 @@ func (s *PostgresMetadataStore) CreateSandbox(ctx context.Context, sbx *SandboxR
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `
+	_, err = db.Exec(ctx, `
 		INSERT INTO kt_sandboxes (sandbox_id, payload_json, state, active_snapshot_id, updated_at)
 		VALUES ($1, $2, $3, $4, $5)`,
 		sbx.SandboxID, raw, string(sbx.State), sbx.ActiveSnapshotID, sbx.UpdatedAt,
@@ -378,22 +395,71 @@ func (s *PostgresMetadataStore) GetSandbox(ctx context.Context, sandboxID string
 }
 
 func (s *PostgresMetadataStore) SaveSandbox(ctx context.Context, sbx *SandboxRecord) error {
+	return updateSandbox(ctx, s.pool, sbx)
+}
+
+func updateSandbox(ctx context.Context, db sandboxWriter, sbx *SandboxRecord) error {
 	sbx.UpdatedAt = time.Now().UTC()
 	raw, err := json.Marshal(sbx)
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		UPDATE kt_sandboxes
 		SET payload_json = $2, state = $3, active_snapshot_id = $4, updated_at = $5
 		WHERE sandbox_id = $1`,
 		sbx.SandboxID, raw, string(sbx.State), sbx.ActiveSnapshotID, sbx.UpdatedAt,
 	)
+	if err == nil && tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
 	return err
 }
 
+func (s *PostgresMetadataStore) GetForkReceipt(ctx context.Context, sourceID, requestKey string) (*ForkReceipt, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `SELECT receipt FROM kt_fork_receipts WHERE source_id=$1 AND request_key=$2`, sourceID, requestKey).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var receipt ForkReceipt
+	if err = json.Unmarshal(raw, &receipt); err != nil {
+		return nil, err
+	}
+	return &receipt, nil
+}
+
+func (s *PostgresMetadataStore) CommitFork(ctx context.Context, source *SandboxRecord, children []*SandboxRecord) error {
+	fork := source.PendingFork
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		for _, child := range children {
+			if err := insertSandbox(ctx, tx, child); err != nil {
+				return err
+			}
+		}
+		if fork.RequestKey != "" {
+			raw, err := json.Marshal(fork.ForkReceipt)
+			if err != nil {
+				return err
+			}
+			if _, err = tx.Exec(ctx, `INSERT INTO kt_fork_receipts VALUES ($1,$2,$3)`, source.SandboxID, fork.RequestKey, raw); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE kt_snapshots SET superseded=TRUE WHERE snapshot_id=$1 AND kind=$2`, fork.SnapshotID, string(protocol.SnapshotKindLiveFork)); err != nil {
+			return err
+		}
+		updated := *source
+		updated.PendingFork = nil
+		return updateSandbox(ctx, tx, &updated)
+	})
+}
+
 func (s *PostgresMetadataStore) ListSandboxesToSweep(ctx context.Context) ([]SandboxRecord, error) {
-	rows, err := s.pool.Query(ctx, `SELECT payload_json FROM kt_sandboxes WHERE state IN ($1,$2,$4,$5) OR (state=$3 AND coalesce(payload_json->>'currentSlotId','') <> '')`, string(SandboxStateRunning), string(SandboxStateSuspending), string(SandboxStateSuspended), string(SandboxStateCreating), string(SandboxStateResuming))
+	rows, err := s.pool.Query(ctx, `SELECT payload_json FROM kt_sandboxes WHERE state IN ($1,$2,$4,$5) OR (state=$3 AND (coalesce(payload_json->>'currentSlotId','') <> '' OR payload_json ? 'pendingFork'))`, string(SandboxStateRunning), string(SandboxStateSuspending), string(SandboxStateSuspended), string(SandboxStateCreating), string(SandboxStateResuming))
 	if err != nil {
 		return nil, err
 	}

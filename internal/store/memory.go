@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -22,6 +24,7 @@ type MemoryMetadataStore struct {
 	templates     map[string]TemplateRecord
 	snapshots     map[string]SnapshotRecord
 	sandboxes     map[string]SandboxRecord
+	forkReceipts  map[[2]string]ForkReceipt
 	leaders       map[string]bool
 }
 
@@ -31,6 +34,7 @@ func NewMemoryMetadataStore() *MemoryMetadataStore {
 		templates:     make(map[string]TemplateRecord),
 		snapshots:     make(map[string]SnapshotRecord),
 		sandboxes:     make(map[string]SandboxRecord),
+		forkReceipts:  make(map[[2]string]ForkReceipt),
 		leaders:       make(map[string]bool),
 	}
 }
@@ -191,13 +195,19 @@ func (m *MemoryMetadataStore) DeleteSnapshot(_ context.Context, snapshotID strin
 func (m *MemoryMetadataStore) CreateSandbox(_ context.Context, sbx *SandboxRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.sandboxes[sbx.SandboxID]; ok {
+		return ErrSandboxExists
+	}
+	m.insertSandbox(sbx)
+	return nil
+}
+func (m *MemoryMetadataStore) insertSandbox(sbx *SandboxRecord) {
 	now := time.Now().UTC()
 	if sbx.CreatedAt.IsZero() {
 		sbx.CreatedAt = now
 	}
 	sbx.UpdatedAt = now
 	m.sandboxes[sbx.SandboxID] = cloneSandbox(*sbx)
-	return nil
 }
 
 func (m *MemoryMetadataStore) GetSandbox(_ context.Context, sandboxID string) (*SandboxRecord, error) {
@@ -219,12 +229,56 @@ func (m *MemoryMetadataStore) SaveSandbox(_ context.Context, sbx *SandboxRecord)
 	return nil
 }
 
+func (m *MemoryMetadataStore) GetForkReceipt(_ context.Context, sourceID, requestKey string) (*ForkReceipt, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	r, ok := m.forkReceipts[[2]string{sourceID, requestKey}]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	r.ChildIDs = slices.Clone(r.ChildIDs)
+	return &r, nil
+}
+
+func (m *MemoryMetadataStore) CommitFork(_ context.Context, source *SandboxRecord, children []*SandboxRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fork := source.PendingFork
+	ids := make(map[string]bool, len(children))
+	for _, child := range children {
+		if _, ok := m.sandboxes[child.SandboxID]; ok || ids[child.SandboxID] {
+			return ErrSandboxExists
+		}
+		ids[child.SandboxID] = true
+	}
+	if _, ok := m.sandboxes[source.SandboxID]; !ok {
+		return ErrNotFound
+	}
+	for _, child := range children {
+		m.insertSandbox(child)
+	}
+	if fork.RequestKey != "" {
+		r := fork.ForkReceipt
+		r.ChildIDs = slices.Clone(r.ChildIDs)
+		m.forkReceipts[[2]string{source.SandboxID, fork.RequestKey}] = r
+	}
+	if snap := m.snapshots[fork.SnapshotID]; snap.Kind == protocol.SnapshotKindLiveFork {
+		snap.Superseded = true
+		m.snapshots[snap.SnapshotID] = snap
+	}
+	updated := cloneSandbox(*source)
+	updated.PendingFork = nil
+	updated.UpdatedAt = time.Now().UTC()
+	m.sandboxes[source.SandboxID] = updated
+	return nil
+}
+
 func (m *MemoryMetadataStore) ListSandboxesToSweep(_ context.Context) ([]SandboxRecord, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var out []SandboxRecord
 	for _, s := range m.sandboxes {
-		if s.State == SandboxStateCreating || s.State == SandboxStateResuming || s.State == SandboxStateRunning || s.State == SandboxStateSuspending || (s.State == SandboxStateSuspended && s.CurrentSlotID != "") {
+		if s.State == SandboxStateCreating || s.State == SandboxStateResuming || s.State == SandboxStateRunning || s.State == SandboxStateSuspending || (s.State == SandboxStateSuspended && (s.CurrentSlotID != "" || s.PendingFork != nil)) {
 			out = append(out, cloneSandbox(s))
 		}
 	}
@@ -235,10 +289,21 @@ func (m *MemoryMetadataStore) DeleteSandbox(_ context.Context, sandboxID string)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.sandboxes, sandboxID)
+	for key := range m.forkReceipts {
+		if key[0] == sandboxID {
+			delete(m.forkReceipts, key)
+		}
+	}
 	return nil
 }
 
 func cloneSandbox(in SandboxRecord) SandboxRecord {
+	if in.PendingFork != nil {
+		f := *in.PendingFork
+		f.ChildIDs = slices.Clone(f.ChildIDs)
+		f.EnvVars = maps.Clone(f.EnvVars)
+		in.PendingFork = &f
+	}
 	if in.PendingPlacement != nil {
 		p := *in.PendingPlacement
 		in.PendingPlacement = &p

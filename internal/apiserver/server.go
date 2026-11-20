@@ -19,7 +19,7 @@ import (
 	"github.com/kontinue-sh/kontinue/pkg/storage"
 	"github.com/kontinue-sh/kontinue/pkg/telemetry"
 	"go.opentelemetry.io/otel/attribute"
-	"golang.org/x/sync/errgroup"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -119,8 +119,9 @@ type CreateSandboxRequest struct {
 }
 
 type ForkSandboxRequest struct {
-	Count   int               `json:"count"`
-	EnvVars map[string]string `json:"envVars,omitempty"`
+	RequestKey string            `json:"-"`
+	Count      int               `json:"count"`
+	EnvVars    map[string]string `json:"envVars,omitempty"`
 }
 
 func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
@@ -264,10 +265,18 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 	case "fork":
 		var fReq ForkSandboxRequest
 		if r.Body != nil && r.ContentLength != 0 {
-			_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&fReq)
+			if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&fReq); err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
+		fReq.RequestKey = r.Header.Get(protocol.HeaderIdempotencyKey)
 		forks, err := s.ForkSandbox(r.Context(), sandboxID, fReq)
 		if err != nil {
+			if errors.Is(err, store.ErrTransitionLocked) || errors.Is(err, store.ErrStaleExecutionFence) {
+				writeErr(w, http.StatusConflict, err.Error())
+				return
+			}
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -542,6 +551,9 @@ func (s *Server) suspendSandbox(ctx context.Context, sandboxID string, observed 
 		retErr = err
 		return nil, err
 	}
+	if sbx.PendingFork != nil {
+		return nil, store.ErrTransitionLocked
+	}
 	if observed != nil && (sbx.ExecutionID != observed.ExecutionID || sbx.State != observed.State || sbx.LifecycleID != observed.LifecycleID) {
 		return nil, store.ErrStaleExecutionFence
 	}
@@ -574,7 +586,7 @@ func (s *Server) suspendSandbox(ctx context.Context, sandboxID string, observed 
 	}
 	snapRec, err := s.cfg.Meta.GetSnapshot(ctx, sbx.PendingSnapshotID)
 	if errors.Is(err, store.ErrNotFound) {
-		snapRec, err = s.captureSuspend(ctx, sbx, route)
+		snapRec, err = s.captureSandbox(ctx, sbx, route, sbx.PendingSnapshotID, protocol.SnapshotKindSessionSuspend)
 	}
 	if err != nil {
 		return nil, err
@@ -635,7 +647,7 @@ func (s *Server) releaseExecution(ctx context.Context, sbx *store.SandboxRecord)
 	return nil
 }
 
-func (s *Server) captureSuspend(ctx context.Context, sbx *store.SandboxRecord, route *protocol.RouteRecord) (*store.SnapshotRecord, error) {
+func (s *Server) captureSandbox(ctx context.Context, sbx *store.SandboxRecord, route *protocol.RouteRecord, newSnapID string, kind protocol.SnapshotKind) (*store.SnapshotRecord, error) {
 	releaseSnapshots, err := s.cfg.Meta.LockSnapshotSet(ctx, false)
 	if err != nil {
 		return nil, err
@@ -646,8 +658,7 @@ func (s *Server) captureSuspend(ctx context.Context, sbx *store.SandboxRecord, r
 		return nil, err
 	}
 	sandboxID := sbx.SandboxID
-	newSnapID := sbx.PendingSnapshotID
-	if _, err := nodeClient.PrepareCheckpoint(ctx, &protocol.PrepareCheckpointRequest{
+	prep := &protocol.PrepareCheckpointRequest{
 		SandboxID:        sandboxID,
 		ExecutionID:      sbx.ExecutionID,
 		LifecycleID:      sbx.LifecycleID,
@@ -659,31 +670,39 @@ func (s *Server) captureSuspend(ctx context.Context, sbx *store.SandboxRecord, r
 		PodIP:            route.PodIP,
 		TargetSnapshotID: newSnapID,
 		ParentSnapshotID: sbx.ActiveSnapshotID,
-		Kind:             protocol.SnapshotKindSessionSuspend,
+		Kind:             kind,
 		LeaveRunning:     true,
 		BootstrapToken:   sbx.BootstrapToken,
-	}); err != nil {
-		return nil, err
 	}
-
-	kubeletPort := s.lookupNodeKubeletPort(ctx, route.NodeID)
-	if _, err := s.cfg.Kubelet.CheckpointContainer(ctx, route.NodeIP, kubeletPort,
-		sbx.CarrierPodNamespace, sbx.CarrierPodName, protocol.ContainerNameSandbox, 60); err != nil {
-		return nil, err
-	}
-
-	snapRes, err := nodeClient.GetLatestSnapshotResult(ctx, &protocol.GetLatestSnapshotResultRequest{SnapshotID: newSnapID})
+	query := &protocol.GetLatestSnapshotResultRequest{SnapshotID: newSnapID, Expected: prep}
+	snapRes, err := nodeClient.GetLatestSnapshotResult(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("fetch suspend snapshot %s: %w", newSnapID, err)
+		return nil, err
 	}
 	if !snapRes.Found {
-		return nil, fmt.Errorf("suspend snapshot %s is unavailable", newSnapID)
-	}
+		if _, err := nodeClient.PrepareCheckpoint(ctx, prep); err != nil {
+			return nil, err
+		}
 
+		kubeletPort := s.lookupNodeKubeletPort(ctx, route.NodeID)
+		if _, err := s.cfg.Kubelet.CheckpointContainer(ctx, route.NodeIP, kubeletPort,
+			sbx.CarrierPodNamespace, sbx.CarrierPodName, protocol.ContainerNameSandbox, 60); err != nil {
+			return nil, err
+		}
+
+		snapRes, err = nodeClient.GetLatestSnapshotResult(ctx, query)
+		if err != nil {
+			return nil, fmt.Errorf("fetch snapshot %s: %w", newSnapID, err)
+		}
+		if !snapRes.Found {
+			return nil, fmt.Errorf("snapshot %s is unavailable", newSnapID)
+		}
+
+	}
 	prevSnapID := sbx.ActiveSnapshotID
 	snapRec := &store.SnapshotRecord{
 		SnapshotID:       newSnapID,
-		Kind:             protocol.SnapshotKindSessionSuspend,
+		Kind:             kind,
 		TemplateID:       sbx.TemplateID,
 		SourceSandboxID:  sandboxID,
 		ParentSnapshotID: prevSnapID,
@@ -752,7 +771,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 	if sbx.State == store.SandboxStateCreating || sbx.State == store.SandboxStateResuming {
 		return s.advanceActivation(ctx, sbx)
 	}
-	if sbx.State != store.SandboxStateSuspended {
+	if sbx.State != store.SandboxStateSuspended || sbx.PendingFork != nil {
 		return nil, store.ErrTransitionLocked
 	}
 	if err := s.finishSuspendRelease(ctx, sbx); err != nil {
@@ -766,23 +785,6 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 		return nil, err
 	}
 	return s.advanceActivation(ctx, sbx)
-}
-
-func (s *Server) abandonHydratedSlot(ctx context.Context, dec *PlacementDecision, sandboxID string, executionID int64, lifecycleID string) {
-	if dec == nil {
-		return
-	}
-	nc, err := s.nodeClient(dec.Node.GRPCAddr)
-	if err != nil {
-		return
-	}
-	released, err := nc.ReleaseSlot(ctx, &protocol.ReleaseSlotRequest{SlotID: dec.Slot.SlotID, SandboxID: sandboxID, ExecutionID: executionID, LifecycleID: lifecycleID})
-	if err != nil || !released.Released {
-		return
-	}
-	if s.cfg.Replenisher != nil {
-		s.cfg.Replenisher.EnqueueTaintedPod(dec.Slot.PodNamespace, dec.Slot.PodName, released.PodUID)
-	}
 }
 
 func (s *Server) routeForExecution(ctx context.Context, sbx *store.SandboxRecord) (*protocol.RouteRecord, error) {
@@ -828,197 +830,6 @@ func (s *Server) routeForExecution(ctx context.Context, sbx *store.SandboxRecord
 	return route, nil
 }
 
-// ForkSandbox checkpoints a live running sandbox in-place (--leave-running) via Kubelet /checkpoint API
-// and spawns K independent branch sandboxes with distinct IDs, IPs, and tokens from that exact memory state.
-func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req ForkSandboxRequest) ([]*store.SandboxRecord, error) {
-	if req.Count <= 0 {
-		req.Count = 1
-	}
-	ctx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "apiserver.fork_sandbox",
-		attribute.String(telemetry.AttrSandboxID, sourceSandboxID),
-		attribute.Int("fork.count", req.Count),
-	)
-	var retErr error
-	defer func() { telemetry.EndSpan(span, retErr) }()
-
-	unlock, err := s.lockExecution(ctx, sourceSandboxID)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-
-	releaseSnapshots, err := s.cfg.Meta.LockSnapshotSet(ctx, false)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseSnapshots()
-	src, err := s.cfg.Meta.GetSandbox(ctx, sourceSandboxID)
-	if err != nil {
-		retErr = err
-		return nil, err
-	}
-	var forkSnap *store.SnapshotRecord
-	if src.State == store.SandboxStateRunning {
-		route, rErr := s.cfg.Catalog.GetRoute(ctx, sourceSandboxID)
-		if rErr != nil {
-			retErr = rErr
-			return nil, rErr
-		}
-		nodeClient, nErr := s.nodeClient(route.NodeGRPCAddr)
-		if nErr != nil {
-			retErr = nErr
-			return nil, nErr
-		}
-		snapID := fmt.Sprintf("snap-fork-%s-%s", sourceSandboxID, randHex(4))
-		if _, err := nodeClient.PrepareCheckpoint(ctx, &protocol.PrepareCheckpointRequest{
-			SandboxID:        sourceSandboxID,
-			ExecutionID:      src.ExecutionID,
-			LifecycleID:      src.LifecycleID,
-			TemplateID:       src.TemplateID,
-			BaseImage:        src.BaseImage,
-			SlotID:           src.CurrentSlotID,
-			PodNamespace:     src.CarrierPodNamespace,
-			PodName:          src.CarrierPodName,
-			PodIP:            route.PodIP,
-			TargetSnapshotID: snapID,
-			ParentSnapshotID: src.ActiveSnapshotID,
-			Kind:             protocol.SnapshotKindLiveFork,
-			LeaveRunning:     true,
-			BootstrapToken:   src.BootstrapToken,
-		}); err != nil {
-			retErr = err
-			return nil, err
-		}
-		kubeletPort := s.lookupNodeKubeletPort(ctx, route.NodeID)
-		if _, err := s.cfg.Kubelet.CheckpointContainer(ctx, route.NodeIP, kubeletPort,
-			src.CarrierPodNamespace, src.CarrierPodName, protocol.ContainerNameSandbox, 60); err != nil {
-			retErr = err
-			return nil, err
-		}
-		res, gErr := nodeClient.GetLatestSnapshotResult(ctx, &protocol.GetLatestSnapshotResultRequest{SnapshotID: snapID})
-		if gErr != nil || !res.Found {
-			retErr = fmt.Errorf("fetch fork snapshot %s: %w", snapID, gErr)
-			return nil, retErr
-		}
-		forkSnap = &store.SnapshotRecord{
-			SnapshotID:       snapID,
-			Kind:             protocol.SnapshotKindLiveFork,
-			TemplateID:       src.TemplateID,
-			SourceSandboxID:  sourceSandboxID,
-			ParentSnapshotID: src.ActiveSnapshotID,
-			BaseImage:        src.BaseImage,
-			ManifestURI:      res.ManifestURI,
-			OriginNodeID:     route.NodeID,
-			OriginPeerAddr:   route.NodeGRPCAddr,
-			TotalMemoryBytes: res.Manifest.PagesImgTotalSize,
-			DirtyMemoryBytes: res.Manifest.DirtyMemoryBytes,
-			DirtyChunks:      res.Manifest.DirtyChunkCount,
-			ReusedChunks:     res.Manifest.ReusedChunkCount,
-			BootstrapToken:   src.BootstrapToken,
-			Fingerprint:      res.Manifest.Fingerprint,
-		}
-		if err := s.cfg.Meta.CreateSnapshot(ctx, forkSnap); err != nil {
-			retErr = err
-			return nil, err
-		}
-	} else if src.State == store.SandboxStateSuspended && src.ActiveSnapshotID != "" {
-		forkSnap, err = s.cfg.Meta.GetSnapshot(ctx, src.ActiveSnapshotID)
-		if err != nil {
-			retErr = err
-			return nil, err
-		}
-	} else {
-		retErr = fmt.Errorf("source sandbox %s has no running state or snapshot to fork", sourceSandboxID)
-		return nil, retErr
-	}
-
-	// The restored guest carries its parent's execution fence, including in
-	// snapshots baked with older ktd binaries. Branch IDs have their own routes.
-	branchExecution := src.ExecutionID + 1
-	out := make([]*store.SandboxRecord, req.Count)
-	g, gCtx := errgroup.WithContext(ctx)
-	for i := 0; i < req.Count; i++ {
-		idx := i
-		g.Go(func() error {
-			forkID := fmt.Sprintf("%s-fork-%d-%s", sourceSandboxID, idx+1, randHex(3))
-			dec, pErr := s.cfg.Placement.SelectAndClaimSlot(gCtx, PlacementRequest{
-				Tier:                        src.Tier,
-				SnapshotID:                  forkSnap.SnapshotID,
-				OriginNodeID:                forkSnap.OriginNodeID,
-				RequiredFingerprint:         &forkSnap.Fingerprint,
-				AllowFilesystemOnlyFallback: src.AllowFilesystemOnlyFallback,
-			})
-			if pErr != nil {
-				return pErr
-			}
-			nc, cErr := s.nodeClient(dec.Node.GRPCAddr)
-			if cErr != nil {
-				return cErr
-			}
-			mergedEnv := make(map[string]string, len(src.EnvVars)+len(req.EnvVars))
-			for k, v := range src.EnvVars {
-				mergedEnv[k] = v
-			}
-			for k, v := range req.EnvVars {
-				mergedEnv[k] = v
-			}
-			newTok := "kt_fork_" + randHex(16)
-			lifeID := "life-" + randHex(6)
-			hydResp, hErr := nc.HydrateSlot(gCtx, &protocol.HydrateSlotRequest{
-				Slot:           dec.Slot,
-				SandboxID:      forkID,
-				TemplateID:     src.TemplateID,
-				ExecutionID:    branchExecution,
-				LifecycleID:    lifeID,
-				SnapshotID:     forkSnap.SnapshotID,
-				BaseImage:      src.BaseImage,
-				RestoreMode:    dec.RestoreMode,
-				BootstrapToken: forkSnap.BootstrapToken,
-				AccessToken:    newTok,
-				EnvVars:        mergedEnv,
-				CPUMillis:      src.CPUMillis,
-				MemoryBytes:    src.MemoryBytes,
-			})
-			if hErr != nil {
-				return hErr
-			}
-			rec := &store.SandboxRecord{
-				SandboxID:           forkID,
-				TemplateID:          src.TemplateID,
-				BaseImage:           src.BaseImage,
-				Tier:                src.Tier,
-				State:               store.SandboxStateRunning,
-				ExecutionID:         branchExecution,
-				LifecycleID:         lifeID,
-				ActiveSnapshotID:    forkSnap.SnapshotID,
-				CurrentNodeID:       dec.Node.NodeID,
-				OriginNodeID:        dec.Node.NodeID,
-				CurrentSlotID:       dec.Slot.SlotID,
-				CarrierPodNamespace: dec.Slot.PodNamespace,
-				CarrierPodName:      dec.Slot.PodName,
-				PodIP:               hydResp.PodIP,
-				AccessToken:         newTok,
-				BootstrapToken:      forkSnap.BootstrapToken,
-				EnvVars:             mergedEnv,
-				IdleTimeoutSeconds:  src.IdleTimeoutSeconds,
-				CPUMillis:           src.CPUMillis,
-				MemoryBytes:         src.MemoryBytes,
-			}
-			if err := s.cfg.Meta.CreateSandbox(gCtx, rec); err != nil {
-				s.abandonHydratedSlot(gCtx, dec, forkID, branchExecution, lifeID)
-				return err
-			}
-			out[idx] = rec
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		retErr = err
-		return nil, err
-	}
-	return out, nil
-}
-
 func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
 	unlock, err := s.lockExecution(ctx, sandboxID)
 	if err != nil {
@@ -1031,6 +842,9 @@ func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
 	}
 	if err != nil {
 		return err
+	}
+	if sbx.PendingFork != nil && sbx.State != store.SandboxStateFailed {
+		return store.ErrTransitionLocked
 	}
 	if sbx.State == store.SandboxStateCreating || sbx.State == store.SandboxStateResuming {
 		if err := s.cfg.Catalog.FinishReservation(ctx, sbx.LifecycleID, sbx.PendingPlacement == nil); err != nil {
@@ -1085,6 +899,10 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 				continue
 			}
 			if s.reconcileSandbox(ctx, &sbx) {
+				continue
+			}
+			if sbx.PendingFork != nil {
+				_, _ = s.prepareFork(ctx, sbx.SandboxID, nil, sbx.PendingFork.OperationID)
 				continue
 			}
 			if sbx.State == store.SandboxStateSuspending || sbx.State == store.SandboxStateSuspended {
@@ -1314,6 +1132,8 @@ func redactSandbox(sbx *store.SandboxRecord) store.SandboxRecord {
 	}
 	cp := *sbx
 	cp.PendingPlacement = nil
+	cp.PendingFork = nil
+	cp.ForkOperationID = ""
 	cp.BootstrapToken = ""
 	return cp
 }

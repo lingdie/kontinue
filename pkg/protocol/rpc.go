@@ -163,7 +163,8 @@ type PrewarmTemplateResponse struct {
 }
 
 type GetLatestSnapshotResultRequest struct {
-	SnapshotID string `json:"snapshotId"`
+	Expected   *PrepareCheckpointRequest `json:"expected,omitempty"`
+	SnapshotID string                    `json:"snapshotId"`
 }
 
 type GetLatestSnapshotResultResponse struct {

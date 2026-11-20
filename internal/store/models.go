@@ -70,7 +70,22 @@ type ActivationPlacement struct {
 	RestoreMode string               `json:"restoreMode"`
 }
 
+// ForkReceipt identifies the branches even after a lost HTTP response.
+type ForkReceipt struct {
+	OperationID string   `json:"operationId"`
+	RequestHash string   `json:"requestHash"`
+	ChildIDs    []string `json:"childIds"`
+}
+type PendingFork struct {
+	ForkReceipt
+	RequestKey string            `json:"requestKey,omitempty"`
+	SnapshotID string            `json:"snapshotId"`
+	EnvVars    map[string]string `json:"envVars,omitempty"`
+}
+
 type SandboxRecord struct {
+	PendingFork                 *PendingFork         `json:"pendingFork,omitempty"`
+	ForkOperationID             string               `json:"forkOperationId,omitempty"`
 	PendingPlacement            *ActivationPlacement `json:"pendingPlacement,omitempty"`
 	FailureReason               string               `json:"failureReason,omitempty"`
 	SandboxID                   string               `json:"sandboxId"`
@@ -120,6 +135,8 @@ type MetadataStore interface {
 
 	CreateSandbox(ctx context.Context, sbx *SandboxRecord) error
 	GetSandbox(ctx context.Context, sandboxID string) (*SandboxRecord, error)
+	CommitFork(ctx context.Context, source *SandboxRecord, children []*SandboxRecord) error
+	GetForkReceipt(ctx context.Context, sourceID, requestKey string) (*ForkReceipt, error)
 	SaveSandbox(ctx context.Context, sbx *SandboxRecord) error
 	ListSandboxesToSweep(ctx context.Context) ([]SandboxRecord, error)
 	DeleteSandbox(ctx context.Context, sandboxID string) error
