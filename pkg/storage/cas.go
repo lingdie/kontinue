@@ -21,6 +21,7 @@ var ErrObjectNotFound = errors.New("storage object not found")
 // Backend abstracts shared durable storage (S3 / MinIO / Shared FS) for SnapshotManifests,
 // 2MiB Blake3 memory chunks, checkpoint.img, pages_meta.img, and rootfs diffs.
 type Backend interface {
+	ManifestURI(snapshotID string) string
 	PutManifest(ctx context.Context, snapshotID string, manifest *protocol.SnapshotManifest) (string, error)
 	GetManifest(ctx context.Context, snapshotID string) (*protocol.SnapshotManifest, error)
 
@@ -66,6 +67,10 @@ func (b *LocalFSBackend) safePath(key string) (string, error) {
 	return full, nil
 }
 
+func (b *LocalFSBackend) ManifestURI(snapshotID string) string {
+	return "file://" + ArtifactKey(snapshotID, protocol.ManifestFileName)
+}
+
 func (b *LocalFSBackend) PutManifest(ctx context.Context, snapshotID string, manifest *protocol.SnapshotManifest) (string, error) {
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -75,7 +80,7 @@ func (b *LocalFSBackend) PutManifest(ctx context.Context, snapshotID string, man
 	if err := b.PutBlob(ctx, key, bytes.NewReader(raw), int64(len(raw))); err != nil {
 		return "", err
 	}
-	return "file://" + key, nil
+	return b.ManifestURI(snapshotID), nil
 }
 
 func (b *LocalFSBackend) GetManifest(ctx context.Context, snapshotID string) (*protocol.SnapshotManifest, error) {
@@ -229,6 +234,10 @@ func (h *HTTPObjectStoreBackend) authorize(req *http.Request) {
 	}
 }
 
+func (h *HTTPObjectStoreBackend) ManifestURI(snapshotID string) string {
+	return h.urlFor(ArtifactKey(snapshotID, protocol.ManifestFileName))
+}
+
 func (h *HTTPObjectStoreBackend) PutManifest(ctx context.Context, snapshotID string, manifest *protocol.SnapshotManifest) (string, error) {
 	raw, err := json.Marshal(manifest)
 	if err != nil {
@@ -238,7 +247,7 @@ func (h *HTTPObjectStoreBackend) PutManifest(ctx context.Context, snapshotID str
 	if err := h.PutBlob(ctx, key, bytes.NewReader(raw), int64(len(raw))); err != nil {
 		return "", err
 	}
-	return h.urlFor(key), nil
+	return h.ManifestURI(snapshotID), nil
 }
 
 func (h *HTTPObjectStoreBackend) GetManifest(ctx context.Context, snapshotID string) (*protocol.SnapshotManifest, error) {

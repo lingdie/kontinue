@@ -29,22 +29,23 @@ type checkpointReceipt struct {
 }
 
 type ownership struct {
-	LastCheckpoint *checkpointReceipt            `json:"lastCheckpoint,omitempty"`
-	RequestHash    string                        `json:"requestHash,omitempty"`
-	Activation     *protocol.HydrateSlotResponse `json:"activation,omitempty"`
-	FailureReason  string                        `json:"failureReason,omitempty"`
-	View           *arena.ViewIdentity           `json:"view,omitempty"`
-	Version        int                           `json:"version"`
-	Phase          ownershipPhase                `json:"phase"`
-	Slot           protocol.CarrierSlot          `json:"slot"`
-	SandboxID      string                        `json:"sandboxId"`
-	ExecutionID    int64                         `json:"executionId"`
-	LifecycleID    string                        `json:"lifecycleId"`
-	ContainerID    string                        `json:"containerId"`
-	KtdEndpoint    string                        `json:"ktdEndpoint,omitempty"`
-	ViewID         string                        `json:"viewId,omitempty"`
-	ViewPath       string                        `json:"viewPath,omitempty"`
-	BootstrapToken string                        `json:"bootstrapToken,omitempty"`
+	LastCheckpoint   *checkpointReceipt            `json:"lastCheckpoint,omitempty"`
+	StagedCheckpoint *checkpointReceipt            `json:"stagedCheckpoint,omitempty"`
+	RequestHash      string                        `json:"requestHash,omitempty"`
+	Activation       *protocol.HydrateSlotResponse `json:"activation,omitempty"`
+	FailureReason    string                        `json:"failureReason,omitempty"`
+	View             *arena.ViewIdentity           `json:"view,omitempty"`
+	Version          int                           `json:"version"`
+	Phase            ownershipPhase                `json:"phase"`
+	Slot             protocol.CarrierSlot          `json:"slot"`
+	SandboxID        string                        `json:"sandboxId"`
+	ExecutionID      int64                         `json:"executionId"`
+	LifecycleID      string                        `json:"lifecycleId"`
+	ContainerID      string                        `json:"containerId"`
+	KtdEndpoint      string                        `json:"ktdEndpoint,omitempty"`
+	ViewID           string                        `json:"viewId,omitempty"`
+	ViewPath         string                        `json:"viewPath,omitempty"`
+	BootstrapToken   string                        `json:"bootstrapToken,omitempty"`
 }
 
 type ownershipJournal string

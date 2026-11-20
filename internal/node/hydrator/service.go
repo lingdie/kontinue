@@ -135,7 +135,7 @@ func (s *Service) PrepareCheckpoint(ctx context.Context, req *protocol.PrepareCh
 	s.mu.Lock()
 	current := s.byContainer[st.ContainerID] == st
 	s.mu.Unlock()
-	if !current || st.Phase != activeExecution || st.SandboxID != req.SandboxID || (req.ExecutionID != 0 && req.ExecutionID != st.ExecutionID) || (req.LifecycleID != "" && req.LifecycleID != st.LifecycleID) {
+	if !current || st.Phase != activeExecution || !matchesCheckpointOwner(st, req) {
 		return nil, store.ErrStaleExecutionFence
 	}
 	if st.Slot.NetworkReadyOnly {
@@ -242,17 +242,25 @@ func (s *Service) ExecuteCheckpoint(ctx context.Context, req *protocol.ExecuteCh
 		attribute.String(telemetry.AttrSnapshotID, prep.TargetSnapshotID),
 	)
 
-	requestHash := checkpointRequestHash(prep)
-	if saved := active.LastCheckpoint; saved != nil && saved.Result.Manifest.SnapshotID == prep.TargetSnapshotID {
-		if saved.RequestHash != requestHash {
-			return nil, store.ErrStaleExecutionFence
-		}
+	saved, err := s.replayCheckpoint(ctx, active, prep)
+	if err != nil {
+		return nil, err
+	}
+	if saved != nil {
 		if req.KubeletLocation != "" {
 			if err := s.cfg.Arena.WriteCheckpointDescriptor(req.KubeletLocation, &saved.Result.Manifest, saved.Result.ManifestURI); err != nil {
 				return nil, err
 			}
 		}
 		return &saved.Result, nil
+	}
+	if active.StagedCheckpoint != nil {
+		return nil, fmt.Errorf("another checkpoint is awaiting publication: %w", store.ErrTransitionLocked)
+	}
+	if exists, err := s.cfg.Arena.CheckpointManifestExists(ctx, prep.TargetSnapshotID); err != nil {
+		return nil, err
+	} else if exists {
+		return nil, fmt.Errorf("snapshot %s already has a manifest without a matching receipt: %w", prep.TargetSnapshotID, store.ErrStaleExecutionFence)
 	}
 	ktdAddr := prep.PodIP
 	if ktdAddr != "" && !strings.Contains(ktdAddr, ":") {
@@ -302,7 +310,7 @@ func (s *Service) ExecuteCheckpoint(ctx context.Context, req *protocol.ExecuteCh
 	}
 
 	// Step 3: 2MiB Blake3 chunking + incremental diff against ParentSnapshotID + Kubelet tar descriptor!
-	mf, uri, err := s.cfg.Arena.IngestRawCheckpoint(ctx, arena.IngestOptions{
+	_, _, err = s.cfg.Arena.IngestRawCheckpoint(ctx, arena.IngestOptions{
 		SnapshotID:       prep.TargetSnapshotID,
 		Kind:             prep.Kind,
 		TemplateID:       prep.TemplateID,
@@ -314,30 +322,28 @@ func (s *Service) ExecuteCheckpoint(ctx context.Context, req *protocol.ExecuteCh
 		PinInL1Tmpfs:     prep.Kind == protocol.SnapshotKindGoldenTemplate,
 		TraceHotPages:    prep.TraceHotPages,
 		Fingerprint:      s.cfg.Fingerprint,
+		BeforePublish: func(manifest *protocol.SnapshotManifest, uri string) error {
+			next := active.ownership
+			next.StagedCheckpoint = &checkpointReceipt{RequestHash: checkpointRequestHash(prep), Result: protocol.ExecuteCheckpointResponse{
+				Manifest: *manifest, ManifestURI: uri, ArenaTier: arena.TierL2NVMe,
+			}}
+			if err := s.journal.write(next, false); err != nil {
+				return err
+			}
+			active.StagedCheckpoint = next.StagedCheckpoint
+			return nil
+		},
 	})
 	if err != nil {
 		retErr = err
 		return nil, err
 	}
 
-	out := &protocol.ExecuteCheckpointResponse{
-		Manifest:    *mf,
-		ManifestURI: uri,
-		ArenaTier:   arena.TierL2NVMe,
-	}
-	next := active.ownership
-	next.LastCheckpoint = &checkpointReceipt{RequestHash: requestHash, Result: *out}
-	if err := s.journal.write(next, false); err != nil {
+	saved, err = s.commitCheckpoint(active)
+	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	if previous := active.LastCheckpoint; previous != nil {
-		delete(s.results, previous.Result.Manifest.SnapshotID)
-	}
-	active.LastCheckpoint = next.LastCheckpoint
-	s.results[prep.TargetSnapshotID] = next.LastCheckpoint
-	s.mu.Unlock()
-	return out, nil
+	return &saved.Result, nil
 }
 
 // HydrateSlot hot-swaps a pre-warmed Carrier Pod's inner container with a memory-restored (or cold)
@@ -691,11 +697,21 @@ func checkpointRequestHash(req *protocol.PrepareCheckpointRequest) string {
 	return fmt.Sprintf("%x", sha256.Sum256(raw))
 }
 
-func (s *Service) GetLatestSnapshotResult(_ context.Context, req *protocol.GetLatestSnapshotResultRequest) (*protocol.GetLatestSnapshotResultResponse, error) {
+func (s *Service) GetLatestSnapshotResult(ctx context.Context, req *protocol.GetLatestSnapshotResultRequest) (*protocol.GetLatestSnapshotResultResponse, error) {
+	if req.Expected != nil && req.Expected.TargetSnapshotID != req.SnapshotID {
+		return nil, store.ErrStaleExecutionFence
+	}
 	s.mu.Lock()
-	res, ok := s.results[req.SnapshotID]
+	res := s.results[req.SnapshotID]
 	s.mu.Unlock()
-	if !ok {
+	if res == nil && req.Expected != nil {
+		var err error
+		res, err = s.recoverCheckpointResult(ctx, req.Expected)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if res == nil {
 		return &protocol.GetLatestSnapshotResultResponse{Found: false}, nil
 	}
 	if req.Expected != nil && checkpointRequestHash(req.Expected) != res.RequestHash {

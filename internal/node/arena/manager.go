@@ -214,6 +214,7 @@ func (m *Manager) ReadLocalChunk(blake3Hash string) ([]byte, error) {
 }
 
 type IngestOptions struct {
+	BeforePublish    func(*protocol.SnapshotManifest, string) error
 	SnapshotID       string
 	Kind             protocol.SnapshotKind
 	TemplateID       string
@@ -256,6 +257,7 @@ func (m *Manager) IngestRawCheckpoint(ctx context.Context, opts IngestOptions) (
 
 	if m.cfg.RustArenaHelper != "" {
 		if _, err := os.Stat(m.cfg.RustArenaHelper); err == nil {
+			draftPath := filepath.Join(opts.RawCheckpointDir, protocol.ManifestFileName)
 			fpJSON, _ := json.Marshal(opts.Fingerprint)
 			args := []string{
 				"chunk-diff",
@@ -268,7 +270,7 @@ func (m *Manager) IngestRawCheckpoint(ctx context.Context, opts IngestOptions) (
 				"--bootstrap-token", opts.BootstrapToken,
 				"--input-dir", opts.RawCheckpointDir,
 				"--cas-dir", m.cfg.L2CASDir,
-				"--output-manifest", outManifestPath,
+				"--output-manifest", draftPath,
 				"--fingerprint-json", string(fpJSON),
 			}
 			if parentPath != "" {
@@ -280,7 +282,7 @@ func (m *Manager) IngestRawCheckpoint(ctx context.Context, opts IngestOptions) (
 				retErr = fmt.Errorf("kontinue-arena-helper chunk-diff failed: %w (%s)", runErr, string(out))
 				return nil, "", retErr
 			}
-			raw, err := os.ReadFile(outManifestPath)
+			raw, err := os.ReadFile(draftPath)
 			if err != nil {
 				retErr = err
 				return nil, "", err
@@ -295,7 +297,7 @@ func (m *Manager) IngestRawCheckpoint(ctx context.Context, opts IngestOptions) (
 
 	if manifest == nil {
 		var err error
-		manifest, err = m.chunkAndDiffGo(opts, parentManifest, outManifestPath)
+		manifest, err = m.chunkAndDiffGo(opts, parentManifest)
 		if err != nil {
 			retErr = err
 			return nil, "", err
@@ -305,26 +307,23 @@ func (m *Manager) IngestRawCheckpoint(ctx context.Context, opts IngestOptions) (
 	// HotPageIndices is filled later from the read order gVisor actually issues
 	// against the ArenaFS pages file. A build-time scan cannot see that order.
 
-	m.mu.Lock()
-	m.l2Manifests[opts.SnapshotID] = manifest
-	m.mu.Unlock()
+	manifestURI := m.checkpointManifestURI(opts.SnapshotID)
+	if opts.BeforePublish != nil {
+		if err := opts.BeforePublish(manifest, manifestURI); err != nil {
+			retErr = err
+			return nil, "", err
+		}
+	}
+	if err := m.publishCheckpointManifest(ctx, manifest); err != nil {
+		retErr = err
+		return nil, "", err
+	}
 
 	span.SetAttributes(
 		attribute.Int("dirty_chunks_count", int(manifest.DirtyChunkCount)),
 		attribute.Int("reused_chunks_count", int(manifest.ReusedChunkCount)),
 		attribute.Int64(telemetry.AttrBytes, manifest.DirtyMemoryBytes),
 	)
-
-	manifestURI := "local://" + outManifestPath
-	if m.cfg.RemoteStore != nil {
-		// Upload metadata + dirty chunks synchronously enough for reliability or via tracked uploadWG.
-		uri, err := m.uploadSnapshotToRemote(ctx, manifest)
-		if err != nil {
-			retErr = err
-			return nil, "", err
-		}
-		manifestURI = uri
-	}
 
 	if opts.KubeletTarPath != "" {
 		if err := writeKubeletCheckpointTar(opts.KubeletTarPath, manifest, manifestURI, outManifestPath); err != nil {
@@ -386,13 +385,13 @@ func skipThawTouchOrder(chunks []protocol.ChunkRef) []protocol.ChunkRef {
 func (m *Manager) uploadSnapshotToRemote(ctx context.Context, mf *protocol.SnapshotManifest) (uri string, err error) {
 	ctx, span := telemetry.StartSpan(ctx, "kontinue-arena", "arena.upload_snapshot", attribute.String(telemetry.AttrSnapshotID, mf.SnapshotID))
 	defer func() { telemetry.EndSpan(span, err) }()
-	snapDir := filepath.Join(m.cfg.L2CASDir, "snapshots", mf.SnapshotID)
-	for _, art := range []string{protocol.GVisorCheckpointImg, protocol.GVisorPagesMetaImg, protocol.RootfsUpperTar} {
-		p := filepath.Join(snapDir, art)
-		if data, err := os.ReadFile(p); err == nil {
-			if err := m.cfg.RemoteStore.PutBlob(ctx, storage.ArtifactKey(mf.SnapshotID, art), bytes.NewReader(data), int64(len(data))); err != nil {
-				return "", err
-			}
+	for _, art := range checkpointArtifacts(mf) {
+		data, err := os.ReadFile(filepath.Join(m.cfg.L2CASDir, art.key))
+		if err != nil {
+			return "", err
+		}
+		if err := m.cfg.RemoteStore.PutBlob(ctx, art.key, bytes.NewReader(data), int64(len(data))); err != nil {
+			return "", err
 		}
 	}
 
@@ -716,7 +715,7 @@ func (m *Manager) loadCoreArtifacts(ctx context.Context, mf *protocol.SnapshotMa
 }
 
 // chunkAndDiffGo is the pure-Go 2MiB Blake3 fallback matching crates/kontinue-arena byte-for-byte.
-func (m *Manager) chunkAndDiffGo(opts IngestOptions, parent *protocol.SnapshotManifest, outManifestPath string) (*protocol.SnapshotManifest, error) {
+func (m *Manager) chunkAndDiffGo(opts IngestOptions, parent *protocol.SnapshotManifest) (*protocol.SnapshotManifest, error) {
 	parentSet := make(map[string]bool)
 	if parent != nil {
 		for _, ch := range parent.Chunks {
@@ -855,10 +854,6 @@ func (m *Manager) chunkAndDiffGo(opts IngestOptions, parent *protocol.SnapshotMa
 		OriginPeerAddr:     m.cfg.P2PAddr,
 		BootstrapToken:     opts.BootstrapToken,
 		Fingerprint:        opts.Fingerprint,
-	}
-	raw, _ := json.MarshalIndent(mf, "", "  ")
-	if err := writeAtomicFile(outManifestPath, raw); err != nil {
-		return nil, err
 	}
 	return mf, nil
 }
