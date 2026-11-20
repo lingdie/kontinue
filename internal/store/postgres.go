@@ -393,7 +393,7 @@ func (s *PostgresMetadataStore) SaveSandbox(ctx context.Context, sbx *SandboxRec
 }
 
 func (s *PostgresMetadataStore) ListSandboxesToSweep(ctx context.Context) ([]SandboxRecord, error) {
-	rows, err := s.pool.Query(ctx, `SELECT payload_json FROM kt_sandboxes WHERE state IN ($1,$2) OR (state=$3 AND coalesce(payload_json->>'currentSlotId','') <> '')`, string(SandboxStateRunning), string(SandboxStateSuspending), string(SandboxStateSuspended))
+	rows, err := s.pool.Query(ctx, `SELECT payload_json FROM kt_sandboxes WHERE state IN ($1,$2,$4,$5) OR (state=$3 AND coalesce(payload_json->>'currentSlotId','') <> '')`, string(SandboxStateRunning), string(SandboxStateSuspending), string(SandboxStateSuspended), string(SandboxStateCreating), string(SandboxStateResuming))
 	if err != nil {
 		return nil, err
 	}

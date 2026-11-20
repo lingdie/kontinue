@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,8 @@ import (
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
 	"github.com/kontinue-sh/kontinue/pkg/telemetry"
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -268,11 +271,17 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		}
 	}
 	bootstrapToken := req.BootstrapToken
+	baseImage := req.BaseImage
 
 	if req.Slot.SlotID == "" || req.SandboxID == "" || req.ExecutionID <= 0 {
 		return nil, fmt.Errorf("hydrate requires slot, sandbox and execution IDs")
 	}
-	st := &activeSlotState{ownership: ownership{
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	requestHash := fmt.Sprintf("%x", sha256.Sum256(raw))
+	st := &activeSlotState{ownership: ownership{RequestHash: requestHash,
 		Version: 1, Phase: preparing, Slot: req.Slot, SandboxID: req.SandboxID,
 		ExecutionID: req.ExecutionID, LifecycleID: req.LifecycleID, ContainerID: "kt-" + rand.Text(),
 	}}
@@ -282,9 +291,17 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 	st.releaseMu.Lock()
 	defer st.releaseMu.Unlock()
 	s.mu.Lock()
-	if s.activeSlots[req.Slot.SlotID] != nil {
+	if previous := s.activeSlots[req.Slot.SlotID]; previous != nil {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("slot %s is already claimed", req.Slot.SlotID)
+		return s.replayHydration(ctx, previous, requestHash)
+	}
+	receipt, err := s.journal.previousRelease(&protocol.ReleaseSlotRequest{SlotID: req.Slot.SlotID, SandboxID: req.SandboxID, ExecutionID: req.ExecutionID, LifecycleID: req.LifecycleID})
+	if err != nil || receipt.Released {
+		s.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return nil, status.Error(codes.FailedPrecondition, "execution was already released")
 	}
 	if err := s.journal.write(st.ownership, true); err != nil {
 		s.mu.Unlock()
@@ -309,8 +326,8 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		if bootstrapToken == "" && mf.BootstrapToken != "" {
 			bootstrapToken = mf.BootstrapToken
 		}
-		if req.BaseImage == "" && mf.BaseImage != "" {
-			req.BaseImage = mf.BaseImage
+		if baseImage == "" && mf.BaseImage != "" {
+			baseImage = mf.BaseImage
 		}
 	}
 	if bootstrapToken == "" {
@@ -328,7 +345,7 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		LifecycleID:    req.LifecycleID,
 		Slot:           req.Slot,
 		SandboxID:      req.SandboxID,
-		BaseImage:      req.BaseImage,
+		BaseImage:      baseImage,
 		RestoreViewDir: viewDir,
 		RestoreMode:    restoreMode,
 		BootstrapToken: bootstrapToken,
@@ -372,6 +389,15 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		return nil, retErr
 	}
 
+	st.Activation = &protocol.HydrateSlotResponse{
+		SandboxID:   req.SandboxID,
+		ExecutionID: req.ExecutionID,
+		PodIP:       ktdEndpoint,
+		ContainerID: newCID,
+		ArenaTier:   arenaTier,
+		RestoreMode: restoreMode,
+		DurationMs:  time.Since(start).Milliseconds(),
+	}
 	st.Phase = activeExecution
 	if err := s.journal.write(st.ownership, false); err != nil {
 		return nil, err
@@ -386,22 +412,36 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		if err := s.cfg.Routes.ReportExecution(ctx, r, store.ExecutionReport{State: store.OwnerReady}); err != nil {
 			return nil, err
 		}
-		if err := s.cfg.Routes.PublishRoute(ctx, r); err != nil {
-			retErr = fmt.Errorf("publish fenced route: %w", err)
-			return nil, retErr
+		if !req.DeferRoutePublication {
+			if err := s.cfg.Routes.PublishRoute(ctx, r); err != nil {
+				retErr = fmt.Errorf("publish fenced route: %w", err)
+				return nil, retErr
+			}
 		}
 	}
 
 	span.SetAttributes(attribute.String(telemetry.AttrArenaTier, arenaTier))
-	return &protocol.HydrateSlotResponse{
-		SandboxID:   req.SandboxID,
-		ExecutionID: req.ExecutionID,
-		PodIP:       ktdEndpoint,
-		ContainerID: newCID,
-		ArenaTier:   arenaTier,
-		RestoreMode: restoreMode,
-		DurationMs:  time.Since(start).Milliseconds(),
-	}, nil
+	return st.Activation, nil
+}
+
+// An ambiguous RPC reply must carry the original result on retry. A replay
+// never thaws the guest or reopens a route that suspend may have drained.
+func (s *Service) replayHydration(ctx context.Context, st *activeSlotState, requestHash string) (*protocol.HydrateSlotResponse, error) {
+	st.releaseMu.Lock()
+	defer st.releaseMu.Unlock()
+	if st.RequestHash != requestHash || st.Phase == lost || st.Phase == releasing {
+		return nil, status.Error(codes.FailedPrecondition, "slot ownership conflicts with activation")
+	}
+	s.mu.Lock()
+	verified := s.activeSlots[st.Slot.SlotID] == st && s.byContainer[st.ContainerID] == st
+	s.mu.Unlock()
+	if !verified || st.Phase != activeExecution || st.Activation == nil {
+		return nil, status.Error(codes.Unavailable, "activation awaits reconciliation")
+	}
+	if err := s.report(ctx, st, store.OwnerReady); err != nil {
+		return nil, err
+	}
+	return st.Activation, nil
 }
 
 func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequest) (*protocol.ReleaseSlotResponse, error) {

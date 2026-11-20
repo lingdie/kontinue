@@ -110,20 +110,21 @@ type ExecuteCheckpointResponse struct {
 }
 
 type HydrateSlotRequest struct {
-	Slot           CarrierSlot       `json:"slot"`
-	SandboxID      string            `json:"sandboxId"`
-	TemplateID     string            `json:"templateId,omitempty"`
-	ExecutionID    int64             `json:"executionId"`
-	LifecycleID    string            `json:"lifecycleId"`
-	SnapshotID     string            `json:"snapshotId,omitempty"`
-	BaseImage      string            `json:"baseImage"`
-	RestoreMode    string            `json:"restoreMode"`
-	BootstrapToken string            `json:"bootstrapToken"`
-	AccessToken    string            `json:"accessToken"`
-	CPUMillis      int64             `json:"cpuMillis,omitempty"`
-	MemoryBytes    int64             `json:"memoryBytes,omitempty"`
-	EnvVars        map[string]string `json:"envVars,omitempty"`
-	SkipThaw       bool              `json:"skipThaw,omitempty"`
+	DeferRoutePublication bool              `json:"deferRoutePublication,omitempty"`
+	Slot                  CarrierSlot       `json:"slot"`
+	SandboxID             string            `json:"sandboxId"`
+	TemplateID            string            `json:"templateId,omitempty"`
+	ExecutionID           int64             `json:"executionId"`
+	LifecycleID           string            `json:"lifecycleId"`
+	SnapshotID            string            `json:"snapshotId,omitempty"`
+	BaseImage             string            `json:"baseImage"`
+	RestoreMode           string            `json:"restoreMode"`
+	BootstrapToken        string            `json:"bootstrapToken"`
+	AccessToken           string            `json:"accessToken"`
+	CPUMillis             int64             `json:"cpuMillis,omitempty"`
+	MemoryBytes           int64             `json:"memoryBytes,omitempty"`
+	EnvVars               map[string]string `json:"envVars,omitempty"`
+	SkipThaw              bool              `json:"skipThaw,omitempty"`
 }
 
 type HydrateSlotResponse struct {

@@ -176,7 +176,7 @@ func (r *CarrierPoolReplenisher) reconcilePoolWatermarks(ctx context.Context) {
 	wg.Wait()
 }
 
-func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, node protocol.NodeHeartbeat, tier string) (*protocol.CarrierSlot, error) {
+func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, node protocol.NodeHeartbeat, tier, lifecycleID string) (*store.SlotReservation, error) {
 	if r.kube == nil {
 		return nil, store.ErrNoIdleCarrierSlot
 	}
@@ -212,14 +212,14 @@ func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, no
 		attribute.String(telemetry.AttrNodeID, node.NodeID),
 	)
 	deadline := time.Now().Add(30 * time.Second)
-	var slot *protocol.CarrierSlot
+	var slot *store.SlotReservation
 	for time.Now().Before(deadline) {
 		if waitCtx.Err() != nil {
 			retErr = waitCtx.Err()
 			telemetry.EndSpan(waitSpan, retErr)
 			return nil, retErr
 		}
-		if claimed, cErr := r.catalog.ClaimIdleSlot(waitCtx, node.NodeID, tier); cErr == nil && claimed != nil {
+		if claimed, cErr := r.catalog.ReserveIdleSlot(waitCtx, node.NodeID, tier, lifecycleID, true); cErr == nil && claimed != nil {
 			slot = claimed
 			break
 		}
@@ -234,7 +234,7 @@ func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, no
 		return nil, retErr
 	}
 	telemetry.EndSpan(waitSpan, nil)
-	span.SetAttributes(attribute.String(telemetry.AttrSlotID, slot.SlotID))
+	span.SetAttributes(attribute.String(telemetry.AttrSlotID, slot.Slot.SlotID))
 	return slot, nil
 }
 

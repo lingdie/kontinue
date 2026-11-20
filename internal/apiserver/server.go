@@ -487,99 +487,22 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 		tier = protocol.DefaultCarrierTier
 	}
 
-	var reqFP *protocol.CompatibilityFingerprint
 	var snapID, bootTok string
 	if snap != nil {
 		snapID = snap.SnapshotID
 		bootTok = snap.BootstrapToken
-		reqFP = &snap.Fingerprint
 	}
 	if bootTok == "" {
 		bootTok = "boot-" + randHex(12)
 	}
-	accessTok := "kt_live_" + randHex(16)
-	lifecycleID := "life-" + randHex(6)
-
-	var dec *PlacementDecision
-	var hydResp *protocol.HydrateSlotResponse
-	for attempt := 0; attempt < 3; attempt++ {
-		var err error
-		dec, err = s.cfg.Placement.SelectAndClaimSlot(ctx, PlacementRequest{
-			Tier:                        tier,
-			SnapshotID:                  snapID,
-			RequiredFingerprint:         reqFP,
-			AllowFilesystemOnlyFallback: req.AllowFilesystemOnlyFallback,
-		})
-		if err != nil {
-			retErr = err
-			return nil, err
-		}
-		nodeClient, err := s.nodeClient(dec.Node.GRPCAddr)
-		if err != nil {
-			retErr = err
-			return nil, err
-		}
-		hydResp, err = nodeClient.HydrateSlot(ctx, &protocol.HydrateSlotRequest{
-			Slot:           dec.Slot,
-			SandboxID:      req.SandboxID,
-			TemplateID:     req.TemplateID,
-			ExecutionID:    1,
-			LifecycleID:    lifecycleID,
-			SnapshotID:     snapID,
-			BaseImage:      baseImage,
-			RestoreMode:    dec.RestoreMode,
-			BootstrapToken: bootTok,
-			AccessToken:    accessTok,
-			EnvVars:        req.EnvVars,
-			CPUMillis:      req.CPUMillis,
-			MemoryBytes:    req.MemoryBytes,
-		})
-		if err == nil {
-			retErr = nil
-			break
-		}
-		retErr = err
-		s.abandonHydratedSlot(ctx, dec, req.SandboxID, 1, lifecycleID)
-	}
-	if retErr != nil {
-		return nil, retErr
-	}
-
-	poolAlloc := "WARM_POOL"
-	if dec.ColdFallback {
-		poolAlloc = "COLD_FALLBACK"
-	}
-	sbx := &store.SandboxRecord{
-		SandboxID:                   req.SandboxID,
-		TemplateID:                  req.TemplateID,
-		BaseImage:                   baseImage,
-		Tier:                        tier,
-		State:                       store.SandboxStateRunning,
-		ExecutionID:                 1,
-		LifecycleID:                 lifecycleID,
-		ActiveSnapshotID:            snapID,
-		CurrentNodeID:               dec.Node.NodeID,
-		OriginNodeID:                dec.Node.NodeID,
-		CurrentSlotID:               dec.Slot.SlotID,
-		CarrierPodNamespace:         dec.Slot.PodNamespace,
-		CarrierPodName:              dec.Slot.PodName,
-		PodIP:                       hydResp.PodIP,
-		PoolAllocation:              poolAlloc,
-		AccessToken:                 accessTok,
-		BootstrapToken:              bootTok,
-		EnvVars:                     req.EnvVars,
-		IdleTimeoutSeconds:          req.IdleTimeoutSeconds,
-		CPUMillis:                   req.CPUMillis,
-		MemoryBytes:                 req.MemoryBytes,
-		AllowFilesystemOnlyFallback: req.AllowFilesystemOnlyFallback,
-	}
+	sbx := &store.SandboxRecord{SandboxID: req.SandboxID, TemplateID: req.TemplateID, BaseImage: baseImage, Tier: tier,
+		State: store.SandboxStateCreating, ExecutionID: 1, LifecycleID: "life-" + randHex(6), ActiveSnapshotID: snapID,
+		AccessToken: "kt_live_" + randHex(16), BootstrapToken: bootTok, EnvVars: req.EnvVars, IdleTimeoutSeconds: req.IdleTimeoutSeconds,
+		CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes, AllowFilesystemOnlyFallback: req.AllowFilesystemOnlyFallback}
 	if err := s.cfg.Meta.CreateSandbox(ctx, sbx); err != nil {
-		s.abandonHydratedSlot(ctx, dec, req.SandboxID, 1, lifecycleID)
-		retErr = err
 		return nil, err
 	}
-	_ = s.cfg.Catalog.TouchSandboxActive(ctx, sbx.SandboxID, time.Now().UTC())
-	return sbx, nil
+	return s.advanceActivation(ctx, sbx)
 }
 
 // A session-scoped lock covers checkpoint, upload and commit, regardless of their duration.
@@ -826,6 +749,9 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 		return sbx, nil
 	}
 
+	if sbx.State == store.SandboxStateCreating || sbx.State == store.SandboxStateResuming {
+		return s.advanceActivation(ctx, sbx)
+	}
 	if sbx.State != store.SandboxStateSuspended {
 		return nil, store.ErrTransitionLocked
 	}
@@ -833,80 +759,13 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 		return nil, err
 	}
 
-	snap, err := s.cfg.Meta.GetSnapshot(ctx, sbx.ActiveSnapshotID)
-	if err != nil {
-		retErr = fmt.Errorf("load active snapshot %s: %w", sbx.ActiveSnapshotID, err)
-		return nil, retErr
-	}
-
-	nextExecID := sbx.ExecutionID + 1
-	nextLifeID := "life-" + randHex(6)
-	var dec *PlacementDecision
-	var hydResp *protocol.HydrateSlotResponse
-	for attempt := 0; attempt < 3; attempt++ {
-		dec, err = s.cfg.Placement.SelectAndClaimSlot(ctx, PlacementRequest{
-			Tier:                        sbx.Tier,
-			SnapshotID:                  snap.SnapshotID,
-			OriginNodeID:                sbx.OriginNodeID,
-			RequiredFingerprint:         &snap.Fingerprint,
-			AllowFilesystemOnlyFallback: sbx.AllowFilesystemOnlyFallback,
-		})
-		if err != nil {
-			retErr = err
-			return nil, err
-		}
-		nodeClient, cErr := s.nodeClient(dec.Node.GRPCAddr)
-		if cErr != nil {
-			retErr = cErr
-			return nil, cErr
-		}
-		hydResp, err = nodeClient.HydrateSlot(ctx, &protocol.HydrateSlotRequest{
-			Slot:           dec.Slot,
-			SandboxID:      sbx.SandboxID,
-			TemplateID:     sbx.TemplateID,
-			ExecutionID:    nextExecID,
-			LifecycleID:    nextLifeID,
-			SnapshotID:     snap.SnapshotID,
-			BaseImage:      sbx.BaseImage,
-			RestoreMode:    dec.RestoreMode,
-			BootstrapToken: sbx.BootstrapToken,
-			AccessToken:    sbx.AccessToken,
-			EnvVars:        sbx.EnvVars,
-			CPUMillis:      sbx.CPUMillis,
-			MemoryBytes:    sbx.MemoryBytes,
-		})
-		if err == nil {
-			retErr = nil
-			break
-		}
-		retErr = err
-		s.abandonHydratedSlot(ctx, dec, sbx.SandboxID, nextExecID, nextLifeID)
-	}
-	if retErr != nil {
-		return nil, retErr
-	}
-
-	if dec.ColdFallback {
-		sbx.PoolAllocation = "COLD_FALLBACK"
-	} else {
-		sbx.PoolAllocation = "WARM_POOL"
-	}
-	sbx.State = store.SandboxStateRunning
-	sbx.ExecutionID = nextExecID
-	sbx.LifecycleID = nextLifeID
-	sbx.CurrentNodeID = dec.Node.NodeID
-	sbx.OriginNodeID = dec.Node.NodeID
-	sbx.CurrentSlotID = dec.Slot.SlotID
-	sbx.CarrierPodNamespace = dec.Slot.PodNamespace
-	sbx.CarrierPodName = dec.Slot.PodName
-	sbx.PodIP = hydResp.PodIP
+	sbx.State = store.SandboxStateResuming
+	sbx.ExecutionID++
+	sbx.LifecycleID = "life-" + randHex(6)
 	if err := s.cfg.Meta.SaveSandbox(ctx, sbx); err != nil {
-		s.abandonHydratedSlot(ctx, dec, sbx.SandboxID, nextExecID, nextLifeID)
-		retErr = err
 		return nil, err
 	}
-	_ = s.cfg.Catalog.TouchSandboxActive(ctx, sbx.SandboxID, time.Now().UTC())
-	return sbx, nil
+	return s.advanceActivation(ctx, sbx)
 }
 
 func (s *Server) abandonHydratedSlot(ctx context.Context, dec *PlacementDecision, sandboxID string, executionID int64, lifecycleID string) {
@@ -1173,6 +1032,11 @@ func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
 	if err != nil {
 		return err
 	}
+	if sbx.State == store.SandboxStateCreating || sbx.State == store.SandboxStateResuming {
+		if err := s.cfg.Catalog.FinishReservation(ctx, sbx.LifecycleID, sbx.PendingPlacement == nil); err != nil {
+			return err
+		}
+	}
 	if sbx.CurrentSlotID != "" {
 		if err := s.releaseExecution(ctx, sbx); err != nil {
 			return err
@@ -1216,6 +1080,10 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 	running, err := s.cfg.Meta.ListSandboxesToSweep(ctx)
 	if err == nil {
 		for _, sbx := range running {
+			if sbx.State == store.SandboxStateResuming || sbx.State == store.SandboxStateCreating {
+				_, _ = s.resumePending(ctx, &sbx)
+				continue
+			}
 			if s.reconcileSandbox(ctx, &sbx) {
 				continue
 			}
@@ -1445,6 +1313,7 @@ func redactSandbox(sbx *store.SandboxRecord) store.SandboxRecord {
 		return store.SandboxRecord{}
 	}
 	cp := *sbx
+	cp.PendingPlacement = nil
 	cp.BootstrapToken = ""
 	return cp
 }

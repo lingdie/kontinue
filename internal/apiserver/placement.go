@@ -2,6 +2,7 @@ package apiserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -13,6 +14,7 @@ import (
 )
 
 type PlacementRequest struct {
+	LifecycleID                 string
 	Tier                        string
 	SnapshotID                  string
 	OriginNodeID                string
@@ -30,7 +32,7 @@ type PlacementDecision struct {
 // ColdSlotAllocator is invoked only when burst traffic exhausts all pre-warmed Carrier Pod slots in Redis,
 // creating a direct-bound Carrier Pod (pod.Spec.NodeName = nodeID, bypassing kube-scheduler).
 type ColdSlotAllocator interface {
-	AllocateColdCarrierSlot(ctx context.Context, node protocol.NodeHeartbeat, tier string) (*protocol.CarrierSlot, error)
+	AllocateColdCarrierSlot(ctx context.Context, node protocol.NodeHeartbeat, tier, lifecycleID string) (*store.SlotReservation, error)
 }
 
 type PlacementEngine struct {
@@ -118,39 +120,31 @@ func (p *PlacementEngine) SelectAndClaimSlot(ctx context.Context, req PlacementR
 		return 0
 	})
 
+	decision := func(reservation *store.SlotReservation) (*PlacementDecision, error) {
+		for _, cand := range candidates {
+			if cand.hb.NodeID == reservation.Slot.NodeID {
+				span.SetAttributes(attribute.String(telemetry.AttrNodeID, cand.hb.NodeID), attribute.String(telemetry.AttrSlotID, reservation.Slot.SlotID), attribute.String(telemetry.AttrRestoreMode, cand.mode), attribute.Bool("carrier.cold_fallback", reservation.Cold))
+				return &PlacementDecision{Node: cand.hb, Slot: reservation.Slot, RestoreMode: cand.mode, ColdFallback: reservation.Cold}, nil
+			}
+		}
+		return nil, fmt.Errorf("reserved slot %s is on an unavailable or incompatible worker", reservation.Slot.SlotID)
+	}
 	for _, cand := range candidates {
-		slot, claimErr := p.catalog.ClaimIdleSlot(ctx, cand.hb.NodeID, req.Tier)
-		if claimErr == nil && slot != nil {
-			span.SetAttributes(
-				attribute.String(telemetry.AttrNodeID, cand.hb.NodeID),
-				attribute.String(telemetry.AttrSlotID, slot.SlotID),
-				attribute.String(telemetry.AttrRestoreMode, cand.mode),
-			)
-			return &PlacementDecision{
-				Node:        cand.hb,
-				Slot:        *slot,
-				RestoreMode: cand.mode,
-			}, nil
+		r, err := p.catalog.ReserveIdleSlot(ctx, cand.hb.NodeID, req.Tier, req.LifecycleID, false)
+		if err == nil {
+			return decision(r)
+		}
+		if !errors.Is(err, store.ErrNoIdleCarrierSlot) {
+			return nil, err
 		}
 	}
-
-	// Cold Carrier Fallback: pool temporarily exhausted under burst load -> spread across candidate nodes!
 	if p.coldAllocator != nil {
 		pick := candidates[rand.IntN(len(candidates))]
-		slot, allocErr := p.coldAllocator.AllocateColdCarrierSlot(ctx, pick.hb, req.Tier)
-		if allocErr == nil && slot != nil {
-			span.SetAttributes(
-				attribute.String(telemetry.AttrNodeID, pick.hb.NodeID),
-				attribute.String(telemetry.AttrSlotID, slot.SlotID),
-				attribute.Bool("carrier.cold_fallback", true),
-			)
-			return &PlacementDecision{
-				Node:         pick.hb,
-				Slot:         *slot,
-				RestoreMode:  pick.mode,
-				ColdFallback: true,
-			}, nil
+		r, err := p.coldAllocator.AllocateColdCarrierSlot(ctx, pick.hb, req.Tier, req.LifecycleID)
+		if err != nil {
+			return nil, err
 		}
+		return decision(r)
 	}
 
 	retErr = store.ErrNoIdleCarrierSlot

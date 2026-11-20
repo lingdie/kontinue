@@ -13,15 +13,22 @@ import (
 
 // Lua Script 1: Atomically pop an idle Carrier Slot from kt:pool:idle:{node}:{tier} and return its metadata JSON.
 var luaClaimIdleSlot = redis.NewScript(`
+if ARGV[2] ~= "" then
+    local previous = redis.call("GET", KEYS[2])
+    if previous then return previous end
+end
 local slotId = redis.call("SPOP", KEYS[1])
 if not slotId then
     return nil
 end
 local metaKey = ARGV[1] .. slotId
 local meta = redis.call("GET", metaKey)
+if not meta then return nil end
 redis.call("DEL", metaKey)
-redis.call("SET", "kt:carrier:used:" .. slotId, "1", "EX", 86400)
-return meta
+redis.call("SET", "kt:carrier:used:" .. slotId, ARGV[2], "EX", 86400)
+local reservation = cjson.encode({slot=cjson.decode(meta),cold=ARGV[3]=="1"})
+if ARGV[2] ~= "" then redis.call("SET", KEYS[2], reservation) end
+return reservation
 `)
 
 // Lua Script 2: Monotonic ExecutionID-fenced route upsert (prevents stale starts overwriting newer executions).
@@ -96,22 +103,22 @@ func NewRedisRuntimeCatalog(addr, password string, db int) *RedisRuntimeCatalog 
 
 func (c *RedisRuntimeCatalog) Close() error { return c.rdb.Close() }
 
+var luaRegisterIdleSlot = redis.NewScript(`
+if redis.call("EXISTS",KEYS[1])==1 then return 0 end
+redis.call("SET",KEYS[2],ARGV[1],"EX",86400)
+redis.call("SADD",KEYS[3],ARGV[2])
+return 1
+`)
+
 func (c *RedisRuntimeCatalog) RegisterIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error {
 	if slot.Tier == "" {
 		slot.Tier = protocol.DefaultCarrierTier
-	}
-	if used, err := c.rdb.Exists(ctx, "kt:carrier:used:"+slot.SlotID).Result(); err == nil && used > 0 {
-		return nil
 	}
 	raw, err := json.Marshal(slot)
 	if err != nil {
 		return err
 	}
-	pipe := c.rdb.TxPipeline()
-	pipe.Set(ctx, protocol.CarrierMetaKey(slot.SlotID), raw, 24*time.Hour)
-	pipe.SAdd(ctx, protocol.IdlePoolKey(slot.NodeID, slot.Tier), slot.SlotID)
-	_, err = pipe.Exec(ctx)
-	return err
+	return luaRegisterIdleSlot.Run(ctx, c.rdb, []string{"kt:carrier:used:" + slot.SlotID, protocol.CarrierMetaKey(slot.SlotID), protocol.IdlePoolKey(slot.NodeID, slot.Tier)}, raw, slot.SlotID).Err()
 }
 
 func (c *RedisRuntimeCatalog) RemoveIdleSlot(ctx context.Context, nodeID, tier, slotID string) error {
@@ -126,25 +133,49 @@ func (c *RedisRuntimeCatalog) RemoveIdleSlot(ctx context.Context, nodeID, tier, 
 }
 
 func (c *RedisRuntimeCatalog) ClaimIdleSlot(ctx context.Context, nodeID, tier string) (*protocol.CarrierSlot, error) {
+	r, err := c.ReserveIdleSlot(ctx, nodeID, tier, "", false)
+	if err != nil {
+		return nil, err
+	}
+	return &r.Slot, nil
+}
+
+func (c *RedisRuntimeCatalog) ReserveIdleSlot(ctx context.Context, nodeID, tier, life string, cold bool) (*SlotReservation, error) {
 	if tier == "" {
 		tier = protocol.DefaultCarrierTier
 	}
-	res, err := luaClaimIdleSlot.Run(ctx, c.rdb, []string{protocol.IdlePoolKey(nodeID, tier)}, protocol.RedisPrefixCarrierMeta).Result()
-	if errors.Is(err, redis.Nil) || res == nil {
+	raw, err := luaClaimIdleSlot.Run(ctx, c.rdb, []string{protocol.IdlePoolKey(nodeID, tier), "kt:placement:" + life}, protocol.RedisPrefixCarrierMeta, life, cold).Text()
+	if errors.Is(err, redis.Nil) {
 		return nil, ErrNoIdleCarrierSlot
 	}
 	if err != nil {
 		return nil, err
 	}
-	str, ok := res.(string)
-	if !ok || str == "" {
-		return nil, ErrNoIdleCarrierSlot
-	}
-	var slot protocol.CarrierSlot
-	if err := json.Unmarshal([]byte(str), &slot); err != nil {
+	var r SlotReservation
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
 		return nil, err
 	}
-	return &slot, nil
+	return &r, nil
+}
+
+var luaFinishReservation = redis.NewScript(`
+local raw=redis.call("GET",KEYS[1])
+if not raw then return 1 end
+if ARGV[2]=="1" then
+    local slot=cjson.decode(raw).slot
+    local used="kt:carrier:used:"..slot.slotId
+    if redis.call("GET",used)==ARGV[1] then
+        redis.call("DEL",used)
+        redis.call("SET",ARGV[3]..slot.slotId,cjson.encode(slot),"EX",86400)
+        redis.call("SADD",ARGV[4]..slot.nodeId..":"..slot.tier,slot.slotId)
+    end
+end
+redis.call("DEL",KEYS[1])
+return 1
+`)
+
+func (c *RedisRuntimeCatalog) FinishReservation(ctx context.Context, life string, returnUnused bool) error {
+	return luaFinishReservation.Run(ctx, c.rdb, []string{"kt:placement:" + life}, life, returnUnused, protocol.RedisPrefixCarrierMeta, protocol.RedisPrefixIdlePool).Err()
 }
 
 func (c *RedisRuntimeCatalog) CountIdleSlots(ctx context.Context, nodeID, tier string) (int, error) {

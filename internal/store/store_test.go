@@ -183,3 +183,49 @@ func checkFailedOwnership(t *testing.T, cat store.RuntimeCatalog) {
 		t.Fatalf("new route=%v err=%v", r, err)
 	}
 }
+
+func TestPlacementClaimReplaysAcrossSchedulingDecisions(t *testing.T) {
+	check := func(t *testing.T, cat store.RuntimeCatalog) {
+		ctx := context.Background()
+		node := "worker-" + rand.Text()
+		life := "life-" + rand.Text()
+		slot := protocol.CarrierSlot{SlotID: "slot-" + rand.Text(), NodeID: node, Tier: "default", PodUID: "original"}
+		if err := cat.RegisterIdleSlot(ctx, slot); err != nil {
+			t.Fatal(err)
+		}
+		first, err := cat.ReserveIdleSlot(ctx, node, slot.Tier, life, true)
+		if err != nil || !first.Cold {
+			t.Fatal(first, err)
+		}
+		if err := cat.RegisterIdleSlot(ctx, slot); err != nil {
+			t.Fatal(err)
+		}
+		if count, err := cat.CountIdleSlots(ctx, node, slot.Tier); err != nil || count != 0 {
+			t.Fatal(count, err)
+		}
+		second, err := cat.ReserveIdleSlot(ctx, "other-"+node, slot.Tier, life, false)
+		if err != nil || *second != *first {
+			t.Fatal(second, err)
+		}
+		if err := cat.FinishReservation(ctx, life, true); err != nil {
+			t.Fatal(err)
+		}
+		next, err := cat.ReserveIdleSlot(ctx, node, slot.Tier, "next-"+life, false)
+		if err != nil || next.Slot != slot {
+			t.Fatal(next, err)
+		}
+		if err := cat.FinishReservation(ctx, "next-"+life, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("memory", func(t *testing.T) { check(t, store.NewMemoryRuntimeCatalog()) })
+	t.Run("redis", func(t *testing.T) {
+		addr := os.Getenv("KONTINUE_TEST_REDIS")
+		if addr == "" {
+			t.Skip("KONTINUE_TEST_REDIS is unset")
+		}
+		cat := store.NewRedisRuntimeCatalog(addr, "", 0)
+		defer cat.Close()
+		check(t, cat)
+	})
+}

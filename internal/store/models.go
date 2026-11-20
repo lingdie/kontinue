@@ -65,33 +65,39 @@ type SnapshotRecord struct {
 	CreatedAt        time.Time                         `json:"createdAt"`
 }
 
+type ActivationPlacement struct {
+	Slot        protocol.CarrierSlot `json:"slot"`
+	RestoreMode string               `json:"restoreMode"`
+}
+
 type SandboxRecord struct {
-	FailureReason               string            `json:"failureReason,omitempty"`
-	SandboxID                   string            `json:"sandboxId"`
-	TemplateID                  string            `json:"templateId,omitempty"`
-	BaseImage                   string            `json:"baseImage"`
-	Tier                        string            `json:"tier"`
-	State                       SandboxState      `json:"state"`
-	ExecutionID                 int64             `json:"executionId"`
-	LifecycleID                 string            `json:"lifecycleId"`
-	PendingSnapshotID           string            `json:"pendingSnapshotId,omitempty"`
-	ActiveSnapshotID            string            `json:"activeSnapshotId,omitempty"`
-	CurrentNodeID               string            `json:"currentNodeId,omitempty"`
-	OriginNodeID                string            `json:"originNodeId,omitempty"`
-	CurrentSlotID               string            `json:"currentSlotId,omitempty"`
-	CarrierPodNamespace         string            `json:"carrierPodNamespace,omitempty"`
-	CarrierPodName              string            `json:"carrierPodName,omitempty"`
-	PodIP                       string            `json:"podIp,omitempty"`
-	PoolAllocation              string            `json:"poolAllocation,omitempty"`
-	AccessToken                 string            `json:"accessToken,omitempty"`
-	BootstrapToken              string            `json:"bootstrapToken,omitempty"`
-	EnvVars                     map[string]string `json:"envVars,omitempty"`
-	IdleTimeoutSeconds          int64             `json:"idleTimeoutSeconds"`
-	CPUMillis                   int64             `json:"cpuMillis,omitempty"`
-	MemoryBytes                 int64             `json:"memoryBytes,omitempty"`
-	AllowFilesystemOnlyFallback bool              `json:"allowFilesystemOnlyFallback"`
-	CreatedAt                   time.Time         `json:"createdAt"`
-	UpdatedAt                   time.Time         `json:"updatedAt"`
+	PendingPlacement            *ActivationPlacement `json:"pendingPlacement,omitempty"`
+	FailureReason               string               `json:"failureReason,omitempty"`
+	SandboxID                   string               `json:"sandboxId"`
+	TemplateID                  string               `json:"templateId,omitempty"`
+	BaseImage                   string               `json:"baseImage"`
+	Tier                        string               `json:"tier"`
+	State                       SandboxState         `json:"state"`
+	ExecutionID                 int64                `json:"executionId"`
+	LifecycleID                 string               `json:"lifecycleId"`
+	PendingSnapshotID           string               `json:"pendingSnapshotId,omitempty"`
+	ActiveSnapshotID            string               `json:"activeSnapshotId,omitempty"`
+	CurrentNodeID               string               `json:"currentNodeId,omitempty"`
+	OriginNodeID                string               `json:"originNodeId,omitempty"`
+	CurrentSlotID               string               `json:"currentSlotId,omitempty"`
+	CarrierPodNamespace         string               `json:"carrierPodNamespace,omitempty"`
+	CarrierPodName              string               `json:"carrierPodName,omitempty"`
+	PodIP                       string               `json:"podIp,omitempty"`
+	PoolAllocation              string               `json:"poolAllocation,omitempty"`
+	AccessToken                 string               `json:"accessToken,omitempty"`
+	BootstrapToken              string               `json:"bootstrapToken,omitempty"`
+	EnvVars                     map[string]string    `json:"envVars,omitempty"`
+	IdleTimeoutSeconds          int64                `json:"idleTimeoutSeconds"`
+	CPUMillis                   int64                `json:"cpuMillis,omitempty"`
+	MemoryBytes                 int64                `json:"memoryBytes,omitempty"`
+	AllowFilesystemOnlyFallback bool                 `json:"allowFilesystemOnlyFallback"`
+	CreatedAt                   time.Time            `json:"createdAt"`
+	UpdatedAt                   time.Time            `json:"updatedAt"`
 }
 
 // MetadataStore persists durable templates, snapshots, and sandbox lifecycles (PostgreSQL).
@@ -124,7 +130,14 @@ type MetadataStore interface {
 }
 
 // RuntimeCatalog coordinates sub-millisecond routes, Carrier Pod slots, ExecutionID fences, and node heartbeats (Redis).
+type SlotReservation struct {
+	Slot protocol.CarrierSlot `json:"slot"`
+	Cold bool                 `json:"cold"`
+}
+
 type RuntimeCatalog interface {
+	ReserveIdleSlot(ctx context.Context, nodeID, tier, lifecycle string, cold bool) (*SlotReservation, error)
+	FinishReservation(ctx context.Context, lifecycle string, returnUnused bool) error
 	BeginNodeRecovery(context.Context, string) error
 	ReportExecution(context.Context, protocol.RouteRecord, ExecutionReport) error
 	ExecutionReport(context.Context, protocol.RouteRecord) (ExecutionReport, error)

@@ -224,7 +224,7 @@ func (m *MemoryMetadataStore) ListSandboxesToSweep(_ context.Context) ([]Sandbox
 	defer m.mu.RUnlock()
 	var out []SandboxRecord
 	for _, s := range m.sandboxes {
-		if s.State == SandboxStateRunning || s.State == SandboxStateSuspending || (s.State == SandboxStateSuspended && s.CurrentSlotID != "") {
+		if s.State == SandboxStateCreating || s.State == SandboxStateResuming || s.State == SandboxStateRunning || s.State == SandboxStateSuspending || (s.State == SandboxStateSuspended && s.CurrentSlotID != "") {
 			out = append(out, cloneSandbox(s))
 		}
 	}
@@ -239,6 +239,10 @@ func (m *MemoryMetadataStore) DeleteSandbox(_ context.Context, sandboxID string)
 }
 
 func cloneSandbox(in SandboxRecord) SandboxRecord {
+	if in.PendingPlacement != nil {
+		p := *in.PendingPlacement
+		in.PendingPlacement = &p
+	}
 	if in.EnvVars != nil {
 		cp := make(map[string]string, len(in.EnvVars))
 		for k, v := range in.EnvVars {
@@ -251,15 +255,17 @@ func cloneSandbox(in SandboxRecord) SandboxRecord {
 
 // MemoryRuntimeCatalog implements RuntimeCatalog with identical atomic fencing semantics to Redis Lua scripts.
 type MemoryRuntimeCatalog struct {
-	reports     map[string]timedReport
-	mu          sync.Mutex
-	idlePools   map[string][]protocol.CarrierSlot
-	routes      map[string]protocol.RouteRecord
-	activeAt    map[string]time.Time
-	inflight    map[string]int64
-	admissions  map[string]map[string]time.Time
-	nodes       map[string]nodeEntry
-	idempotency map[string]idempEntry
+	usedSlots    map[string]string
+	reservations map[string]SlotReservation
+	reports      map[string]timedReport
+	mu           sync.Mutex
+	idlePools    map[string][]protocol.CarrierSlot
+	routes       map[string]protocol.RouteRecord
+	activeAt     map[string]time.Time
+	inflight     map[string]int64
+	admissions   map[string]map[string]time.Time
+	nodes        map[string]nodeEntry
+	idempotency  map[string]idempEntry
 }
 
 type nodeEntry struct {
@@ -275,14 +281,16 @@ type idempEntry struct {
 
 func NewMemoryRuntimeCatalog() *MemoryRuntimeCatalog {
 	return &MemoryRuntimeCatalog{
-		reports:     make(map[string]timedReport),
-		idlePools:   make(map[string][]protocol.CarrierSlot),
-		routes:      make(map[string]protocol.RouteRecord),
-		activeAt:    make(map[string]time.Time),
-		inflight:    make(map[string]int64),
-		admissions:  make(map[string]map[string]time.Time),
-		nodes:       make(map[string]nodeEntry),
-		idempotency: make(map[string]idempEntry),
+		reservations: make(map[string]SlotReservation),
+		usedSlots:    make(map[string]string),
+		reports:      make(map[string]timedReport),
+		idlePools:    make(map[string][]protocol.CarrierSlot),
+		routes:       make(map[string]protocol.RouteRecord),
+		activeAt:     make(map[string]time.Time),
+		inflight:     make(map[string]int64),
+		admissions:   make(map[string]map[string]time.Time),
+		nodes:        make(map[string]nodeEntry),
+		idempotency:  make(map[string]idempEntry),
 	}
 }
 
@@ -293,6 +301,15 @@ func (c *MemoryRuntimeCatalog) RegisterIdleSlot(_ context.Context, slot protocol
 		slot.Tier = protocol.DefaultCarrierTier
 	}
 	k := protocol.IdlePoolKey(slot.NodeID, slot.Tier)
+	if _, used := c.usedSlots[slot.SlotID]; used {
+		return nil
+	}
+	for i, prior := range c.idlePools[k] {
+		if prior.SlotID == slot.SlotID {
+			c.idlePools[k][i] = slot
+			return nil
+		}
+	}
 	c.idlePools[k] = append(c.idlePools[k], slot)
 	return nil
 }
@@ -315,9 +332,33 @@ func (c *MemoryRuntimeCatalog) RemoveIdleSlot(_ context.Context, nodeID, tier, s
 	return nil
 }
 
-func (c *MemoryRuntimeCatalog) ClaimIdleSlot(_ context.Context, nodeID, tier string) (*protocol.CarrierSlot, error) {
+func (c *MemoryRuntimeCatalog) ClaimIdleSlot(ctx context.Context, nodeID, tier string) (*protocol.CarrierSlot, error) {
+	r, err := c.ReserveIdleSlot(ctx, nodeID, tier, "", false)
+	if err != nil {
+		return nil, err
+	}
+	return &r.Slot, nil
+}
+
+func (c *MemoryRuntimeCatalog) FinishReservation(_ context.Context, life string, returnUnused bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	r, ok := c.reservations[life]
+	if ok && returnUnused && c.usedSlots[r.Slot.SlotID] == life {
+		delete(c.usedSlots, r.Slot.SlotID)
+		k := protocol.IdlePoolKey(r.Slot.NodeID, r.Slot.Tier)
+		c.idlePools[k] = append(c.idlePools[k], r.Slot)
+	}
+	delete(c.reservations, life)
+	return nil
+}
+
+func (c *MemoryRuntimeCatalog) ReserveIdleSlot(_ context.Context, nodeID, tier, life string, cold bool) (*SlotReservation, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.reservations[life]; ok {
+		return &r, nil
+	}
 	if tier == "" {
 		tier = protocol.DefaultCarrierTier
 	}
@@ -328,7 +369,12 @@ func (c *MemoryRuntimeCatalog) ClaimIdleSlot(_ context.Context, nodeID, tier str
 	}
 	slot := list[len(list)-1]
 	c.idlePools[k] = list[:len(list)-1]
-	return &slot, nil
+	c.usedSlots[slot.SlotID] = life
+	r := SlotReservation{Slot: slot, Cold: cold}
+	if life != "" {
+		c.reservations[life] = r
+	}
+	return &r, nil
 }
 
 func (c *MemoryRuntimeCatalog) CountIdleSlots(_ context.Context, nodeID, tier string) (int, error) {
