@@ -3,6 +3,7 @@
 Kontinue performance harness.
 
 Modes (BENCH_MODE):
+  startup       - measure each create through its first completed guest command
   overflow      - create beyond warm pool, exec, suspend, wake storm (default)
   warm-only     - create N <= pool size (all WARM), measure QPS/latency
   sustained-qps - open-loop fixed concurrency creates for BENCH_DURATION_SEC
@@ -17,6 +18,7 @@ import collections
 import concurrent.futures
 import json
 import os
+import secrets
 import statistics
 import subprocess
 import sys
@@ -38,6 +40,8 @@ REPORT_DIR = os.environ.get("BENCH_REPORT_DIR", os.path.join(os.path.dirname(__f
 
 def http_req(method: str, url: str, body=None, headers=None, timeout: int = 90):
     hdrs = dict(headers or {})
+    if url.startswith(API_BASE.rstrip("/") + "/") and os.environ.get("KONTINUE_TENANT_TOKEN"):
+        hdrs["Authorization"] = "Bearer " + os.environ["KONTINUE_TENANT_TOKEN"]
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -64,7 +68,7 @@ def fmt_stats(latencies):
     s = sorted(latencies)
     return (
         f"count={len(s):2d} | min={s[0]:6.1f}ms | p50={percentile(s, 50):6.1f}ms | "
-        f"p90={percentile(s, 90):6.1f}ms | p99={percentile(s, 99):6.1f}ms | max={s[-1]:6.1f}ms | "
+        f"p95={percentile(s, 95):6.1f}ms | p99={percentile(s, 99):6.1f}ms | max={s[-1]:6.1f}ms | "
         f"avg={statistics.mean(s):6.1f}ms"
     )
 
@@ -78,15 +82,21 @@ def stats_dict(latencies):
         "min": round(s[0], 2),
         "p50": round(percentile(s, 50), 2),
         "p90": round(percentile(s, 90), 2),
+        "p95": round(percentile(s, 95), 2),
         "p99": round(percentile(s, 99), 2),
         "max": round(s[-1], 2),
         "avg": round(statistics.mean(s), 2),
     }
 
 
-def query_redis_idle_pool():
+def worker_nodes():
+    raw = subprocess.check_output(["kubectl", "get", "nodes", "-l", "kontinue.sh/memory-ckpt-ready=true", "-o", "json"], text=True)
+    return [n["metadata"]["name"] for n in json.loads(raw)["items"]]
+
+
+def query_redis_idle_pool(tier="default"):
     out = {}
-    for node in ["kontinue-dev-worker", "kontinue-dev-worker2"]:
+    for node in worker_nodes():
         try:
             res = subprocess.check_output(
                 [
@@ -98,7 +108,7 @@ def query_redis_idle_pool():
                     "--",
                     "redis-cli",
                     "SCARD",
-                    f"kt:pool:idle:{node}:default",
+                    f"kt:pool:idle:{node}:{tier}",
                 ],
                 text=True,
             ).strip()
@@ -111,7 +121,7 @@ def query_redis_idle_pool():
 def sample_carrier_rss():
     """Best-effort RSS (KiB) for carrier containers via crictl on Kind workers."""
     rows = []
-    for node in ["kontinue-dev-worker", "kontinue-dev-worker2"]:
+    for node in worker_nodes():
         try:
             raw = subprocess.check_output(
                 [
@@ -156,12 +166,18 @@ def sample_carrier_rss():
     return rows
 
 
+def fetch_api_spans():
+    req = urllib.request.Request(f"{API_BASE}/debug/traces?limit=4000")
+    if os.environ.get("KONTINUE_TRACE_TOKEN"):
+        req.add_header("Authorization", "Bearer " + os.environ["KONTINUE_TRACE_TOKEN"])
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.load(r).get("spans", [])
+
+
 def fetch_trace_rollup():
     out = collections.defaultdict(list)
     try:
-        with urllib.request.urlopen(f"{API_BASE}/debug/traces?limit=4000", timeout=5) as r:
-            data = json.loads(r.read().decode())
-        for s in data.get("spans", []):
+        for s in fetch_api_spans():
             name = s.get("name") or ""
             if any(
                 x in name
@@ -185,14 +201,63 @@ def fetch_trace_rollup():
     return roll
 
 
+def startup_trace_timings(samples):
+    try:
+        spans = fetch_api_spans()
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}
+    create_traces = {
+        span.get("attributes", {}).get("sandbox.id"): span["traceId"]
+        for span in spans if span["name"] == "apiserver.create_sandbox"
+    }
+    by_trace = collections.defaultdict(list)
+    for span in spans:
+        by_trace[span["traceId"]].append(span)
+
+    phases = {
+        "apiserver.acquire_execution_lock": "lifecycle_lock",
+        "apiserver.reacquire_activation_lock": "lifecycle_lock",
+        "postgres.acquire_advisory_connection": "postgres_connection",
+        "replenisher.create_carrier_pod": "carrier_create",
+        "replenisher.wait_slot_ready": "carrier_ready",
+    }
+    cold_phases = collections.defaultdict(list)
+    matched = 0
+    for sample in samples:
+        trace = create_traces.get(sample["sandboxId"])
+        if not trace:
+            continue
+        matched += 1
+        rows = by_trace[trace]
+        retries = {span["spanId"] for span in rows if span["name"] == "apiserver.reacquire_activation_lock"}
+        timings = collections.defaultdict(float)
+        for span in rows:
+            phase = phases.get(span["name"])
+            # Reacquisition includes the PostgreSQL lock attempts and sleep
+            # between retries. Count the enclosing span only.
+            if phase and span.get("parentSpanId") not in retries:
+                timings[phase] += span["durationMs"]
+            attrs = span.get("attributes", {})
+            if phase == "carrier_create" and attrs.get("carrier.pod_name") == sample.get("carrierPodName"):
+                sample["carrier_created_at"] = span["endTime"]
+            if phase == "carrier_ready":
+                sample["carrier_observed_at"] = span["endTime"]
+        sample["traceId"] = trace
+        sample["phases_ms"] = {phase: round(ms, 2) for phase, ms in timings.items()}
+        if sample["pool"] == "COLD_FALLBACK":
+            for phase, ms in timings.items():
+                cold_phases[phase].append(ms)
+    return {"matched": matched, "cold_phases_ms": {phase: stats_dict(ms) for phase, ms in cold_phases.items()}}
+
+
 def bake_template():
     _, tpl, tpl_ms = http_req(
         "POST",
         f"{API_BASE}/v1/templates",
         body={
             "name": f"bench-{BENCH_MODE}",
-            "baseImage": "docker.io/kontinue/python-agent:dev",
-            "warmupScript": "python3 -c 'open(\"/root/tpl_ready\",\"w\").write(\"ok\")'",
+            "baseImage": os.environ.get("BASE_IMAGE", "docker.io/kontinue/python-agent:dev"),
+            "warmupScript": "python3 -c 'open(\"/tmp/tpl_ready\",\"w\").write(\"ok\")'",
             "pinInL1Tmpfs": True,
             "traceHotPages": True,
         },
@@ -200,13 +265,77 @@ def bake_template():
     return tpl["templateId"], tpl_ms
 
 
-def create_sandbox(tpl_id, idx):
+def create_sandbox(tpl_id, idx, sandbox_id=None, tier=None):
+    body = {"templateId": tpl_id, "sandboxId": sandbox_id or "", "envVars": {"BENCH_IDX": str(idx)}, "idleTimeoutSeconds": 600}
+    if tier:
+        body["tier"] = tier
     _, sbx, ms = http_req(
         "POST",
         f"{API_BASE}/v1/sandboxes",
-        body={"templateId": tpl_id, "envVars": {"BENCH_IDX": str(idx)}, "idleTimeoutSeconds": 600},
+        body=body,
     )
     return sbx, ms
+
+
+def first_command(sbx):
+    _, res, _ = http_req("POST", f"{GATEWAY_BASE}/v1/process/exec",
+                         body={"command": ["/bin/echo", "ready"]},
+                         headers={"X-Kontinue-Sandbox-ID": sbx["sandboxId"], "X-Kontinue-Token": sbx["accessToken"]})
+    if res["exitCode"] != 0 or res["stdout"].strip() != "ready":
+        raise RuntimeError("first command did not complete")
+
+
+def run_startup(report):
+    tpl, report["template_ms"] = bake_template()
+    prefix = "bench-" + secrets.token_hex(6)
+    # A unique tier exercises normal placement with no pre-existing Carriers.
+    # The background replenisher manages only the default tier.
+    empty_pool = os.environ.get("BENCH_EMPTY_POOL") == "1"
+    tier = prefix if empty_pool else "default"
+    report["carrier_tier"] = tier
+    report["idle_before"] = query_redis_idle_pool(tier)
+    if empty_pool and (not report["idle_before"] or any(report["idle_before"].values())):
+        raise RuntimeError(f"expected zero idle Carriers in benchmark tier {tier}")
+    ids = [f"{prefix}-{i}" for i in range(TOTAL_SANDBOXES)]
+
+    def measure(item):
+        i, sandbox_id = item
+        start = time.perf_counter()
+        sbx, created_ms = create_sandbox(tpl, i, sandbox_id, tier)
+        first_command(sbx)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        return {
+            "sandboxId": sandbox_id, "pool": sbx["poolAllocation"], "tier": sbx.get("arenaTier"),
+            "carrierPodName": sbx.get("carrierPodName"), "node": sbx.get("currentNodeId"),
+            "restoreViewCopiedBytes": sbx.get("restoreViewCopiedBytes"),
+            "create_ms": round(created_ms, 2), "first_command_ms": round(elapsed_ms, 2),
+        }
+
+    samples, errors = [], []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SUSTAINED_CONC) as pool:
+            futures = {pool.submit(measure, item): item[1] for item in enumerate(ids)}
+            for task in concurrent.futures.as_completed(futures):
+                try:
+                    samples.append(task.result())
+                except Exception as exc:
+                    errors.append({"sandboxId": futures[task], "error": str(exc)})
+        report.update(requested=len(ids), concurrency=SUSTAINED_CONC, samples=samples, errors=errors)
+        report["failure_rate_percent"] = 100 * len(errors) / len(ids)
+        if os.environ.get("KONTINUE_TRACE_TOKEN"):
+            report["startup_traces"] = startup_trace_timings(samples)
+        report["all_first_command_ms"] = stats_dict([sample["first_command_ms"] for sample in samples])
+        report["first_command_ms"] = {
+            kind: stats_dict([r["first_command_ms"] for r in samples if r["pool"] == kind])
+            for kind in ("WARM_POOL", "COLD_FALLBACK")
+        }
+        warm_hits = sum(r["pool"] == "WARM_POOL" for r in samples)
+        report["warm_hit_percent"] = 100 * warm_hits / len(ids)
+        print(json.dumps({k: report[k] for k in ("requested", "concurrency", "warm_hit_percent", "first_command_ms")}))
+        if errors:
+            raise RuntimeError(f"{len(errors)} startup requests failed")
+    finally:
+        delete_all([(i, {"sandboxId": sandbox_id}) for i, sandbox_id in enumerate(ids)])
 
 
 def delete_all(sandboxes):
@@ -234,16 +363,20 @@ def run_overflow(report):
     t_wave1 = time.perf_counter()
 
     def create_one(idx):
+        t0 = time.perf_counter()
         sbx, ms = create_sandbox(tpl_id, idx)
-        return idx, sbx, ms
+        first_command(sbx)
+        return idx, sbx, ms, (time.perf_counter()-t0)*1000
 
     sandboxes = []
+    first_exec = collections.defaultdict(list)
     warm_lat, cold_lat = [], []
     node_dist = collections.Counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=TOTAL_SANDBOXES) as pool:
         futs = [pool.submit(create_one, i) for i in range(TOTAL_SANDBOXES)]
         for f in concurrent.futures.as_completed(futs):
-            idx, sbx, ms = f.result()
+            idx, sbx, ms, ready_ms = f.result()
+            first_exec[sbx["poolAllocation"]].append(ready_ms)
             sandboxes.append((idx, sbx))
             node_dist[sbx["currentNodeId"]] += 1
             if sbx.get("poolAllocation") == "COLD_FALLBACK":
@@ -310,22 +443,8 @@ def run_overflow(report):
         "latency": stats_dict(exec_lats),
     }
 
-    # create -> first exec E2E sample after bulk exec
-    e2e = []
-    for idx, sbx in sandboxes[: min(10, len(sandboxes))]:
-        try:
-            t0 = time.perf_counter()
-            http_req(
-                "POST",
-                f"{GATEWAY_BASE}/v1/process/exec",
-                body={"command": ["/bin/sh", "-c", "echo ok"]},
-                headers={"X-Kontinue-Sandbox-ID": sbx["sandboxId"], "X-Kontinue-Token": sbx["accessToken"]},
-            )
-            e2e.append((time.perf_counter() - t0) * 1000)
-        except Exception:
-            continue
-    print(f"  First-exec sample {fmt_stats(e2e)}")
-    report["first_exec_sample"] = stats_dict(e2e)
+    report["first_command_ms"] = {k: stats_dict(v) for k, v in first_exec.items()}
+    report["warm_hit_percent"] = 100 * len(warm_lat) / len(sandboxes)
 
     # Suspend
     t3 = time.perf_counter()
@@ -488,7 +607,9 @@ def main():
         "gateway": GATEWAY_BASE,
     }
     try:
-        if BENCH_MODE == "warm-only":
+        if BENCH_MODE == "startup":
+            run_startup(report)
+        elif BENCH_MODE == "warm-only":
             run_warm_only(report)
         elif BENCH_MODE == "sustained-qps":
             run_sustained(report)
