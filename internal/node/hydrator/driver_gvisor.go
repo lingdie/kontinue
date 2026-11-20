@@ -13,6 +13,7 @@ import (
 
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
 	"github.com/kontinue-sh/kontinue/pkg/telemetry"
@@ -331,30 +332,20 @@ func (d *GVisorSandboxDriver) stageBaseRootfs(ctx context.Context, imageRef stri
 	}
 
 	mntDir := filepath.Join(d.cfg.BaseRootfsCache, imgKey, "mnt")
-	_ = os.RemoveAll(filepath.Join(d.cfg.BaseRootfsCache, imgKey))
+	if err := d.removeImageMount(ctx, mntDir); err != nil {
+		return "", err
+	}
+	if err := os.RemoveAll(targetRootfs); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(mntDir, 0o755); err != nil {
 		return "", err
 	}
 	if err := os.MkdirAll(targetRootfs, 0o755); err != nil {
 		return "", err
 	}
-
-	mntOut, err := d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "mount", "--rw", imageRef, mntDir).CombinedOutput()
-	if err != nil && strings.Contains(string(mntOut), "already exists") {
-		_ = d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "snapshots", "rm", mntDir).Run()
-		mntOut, err = d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "mount", "--rw", imageRef, mntDir).CombinedOutput()
-	}
-	if err != nil {
-		return "", fmt.Errorf("ctr images mount %s: %w (%s)", imageRef, err, string(mntOut))
-	}
-	defer func() {
-		_ = d.hostCommand(context.Background(), d.cfg.CtrBinary, "-n", "k8s.io", "images", "unmount", mntDir).Run()
-		_ = os.RemoveAll(mntDir)
-	}()
-
-	cpOut, cpErr := d.hostCommand(ctx, "cp", "-a", mntDir+"/.", targetRootfs+"/").CombinedOutput()
-	if cpErr != nil {
-		return "", fmt.Errorf("stage rootfs %s: %w (%s)", imageRef, cpErr, string(cpOut))
+	if err := d.copyMountedRootfs(ctx, imageRef, mntDir, targetRootfs); err != nil {
+		return "", err
 	}
 	_ = os.MkdirAll(filepath.Join(targetRootfs, "root"), 0o755)
 	_ = os.MkdirAll(filepath.Join(targetRootfs, "etc"), 0o755)
@@ -370,6 +361,40 @@ func (d *GVisorSandboxDriver) stageBaseRootfs(ctx context.Context, imageRef stri
 		return "", err
 	}
 	return targetRootfs, nil
+}
+
+func (d *GVisorSandboxDriver) copyMountedRootfs(ctx context.Context, imageRef, mntDir, targetRootfs string) (err error) {
+	// A cancelled or failed mount command can still have created a mount.
+	defer func() {
+		clean, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		err = errors.Join(err, d.removeImageMount(clean, mntDir))
+	}()
+	mntOut, err := d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "mount", "--rw", imageRef, mntDir).CombinedOutput()
+	if err != nil && strings.Contains(string(mntOut), "already exists") {
+		_ = d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "snapshots", "rm", mntDir).Run()
+		mntOut, err = d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "mount", "--rw", imageRef, mntDir).CombinedOutput()
+	}
+	if err != nil {
+		return fmt.Errorf("ctr images mount %s: %w (%s)", imageRef, err, string(mntOut))
+	}
+
+	cpOut, cpErr := d.hostCommand(ctx, "cp", "-a", mntDir+"/.", targetRootfs+"/").CombinedOutput()
+	if cpErr != nil {
+		return fmt.Errorf("stage rootfs %s: %w (%s)", imageRef, cpErr, string(cpOut))
+	}
+	return nil
+}
+
+func (d *GVisorSandboxDriver) removeImageMount(ctx context.Context, dir string) error {
+	// A non-recursive removal is safe for an empty staging directory.
+	if err := os.Remove(dir); err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if out, err := d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "unmount", dir).CombinedOutput(); err != nil {
+		return fmt.Errorf("unmount image rootfs at %s: %w (%s)", dir, err, out)
+	}
+	return os.RemoveAll(dir)
 }
 
 func defaultCaps() []string {
