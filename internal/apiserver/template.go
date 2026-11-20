@@ -132,7 +132,9 @@ func (s *Server) advanceTemplateBuild(ctx context.Context, t *store.TemplateReco
 				return nil, fmt.Errorf("template builder release is unconfirmed")
 			}
 			if !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
-				s.cfg.Replenisher.EnqueueTaintedPod(b.Slot.PodNamespace, b.Slot.PodName, receipt.PodUID)
+				if err := s.cfg.Replenisher.DeleteTaintedPod(ctx, b.Slot.PodNamespace, b.Slot.PodName, receipt.PodUID); err != nil {
+					return nil, err
+				}
 			}
 			t.Build = nil
 			if t.GoldenSnapshotID == "" {

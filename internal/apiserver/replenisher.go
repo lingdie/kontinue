@@ -38,23 +38,14 @@ type ReplenisherConfig struct {
 	PollInterval   time.Duration
 }
 
-// CarrierPoolReplenisher runs off the hot path in the background:
-// 1. Monitors idle Carrier Pod counts per node in Redis and tops up deficit Pods asynchronously;
-// 2. Deletes Tainted (used) Carrier Pods asynchronously so zero K8s API / etcd calls ever block foreground requests;
-// 3. Implements ColdSlotAllocator (direct NodeName-bound Pod creation bypassing kube-scheduler) on pool exhaustion.
+// CarrierPoolReplenisher keeps idle capacity available and provisions Carriers
+// directly on compatible nodes when the pool is empty.
 type CarrierPoolReplenisher struct {
-	kube      kubernetes.Interface
-	catalog   store.RuntimeCatalog
-	cfg       ReplenisherConfig
-	taintedCh chan taintedPodRef
+	kube    kubernetes.Interface
+	catalog store.RuntimeCatalog
+	cfg     ReplenisherConfig
 	// createSem bounds concurrent Pod creates so cold-burst storms do not stall CNI/PLEG.
 	createSem chan struct{}
-}
-
-type taintedPodRef struct {
-	uid       types.UID
-	namespace string
-	podName   string
 }
 
 func NewCarrierPoolReplenisher(kube kubernetes.Interface, catalog store.RuntimeCatalog, cfg ReplenisherConfig) *CarrierPoolReplenisher {
@@ -85,7 +76,6 @@ func NewCarrierPoolReplenisher(kube kubernetes.Interface, catalog store.RuntimeC
 		kube:      kube,
 		catalog:   catalog,
 		cfg:       cfg,
-		taintedCh: make(chan taintedPodRef, 2048),
 		createSem: make(chan struct{}, 8),
 	}
 }
@@ -94,38 +84,41 @@ func (r *CarrierPoolReplenisher) TargetIdlePerNode() int {
 	return r.cfg.MinIdlePerNode + r.cfg.IdleBurstBuffer
 }
 
-func (r *CarrierPoolReplenisher) EnqueueTaintedPod(namespace, podName, podUID string) {
+// DeleteTaintedPod waits for the deletion to be acknowledged before callers
+// discard the durable assignment that lets them retry it.
+func (r *CarrierPoolReplenisher) DeleteTaintedPod(ctx context.Context, namespace, podName, podUID string) error {
 	if r == nil || r.kube == nil || podName == "" || podUID == "" {
-		return
+		return nil
 	}
 	if namespace == "" {
 		namespace = r.cfg.Namespace
 	}
-	select {
-	case r.taintedCh <- taintedPodRef{namespace: namespace, podName: podName, uid: types.UID(podUID)}:
-	default:
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	pods := r.kube.CoreV1().Pods(namespace)
+	uid, grace := types.UID(podUID), int64(0)
+	err := pods.Delete(ctx, podName, metav1.DeleteOptions{
+		GracePeriodSeconds: &grace,
+		Preconditions:      &metav1.Preconditions{UID: &uid},
+	})
+	if err == nil || apierrors.IsNotFound(err) {
+		return nil
 	}
+	if apierrors.IsConflict(err) {
+		pod, lookupErr := pods.Get(ctx, podName, metav1.GetOptions{})
+		if apierrors.IsNotFound(lookupErr) || (lookupErr == nil && pod.UID != uid) {
+			return nil
+		}
+		if lookupErr != nil {
+			return errors.Join(err, lookupErr)
+		}
+	}
+	return err
 }
 
 func (r *CarrierPoolReplenisher) Start(ctx context.Context) {
 	if r == nil || r.kube == nil {
 		return
-	}
-	for w := 0; w < 8; w++ {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case item := <-r.taintedCh:
-					grace := int64(0)
-					_ = r.kube.CoreV1().Pods(item.namespace).Delete(ctx, item.podName, metav1.DeleteOptions{
-						GracePeriodSeconds: &grace,
-						Preconditions:      &metav1.Preconditions{UID: &item.uid},
-					})
-				}
-			}
-		}()
 	}
 	go func() {
 		ticker := time.NewTicker(r.cfg.PollInterval)

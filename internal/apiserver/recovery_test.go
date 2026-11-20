@@ -3,6 +3,7 @@ package apiserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 func TestRecoveryPersistsFailureOnlyForCurrentAllocation(t *testing.T) {
@@ -52,6 +57,88 @@ func TestRecoveryPersistsFailureOnlyForCurrentAllocation(t *testing.T) {
 	got, err = meta.GetSandbox(ctx, "box")
 	if err != nil || got.State != store.SandboxStateFailed || got.CurrentSlotID != "slot" || got.ActiveSnapshotID != "snapshot" || got.FailureReason != report.Reason {
 		t.Fatalf("lost failure evidence: %v %v", got, err)
+	}
+}
+
+type releaseReplayNode struct {
+	protocol.NodeControlServer
+	calls atomic.Int32
+}
+
+func (n *releaseReplayNode) ReleaseSlot(_ context.Context, req *protocol.ReleaseSlotRequest) (*protocol.ReleaseSlotResponse, error) {
+	if req.SandboxID != "box" || req.ExecutionID != 2 || req.LifecycleID != "life" || req.SlotID != "slot" {
+		return nil, errors.New("wrong release identity")
+	}
+	n.calls.Add(1)
+	return &protocol.ReleaseSlotResponse{Released: true, PodUID: "original-uid"}, nil
+}
+
+func TestSuspendReleaseRetainsAssignmentUntilPodDeletionIsConfirmed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var deletes atomic.Int32
+	kube := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/v1/namespaces/carriers/pods/pod" {
+			t.Errorf("unexpected pod path %s", r.URL.Path)
+		}
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(corev1.Pod{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}, ObjectMeta: metav1.ObjectMeta{UID: "replacement-uid"}})
+			return
+		}
+		var opts metav1.DeleteOptions
+		if err := json.NewDecoder(r.Body).Decode(&opts); r.Method != http.MethodDelete || err != nil || opts.Preconditions == nil || opts.Preconditions.UID == nil || *opts.Preconditions.UID != "original-uid" {
+			t.Errorf("pod deletion lost its original UID: method=%s opts=%+v err=%v", r.Method, opts, err)
+		}
+		code, reason := http.StatusConflict, metav1.StatusReasonConflict
+		if deletes.Add(1) == 1 {
+			code, reason = http.StatusInternalServerError, metav1.StatusReasonInternalError
+		}
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: metav1.StatusFailure, Code: int32(code), Reason: reason})
+	}))
+	defer kube.Close()
+	kubeClient, err := kubernetes.NewForConfig(&rest.Config{Host: kube.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &releaseReplayNode{}
+	worker := grpc.NewServer()
+	defer worker.Stop()
+	protocol.RegisterNodeControlServer(worker, node)
+	go func() { _ = worker.Serve(lis) }()
+	meta := store.NewMemoryMetadataStore()
+	catalog := store.NewMemoryRuntimeCatalog()
+	box := &store.SandboxRecord{SandboxID: "box", State: store.SandboxStateSuspended, ExecutionID: 2, LifecycleID: "life", CurrentNodeID: "node", CurrentSlotID: "slot", CarrierPodNamespace: "carriers", CarrierPodName: "pod", PodIP: "10.0.0.1"}
+	if err := meta.CreateSandbox(ctx, box); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.UpsertNodeHeartbeat(ctx, protocol.NodeHeartbeat{NodeID: "node", GRPCAddr: lis.Addr().String()}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	cfg := ServerConfig{Meta: meta, Catalog: catalog, Replenisher: NewCarrierPoolReplenisher(kubeClient, catalog, ReplenisherConfig{})}
+	first := NewServer(cfg)
+	err = first.finishSuspendRelease(ctx, box)
+	first.Close()
+	if err == nil {
+		t.Fatal("forgot a transient pod deletion failure")
+	}
+	recovered := NewServer(cfg)
+	defer recovered.Close()
+	box, err = meta.GetSandbox(ctx, "box")
+	if err != nil || box.CurrentSlotID != "slot" {
+		t.Fatalf("old slot unrecorded after API replacement: got=%+v err=%v", box, err)
+	}
+	if err := recovered.finishSuspendRelease(ctx, box); err != nil {
+		t.Fatalf("retry against a replacement Pod did not finish: %v", err)
+	}
+	box, err = meta.GetSandbox(ctx, "box")
+	if err != nil || box.CurrentSlotID != "" || node.calls.Load() != 2 || deletes.Load() != 2 {
+		t.Fatalf("unexpected release replay: got=%+v err=%v releases=%d deletes=%d", box, err, node.calls.Load(), deletes.Load())
 	}
 }
 

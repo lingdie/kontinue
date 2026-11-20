@@ -501,7 +501,7 @@ func (s *Server) releaseExecution(ctx context.Context, sbx *store.SandboxRecord)
 		return fmt.Errorf("slot %s release is unconfirmed", sbx.CurrentSlotID)
 	}
 	if !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
-		s.cfg.Replenisher.EnqueueTaintedPod(sbx.CarrierPodNamespace, sbx.CarrierPodName, released.PodUID)
+		return s.cfg.Replenisher.DeleteTaintedPod(ctx, sbx.CarrierPodNamespace, sbx.CarrierPodName, released.PodUID)
 	}
 	return nil
 }
