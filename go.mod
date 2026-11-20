@@ -6,12 +6,14 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.7.2
 	github.com/jackc/pgx/v5 v5.7.1
 	github.com/klauspost/cpuid/v2 v2.0.9
+	github.com/moby/sys/mountinfo v0.6.2
 	github.com/redis/go-redis/v9 v9.7.0
 	go.opentelemetry.io/otel v1.31.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.31.0
 	go.opentelemetry.io/otel/sdk v1.31.0
 	go.opentelemetry.io/otel/trace v1.31.0
 	golang.org/x/sync v0.10.0
+	golang.org/x/sys v0.28.0
 	google.golang.org/grpc v1.68.0
 	k8s.io/api v0.31.3
 	k8s.io/apimachinery v0.31.3
@@ -55,7 +57,6 @@ require (
 	golang.org/x/crypto v0.28.0 // indirect
 	golang.org/x/net v0.30.0 // indirect
 	golang.org/x/oauth2 v0.23.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/term v0.25.0 // indirect
 	golang.org/x/text v0.19.0 // indirect
 	golang.org/x/time v0.3.0 // indirect

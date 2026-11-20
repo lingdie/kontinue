@@ -13,10 +13,11 @@ import (
 // A materialized view can outlive its daemon. An ArenaFS mount depends on the
 // original daemon's FUSE server even if its mountpoint still exists.
 type ViewIdentity struct {
-	Staging   FileIdentity    `json:"staging"`
-	ArenaFS   bool            `json:"arenaFs"`
-	Directory FileIdentity    `json:"directory"`
-	Artifacts [3]FileIdentity `json:"artifacts"`
+	Staging    FileIdentity    `json:"staging"`
+	ArenaFS    bool            `json:"arenaFs"`
+	Directory  FileIdentity    `json:"directory"`
+	Mountpoint FileIdentity    `json:"mountpoint,omitzero"`
+	Artifacts  [3]FileIdentity `json:"artifacts"`
 }
 
 type FileIdentity struct {
@@ -74,6 +75,9 @@ func (m *Manager) DescribeView(path string) (*ViewIdentity, error) {
 	}
 	_, plain := h.(*plainDirHandle)
 	id.ArenaFS = !plain
+	if mounted, ok := h.(interface{ mountpointIdentity() FileIdentity }); ok {
+		id.Mountpoint = mounted.mountpointIdentity()
+	}
 	id.Staging, err = m.stagingIdentity(filepath.Base(path))
 	if err != nil {
 		return nil, err
@@ -131,8 +135,19 @@ func (m *Manager) ConfirmReleaseView(viewID, path string, expected *ViewIdentity
 			return fmt.Errorf("unconfirmed tmpfs view %s", viewID)
 		}
 	}
+	actual, err := m.stagingIdentity(viewID)
+	if err != nil {
+		return err
+	}
+	if actual != (FileIdentity{}) && (expected == nil || actual != expected.Staging) {
+		return fmt.Errorf("unconfirmed staging remains for view %s", viewID)
+	}
 	if _, err := os.Lstat(claimed); errors.Is(err, os.ErrNotExist) {
 		// Cleanup of the view completed before the previous process exited.
+	} else if expected != nil && expected.ArenaFS {
+		if err := releaseDisconnectedArenaFS(claimed, expected, err); err != nil {
+			return err
+		}
 	} else if err != nil {
 		return err
 	} else {
@@ -143,21 +158,18 @@ func (m *Manager) ConfirmReleaseView(viewID, path string, expected *ViewIdentity
 			return err
 		}
 	}
-	actual, err := m.stagingIdentity(viewID)
-	if err != nil {
-		return err
-	}
 	if actual == (FileIdentity{}) {
 		return nil
-	}
-	if expected == nil || actual != expected.Staging {
-		return fmt.Errorf("unconfirmed staging remains for view %s", viewID)
 	}
 	return os.RemoveAll(filepath.Join(m.cfg.L2CASDir, "staging", viewID))
 }
 
 func (m *Manager) stagingIdentity(viewID string) (FileIdentity, error) {
-	info, err := os.Lstat(filepath.Join(m.cfg.L2CASDir, "staging", viewID))
+	return directoryIdentity(filepath.Join(m.cfg.L2CASDir, "staging", viewID))
+}
+
+func directoryIdentity(path string) (FileIdentity, error) {
+	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return FileIdentity{}, nil
 	}
@@ -165,7 +177,7 @@ func (m *Manager) stagingIdentity(viewID string) (FileIdentity, error) {
 		return FileIdentity{}, err
 	}
 	if !info.IsDir() {
-		return FileIdentity{}, fmt.Errorf("unexpected staging file for %s", viewID)
+		return FileIdentity{}, fmt.Errorf("expected a directory at %s", path)
 	}
 	stat := info.Sys().(*syscall.Stat_t)
 	return FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, nil
