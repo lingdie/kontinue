@@ -216,11 +216,14 @@ func (s *Service) ExecuteCheckpoint(ctx context.Context, req *protocol.ExecuteCh
 	rawDir := filepath.Join(s.cfg.ScratchDir, fmt.Sprintf("raw-%s-%d", prep.TargetSnapshotID, time.Now().UnixNano()))
 	defer func() { _ = os.RemoveAll(rawDir) }()
 
-	if err := s.cfg.Driver.CheckpointSandboxContainer(ctx, req.ContainerID, rawDir, prep.LeaveRunning); err != nil {
+	captureCtx, captureSpan := telemetry.StartSpan(ctx, "kontinued", "hydrator.driver_checkpoint", attribute.String(telemetry.AttrSnapshotID, prep.TargetSnapshotID))
+	captureErr := s.cfg.Driver.CheckpointSandboxContainer(captureCtx, req.ContainerID, rawDir, prep.LeaveRunning)
+	telemetry.EndSpan(captureSpan, captureErr)
+	if captureErr != nil {
 		if ktdAddr != "" && bootstrapTok != "" {
 			_ = s.cfg.KtdClient.Thaw(ctx, ktdAddr, bootstrapTok)
 		}
-		retErr = fmt.Errorf("driver checkpoint container: %w", err)
+		retErr = fmt.Errorf("driver checkpoint container: %w", captureErr)
 		return nil, retErr
 	}
 
@@ -281,6 +284,7 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
+	var copiedBytes int64
 	var viewDir string
 	arenaTier := "COLD_BOOT"
 	restoreMode := req.RestoreMode
@@ -334,7 +338,7 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		viewID := st.ViewID
 		var mf *protocol.SnapshotManifest
 		var err error
-		viewDir, arenaTier, mf, err = s.cfg.Arena.PrepareRestoreView(ctx, req.SnapshotID, viewID)
+		viewDir, arenaTier, mf, copiedBytes, err = s.cfg.Arena.PrepareRestoreView(ctx, req.SnapshotID, viewID)
 		if err != nil {
 			retErr = fmt.Errorf("prepare restore view: %w", err)
 			return nil, retErr
@@ -410,7 +414,7 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		return nil, retErr
 	}
 
-	st.Activation = &protocol.HydrateSlotResponse{
+	st.Activation = &protocol.HydrateSlotResponse{RestoreViewCopiedBytes: &copiedBytes,
 		SandboxID:   req.SandboxID,
 		ExecutionID: req.ExecutionID,
 		PodIP:       ktdEndpoint,

@@ -98,6 +98,8 @@ type PendingFork struct {
 }
 
 type SandboxRecord struct {
+	ArenaTier                   string               `json:"arenaTier,omitempty"`
+	RestoreViewCopiedBytes      *int64               `json:"restoreViewCopiedBytes,omitempty"`
 	CreateKey                   string               `json:"createKey,omitempty"`
 	CreateRequestHash           string               `json:"createRequestHash,omitempty"`
 	TenantID                    string               `json:"tenantId,omitempty"`

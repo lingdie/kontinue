@@ -73,6 +73,8 @@ func (s *Server) advanceActivation(ctx context.Context, sb *store.SandboxRecord)
 		return nil, fmt.Errorf("unexpected activation result for slot %s", p.Slot.SlotID)
 	}
 	sb.PodIP = result.PodIP
+	sb.ArenaTier = result.ArenaTier
+	sb.RestoreViewCopiedBytes = result.RestoreViewCopiedBytes
 	sb.OriginNodeID = sb.CurrentNodeID
 	sb.State = store.SandboxStateRunning
 	sb.PendingPlacement = nil

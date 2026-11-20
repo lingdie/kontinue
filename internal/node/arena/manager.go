@@ -26,9 +26,10 @@ import (
 )
 
 const (
-	TierL1Tmpfs   = "L1_TMPFS"
-	TierL2NVMe    = "L2_NVME"
-	TierL3ArenaFS = "L3_ARENAFS"
+	TierL1Tmpfs        = "L1_TMPFS"
+	TierL2NVMe         = "L2_NVME"
+	TierL3ArenaFS      = "L3_ARENAFS"
+	TierL3Materialized = "L3_MATERIALIZED"
 )
 
 type ViewCloser interface {
@@ -67,6 +68,7 @@ func fallbackMaterializeDir(ctx context.Context, dir string, ckptBytes, metaByte
 		}
 	}
 	if reader != nil {
+		reader.copiedBytes.Add(int64(len(ckptBytes) + len(metaBytes)))
 		if err := reader.WarmAll(ctx); err != nil {
 			return err
 		}
@@ -82,8 +84,9 @@ func fallbackMaterializeDir(ctx context.Context, dir string, ckptBytes, metaByte
 			if err != nil {
 				return err
 			}
-			_, err = io.Copy(out, in)
-			_ = out.Close()
+			n, copyErr := io.Copy(out, in)
+			reader.copiedBytes.Add(n)
+			err = errors.Join(copyErr, out.Close())
 			if err != nil {
 				return err
 			}
@@ -109,6 +112,7 @@ type Manager struct {
 	cfg ManagerConfig
 
 	releases    singleflight.Group
+	pins        singleflight.Group
 	mu          sync.RWMutex
 	l1Pinned    map[string]string
 	l2Manifests map[string]*protocol.SnapshotManifest
@@ -311,10 +315,6 @@ func (m *Manager) IngestRawCheckpoint(ctx context.Context, opts IngestOptions) (
 		attribute.Int64(telemetry.AttrBytes, manifest.DirtyMemoryBytes),
 	)
 
-	if opts.PinInL1Tmpfs || opts.Kind == protocol.SnapshotKindGoldenTemplate {
-		_, _ = m.PrewarmToL1Tmpfs(ctx, manifest)
-	}
-
 	manifestURI := "local://" + outManifestPath
 	if m.cfg.RemoteStore != nil {
 		// Upload metadata + dirty chunks synchronously enough for reliability or via tracked uploadWG.
@@ -331,6 +331,10 @@ func (m *Manager) IngestRawCheckpoint(ctx context.Context, opts IngestOptions) (
 			retErr = err
 			return nil, "", err
 		}
+	}
+
+	if opts.PinInL1Tmpfs || opts.Kind == protocol.SnapshotKindGoldenTemplate {
+		_, _ = m.PrewarmToL1Tmpfs(ctx, manifest)
 	}
 
 	return manifest, manifestURI, nil
@@ -379,7 +383,9 @@ func skipThawTouchOrder(chunks []protocol.ChunkRef) []protocol.ChunkRef {
 	return out
 }
 
-func (m *Manager) uploadSnapshotToRemote(ctx context.Context, mf *protocol.SnapshotManifest) (string, error) {
+func (m *Manager) uploadSnapshotToRemote(ctx context.Context, mf *protocol.SnapshotManifest) (uri string, err error) {
+	ctx, span := telemetry.StartSpan(ctx, "kontinue-arena", "arena.upload_snapshot", attribute.String(telemetry.AttrSnapshotID, mf.SnapshotID))
+	defer func() { telemetry.EndSpan(span, err) }()
 	snapDir := filepath.Join(m.cfg.L2CASDir, "snapshots", mf.SnapshotID)
 	for _, art := range []string{protocol.GVisorCheckpointImg, protocol.GVisorPagesMetaImg, protocol.RootfsUpperTar} {
 		p := filepath.Join(snapDir, art)
@@ -430,89 +436,103 @@ func (m *Manager) ResolveManifest(ctx context.Context, snapshotID string) (*prot
 	return nil, fmt.Errorf("snapshot %s manifest not found", snapshotID)
 }
 
-func (m *Manager) PrewarmToL1Tmpfs(ctx context.Context, mf *protocol.SnapshotManifest) (string, error) {
+func (m *Manager) PrewarmToL1Tmpfs(ctx context.Context, mf *protocol.SnapshotManifest) (path string, err error) {
 	ctx, span := telemetry.StartSpan(ctx, "kontinue-arena", "arena.prewarm_l1_tmpfs",
 		attribute.String(telemetry.AttrSnapshotID, mf.SnapshotID),
 	)
-	var retErr error
-	defer func() { telemetry.EndSpan(span, retErr) }()
+	defer func() { telemetry.EndSpan(span, err) }()
 
-	m.mu.RLock()
-	if dir, ok := m.l1Pinned[mf.SnapshotID]; ok {
-		m.mu.RUnlock()
-		return dir, nil
-	}
-	m.mu.RUnlock()
-
-	l1Dir := filepath.Join(m.cfg.L1TmpfsDir, mf.SnapshotID)
-	ckptBytes, metaBytes, err := m.loadCoreArtifacts(ctx, mf)
-	if err != nil {
-		retErr = err
-		return "", err
-	}
-
-	tmpBacking := filepath.Join(m.cfg.L2CASDir, "staging", mf.SnapshotID+"-l1.pages")
-	reader, err := NewLazyPageReader(LazyReaderOptions{
-		Manifest:       mf,
-		LocalCASDir:    m.cfg.L2CASDir,
-		BackingFile:    tmpBacking,
-		RemoteStore:    m.cfg.RemoteStore,
-		OriginPeerAddr: mf.OriginPeerAddr,
+	key := pinPath(m.cfg.L1TmpfsDir, mf)
+	value, err, _ := m.pins.Do(key, func() (any, error) {
+		if _, err := os.Stat(key); errors.Is(err, os.ErrNotExist) {
+			tmp, err := os.MkdirTemp(m.cfg.L1TmpfsDir, ".pin-")
+			if err != nil {
+				return "", err
+			}
+			defer os.RemoveAll(tmp)
+			ckpt, meta, err := m.loadCoreArtifacts(ctx, mf)
+			if err != nil {
+				return "", err
+			}
+			// Place the sparse backing file on tmpfs so materialization can link it.
+			reader, err := NewLazyPageReader(LazyReaderOptions{Manifest: mf, LocalCASDir: m.cfg.L2CASDir, BackingFile: filepath.Join(tmp, "backing"), RemoteStore: m.cfg.RemoteStore, OriginPeerAddr: mf.OriginPeerAddr})
+			if err != nil {
+				return "", err
+			}
+			err = fallbackMaterializeDir(ctx, tmp, ckpt, meta, reader)
+			err = errors.Join(err, reader.Close())
+			if err != nil {
+				return "", err
+			}
+			if err = os.Rename(tmp, key); err != nil {
+				return "", err
+			}
+		} else if err != nil {
+			return "", err
+		}
+		m.mu.Lock()
+		m.l1Pinned[mf.SnapshotID] = key
+		m.mu.Unlock()
+		return key, nil
 	})
 	if err != nil {
-		retErr = err
 		return "", err
 	}
-	defer reader.Close()
+	return value.(string), nil
+}
 
-	if err := fallbackMaterializeDir(ctx, l1Dir, ckptBytes, metaBytes, reader); err != nil {
-		retErr = err
-		return "", err
-	}
-	m.mu.Lock()
-	m.l1Pinned[mf.SnapshotID] = l1Dir
-	m.mu.Unlock()
-	return l1Dir, nil
+func pinPath(root string, mf *protocol.SnapshotManifest) string {
+	// A capture retried before publication can reuse its ID with a new image.
+	return filepath.Join(root, fmt.Sprintf("%s-%d", mf.SnapshotID, mf.CreatedAt.UnixNano()))
 }
 
 // PrepareRestoreView selects the fastest Arena Tier available for restoring `snapshotID`:
 // 1. L1_TMPFS: zero-copy hardlink view into host RAM tmpfs;
 // 2. L2_NVME: local CAS materialization when all chunks exist on local NVMe;
 // 3. L3_ARENAFS: instant FUSE mount backed by LazyPageReader (P2P + S3 Range + Hot-Page Prefetcher)!
-func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID string) (viewPath string, tier string, mf *protocol.SnapshotManifest, err error) {
+func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID string) (viewPath string, tier string, mf *protocol.SnapshotManifest, copiedBytes int64, err error) {
 	ctx, span := telemetry.StartSpan(ctx, "kontinue-arena", "arena.prepare_restore_view",
 		attribute.String(telemetry.AttrSnapshotID, snapshotID),
 		attribute.String("view.id", viewID),
 	)
 	defer func() {
 		if tier != "" {
-			span.SetAttributes(attribute.String(telemetry.AttrArenaTier, tier))
+			span.SetAttributes(attribute.String(telemetry.AttrArenaTier, tier), attribute.Int64("restore.view_copied_bytes", copiedBytes))
 		}
 		telemetry.EndSpan(span, err)
 	}()
 
 	mf, err = m.ResolveManifest(ctx, snapshotID)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, 0, err
 	}
 
 	if !filepath.IsLocal(viewID) || filepath.Base(viewID) != viewID || viewID == "." {
-		return "", "", nil, fmt.Errorf("invalid view ID %q", viewID)
+		return "", "", nil, 0, fmt.Errorf("invalid view ID %q", viewID)
+	}
+	pin := pinPath(m.cfg.L1TmpfsDir, mf)
+	if info, statErr := os.Stat(pin); statErr == nil && info.IsDir() {
+		viewDir := filepath.Join(m.cfg.L1TmpfsDir, ".views", viewID)
+		if err := os.MkdirAll(filepath.Dir(viewDir), 0700); err != nil {
+			return "", "", nil, 0, err
+		}
+		if err := os.Mkdir(viewDir, 0700); err != nil {
+			return "", "", nil, 0, err
+		}
+		if err := cloneDirHardlinks(pin, viewDir); err == nil {
+			m.trackView(viewDir, &plainDirHandle{dir: viewDir})
+			m.mu.Lock()
+			m.l1Pinned[snapshotID] = pin
+			m.mu.Unlock()
+			return viewDir, TierL1Tmpfs, mf, 0, nil
+		}
+		if err := os.RemoveAll(viewDir); err != nil {
+			return "", "", nil, 0, err
+		}
 	}
 	viewDir := filepath.Join(m.cfg.ViewsDir, viewID)
 	if err = os.Mkdir(viewDir, 0700); err != nil {
-		return "", "", nil, err
-	}
-
-	// Check Tier 1: L1 tmpfs pinned directory!
-	m.mu.RLock()
-	l1Dir, inL1 := m.l1Pinned[snapshotID]
-	m.mu.RUnlock()
-	if inL1 {
-		if linkErr := cloneDirHardlinks(l1Dir, viewDir); linkErr == nil {
-			m.trackView(viewDir, &plainDirHandle{dir: viewDir})
-			return viewDir, TierL1Tmpfs, mf, nil
-		}
+		return "", "", nil, 0, err
 	}
 
 	// Check Tier 2: Are all non-zero chunks already cached in Local L2 CAS?
@@ -529,7 +549,7 @@ func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID str
 
 	ckptBytes, metaBytes, loadErr := m.loadCoreArtifacts(ctx, mf)
 	if loadErr != nil {
-		return "", "", nil, loadErr
+		return "", "", nil, 0, loadErr
 	}
 
 	stagingPages := filepath.Join(m.cfg.L2CASDir, "staging", viewID, "backing.pages")
@@ -546,27 +566,30 @@ func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID str
 		TraceAccess:    true,
 	})
 	if rErr != nil {
-		return "", "", nil, rErr
+		return "", "", nil, 0, rErr
 	}
 
 	if allLocal {
 		if err = fallbackMaterializeDir(ctx, viewDir, ckptBytes, metaBytes, reader); err != nil {
 			_ = reader.Close()
-			return "", "", nil, err
+			return "", "", nil, 0, err
 		}
 		_ = reader.Close()
 		m.trackView(viewDir, &plainDirHandle{dir: viewDir})
-		return viewDir, TierL2NVMe, mf, nil
+		return viewDir, TierL2NVMe, mf, reader.copiedBytes.Load(), nil
 	}
 
 	// Tier 3: Cross-node / cold-cache L3 ArenaFS FUSE lazy mount + Hot-Page Prefetcher!
 	closer, mErr := mountArenaFSView(ctx, viewDir, ckptBytes, metaBytes, reader)
 	if mErr != nil {
 		_ = reader.Close()
-		return "", "", nil, mErr
+		return "", "", nil, 0, mErr
 	}
 	m.trackView(viewDir, closer)
-	return viewDir, TierL3ArenaFS, mf, nil
+	if _, plain := closer.(*plainDirHandle); plain {
+		return viewDir, TierL3Materialized, mf, reader.copiedBytes.Load(), nil
+	}
+	return viewDir, TierL3ArenaFS, mf, reader.copiedBytes.Load(), nil
 }
 
 type faultSource interface {
@@ -841,27 +864,9 @@ func (m *Manager) chunkAndDiffGo(opts IngestOptions, parent *protocol.SnapshotMa
 }
 
 func cloneDirHardlinks(srcDir, dstDir string) error {
-	entries, err := os.ReadDir(srcDir)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(dstDir, 0o700); err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		s := filepath.Join(srcDir, e.Name())
-		d := filepath.Join(dstDir, e.Name())
-		if err := os.Link(s, d); err != nil {
-			data, rErr := os.ReadFile(s)
-			if rErr != nil {
-				return rErr
-			}
-			if wErr := os.WriteFile(d, data, 0o600); wErr != nil {
-				return wErr
-			}
+	for _, name := range []string{protocol.GVisorCheckpointImg, protocol.GVisorPagesMetaImg, protocol.GVisorPagesImg} {
+		if err := os.Link(filepath.Join(srcDir, name), filepath.Join(dstDir, name)); err != nil {
+			return err
 		}
 	}
 	return nil

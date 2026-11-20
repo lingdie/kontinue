@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -31,6 +32,7 @@ type LazyPageReader struct {
 	sparseFile  *os.File
 	ready       []atomic.Bool
 	sf          singleflight.Group
+	copiedBytes atomic.Int64
 
 	peerConn   *grpc.ClientConn
 	peerClient *protocol.NodeArenaP2PClient
@@ -189,7 +191,7 @@ func (r *LazyPageReader) ensureChunk(ctx context.Context, idx int) error {
 	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
-	val, err, _ := r.sf.Do(ch.Blake3Hash, func() (any, error) {
+	val, err, _ := r.sf.Do(strconv.Itoa(idx), func() (any, error) {
 		if r.ready[idx].Load() {
 			return "already_ready", nil
 		}
@@ -197,7 +199,12 @@ func (r *LazyPageReader) ensureChunk(ctx context.Context, idx int) error {
 		if fetchErr != nil {
 			return "", fetchErr
 		}
-		if _, wErr := r.sparseFile.WriteAt(data, ch.Offset); wErr != nil {
+		if len(data) != int(ch.Length) {
+			return "", fmt.Errorf("chunk %d length mismatch", idx)
+		}
+		n, wErr := r.sparseFile.WriteAt(data, ch.Offset)
+		r.copiedBytes.Add(int64(n))
+		if wErr != nil {
 			return "", wErr
 		}
 		r.ready[idx].Store(true)

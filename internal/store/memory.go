@@ -347,6 +347,10 @@ func (m *MemoryMetadataStore) DeleteSandbox(_ context.Context, sandboxID string)
 }
 
 func cloneSandbox(in SandboxRecord) SandboxRecord {
+	if in.RestoreViewCopiedBytes != nil {
+		size := *in.RestoreViewCopiedBytes
+		in.RestoreViewCopiedBytes = &size
+	}
 	if in.PendingFork != nil {
 		f := *in.PendingFork
 		f.ChildIDs = slices.Clone(f.ChildIDs)

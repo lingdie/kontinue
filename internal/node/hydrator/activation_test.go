@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -57,7 +58,7 @@ func TestReplayActivationAfterLostReplyAndDaemonReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	second, err := s.HydrateSlot(ctx, req)
-	if err != nil || *first != *second || inits.Load() != 1 || d.starts.Load() != 1 {
+	if err != nil || !reflect.DeepEqual(first, second) || inits.Load() != 1 || d.starts.Load() != 1 {
 		t.Fatalf("replay %v, %v; starts=%d inits=%d", second, err, d.starts.Load(), inits.Load())
 	}
 	conflict := *req

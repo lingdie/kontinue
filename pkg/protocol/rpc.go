@@ -129,13 +129,14 @@ type HydrateSlotRequest struct {
 }
 
 type HydrateSlotResponse struct {
-	SandboxID   string `json:"sandboxId"`
-	ExecutionID int64  `json:"executionId"`
-	PodIP       string `json:"podIp"`
-	ContainerID string `json:"containerId"`
-	ArenaTier   string `json:"arenaTier"`
-	RestoreMode string `json:"restoreMode"`
-	DurationMs  int64  `json:"durationMs"`
+	RestoreViewCopiedBytes *int64 `json:"restoreViewCopiedBytes,omitempty"`
+	SandboxID              string `json:"sandboxId"`
+	ExecutionID            int64  `json:"executionId"`
+	PodIP                  string `json:"podIp"`
+	ContainerID            string `json:"containerId"`
+	ArenaTier              string `json:"arenaTier"`
+	RestoreMode            string `json:"restoreMode"`
+	DurationMs             int64  `json:"durationMs"`
 }
 
 type ReleaseSlotRequest struct {

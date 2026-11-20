@@ -10,6 +10,8 @@ import (
 // Public response types list the fields the HTTP API can disclose. Node and
 // store records also contain credentials and partially completed operations.
 type sandboxResponse struct {
+	ArenaTier                   string             `json:"arenaTier,omitempty"`
+	RestoreViewCopiedBytes      *int64             `json:"restoreViewCopiedBytes,omitempty"`
 	SandboxID                   string             `json:"sandboxId"`
 	TemplateID                  string             `json:"templateId,omitempty"`
 	BaseImage                   string             `json:"baseImage"`
@@ -35,7 +37,7 @@ type sandboxResponse struct {
 }
 
 func publicSandbox(r *store.SandboxRecord) sandboxResponse {
-	return sandboxResponse{
+	return sandboxResponse{ArenaTier: r.ArenaTier, RestoreViewCopiedBytes: r.RestoreViewCopiedBytes,
 		SandboxID:                   r.SandboxID,
 		TemplateID:                  r.TemplateID,
 		BaseImage:                   r.BaseImage,

@@ -81,8 +81,15 @@ func (m *Manager) DescribeView(path string) (*ViewIdentity, error) {
 	return &id, nil
 }
 
+func (m *Manager) validViewPath(id, path string) bool {
+	if !filepath.IsLocal(id) || filepath.Base(id) != id || id == "." {
+		return false
+	}
+	return filepath.Join(m.cfg.ViewsDir, id) == path || (m.cfg.L1TmpfsDir != "" && filepath.Join(m.cfg.L1TmpfsDir, ".views", id) == path)
+}
+
 func (m *Manager) AdoptView(viewID, path string, expected *ViewIdentity) error {
-	if expected == nil || !filepath.IsLocal(viewID) || filepath.Base(viewID) != viewID || filepath.Join(m.cfg.ViewsDir, viewID) != path {
+	if expected == nil || !m.validViewPath(viewID, path) {
 		return fmt.Errorf("unconfirmed restore view %q", path)
 	}
 	if expected.ArenaFS {
@@ -114,8 +121,15 @@ func (m *Manager) ConfirmReleaseView(viewID, path string, expected *ViewIdentity
 		return fmt.Errorf("invalid view ID %q", viewID)
 	}
 	claimed := filepath.Join(m.cfg.ViewsDir, viewID)
-	if path != "" && path != claimed {
-		return fmt.Errorf("unexpected view path %q", path)
+	if path != "" {
+		if !m.validViewPath(viewID, path) {
+			return fmt.Errorf("unexpected view path %q", path)
+		}
+		claimed = path
+	} else if m.cfg.L1TmpfsDir != "" {
+		if _, err := os.Lstat(filepath.Join(m.cfg.L1TmpfsDir, ".views", viewID)); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("unconfirmed tmpfs view %s", viewID)
+		}
 	}
 	if _, err := os.Lstat(claimed); errors.Is(err, os.ErrNotExist) {
 		// Cleanup of the view completed before the previous process exited.
