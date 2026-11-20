@@ -245,7 +245,7 @@ flowchart TB
 
 - [x] **M2.1 Stores.** Postgres via `pgxpool` for templates, snapshots, and sandboxes. Redis Lua for idle-slot `SPOP` plus `kt:carrier:used:*`, and execution/slot fencing on `kt:route:{id}`. PostgreSQL session locks serialize lifecycle transitions. The memory store implements the same operations. `MetadataStore.TryLeader` uses `pg_try_advisory_lock` so only one replenisher and one evictor run.
 - [x] **M2.2 Chunker.** `kontinue-arena-helper` streams 2MiB chunks, skips aligned zero pages, hashes with SIMD BLAKE3, and reuses parent hashes. Go `arena.Manager` can fall back to the same diff and upload.
-- [x] **M2.3 API server.** Lifecycle REST with `Idempotency-Key`. Best-of-K placement by memory headroom and hardware fingerprint, with jitter so equal nodes do not herd. Kubelet HTTPS client for the v1.30–v1.37 checkpoint API. Online fork. An 8-worker reaper for tainted pods and an idle sweeper. The gateway records request leases in `kt:admissions:{id}`. The sweeper skips suspend while `Inflight > 0`.
+- [x] **M2.3 API server.** Lifecycle REST with `Idempotency-Key`. Best-of-K placement by memory headroom and hardware fingerprint, with jitter so equal nodes do not herd. Kubelet HTTPS client for the v1.30–v1.37 checkpoint API. Online fork and an idle sweeper. Lifecycle release retries UID-fenced Carrier deletion from the old allocation. The gateway records request leases in `kt:admissions:{id}`. The sweeper skips suspend while `Inflight > 0`.
 - [x] **M2.4 Gateway.** `<port>-<sandbox-id>.<domain>` and `X-Kontinue-Sandbox-ID` routing. `/internal/*` returns 404. `singleflight.Group` collapses concurrent resumes. A suspended in-memory Python server was resumed through this path.
 
 ### M3: Cross-node ArenaFS, P2P, and hot-page prefetch (95%)

@@ -126,7 +126,7 @@ Suspend atomically checks Redis for active gateway requests and removes the matc
 
 Snapshot publishers hold a shared PostgreSQL advisory lock from before upload through registration. Physical GC takes the exclusive lock and recomputes candidates. A failed live-manifest read aborts the sweep. GC retains the candidate row until its physical deletions complete.
 
-`CarrierPoolReplenisher` runs off the hot path. It tops up idle Carrier Pods, deletes tainted pods, suspends idle sandboxes, and garbage-collects unreferenced snapshots.
+`CarrierPoolReplenisher` tops up idle Carrier Pods in the background. Lifecycle release retains the old assignment until Kubernetes acknowledges deletion with the original Pod UID or confirms that the original Pod is gone. The API sweeper retries pending releases and collects unreferenced snapshots.
 
 It does not proxy tenant traffic and it does not touch `pages.img` bytes.
 
@@ -353,6 +353,8 @@ kontinue/
 The Kind deployment mounts `kontinue-api-credentials` into the API server. Its `tenants.json` maps tenant names to bearer credentials. Supply a tenant's bearer credential in the Authorization header for lifecycle and template requests. The Kind bootstrap script creates a random credential for `local` on first deployment. Add tenant entries to the Secret and roll out the API server to change access. The `trace-token` key authorizes administrative trace access on the API and gateway. `ktctl` reads `KONTINUE_TENANT_TOKEN` for lifecycle requests and `KONTINUE_TRACE_TOKEN` for trace collection.
 
 PostgreSQL stores the owner on sandboxes and templates. Existing records without an owner belong to `local`. Forks inherit their parent's tenant. Create idempotency keys are scoped to a tenant and the sandbox record's lifetime. An identical retry can recover the original credentials following API replacement. Changed options conflict. Create and fork issue sandbox credentials. Metadata queries, suspend and resume omit them.
+
+Lifecycle errors return a stable `code` and a public `error` message with the operation's HTTP status. Failed sandbox records report `failureCode: sandbox_failed` and a generic `failureReason`. Operator diagnostics are recorded in service logs with the request trace ID when available.
 
 The gateway checks the sandbox credential for ktd and application ports. A suspended guest wakes only after the API checks its scoped credential under the lifecycle lock. The gateway strips the sandbox credential before forwarding a request to an application port. File operations in a newly built ktd fork a helper that runs as workload UID/GID 1000 and clears supplementary groups before opening the path. Linux permissions apply to the opened file. Rebuild base images and golden templates to deploy the updated guest binary. Existing memory snapshots retain the ktd version that was captured.
 

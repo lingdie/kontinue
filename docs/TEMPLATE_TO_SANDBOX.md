@@ -167,7 +167,7 @@ Fork and resume use the same `HydrateSlot` path. Only the snapshot id and execut
 
 ## 7. Invariants
 
-1. **No etcd on the hot path.** Create and resume do not write kube-apiserver. Carrier replenishment and tainted-pod deletion run in the background.
+1. **Warm-pool activation reuses a Carrier.** Carrier replenishment runs in the background. On release, the API keeps the old assignment until it receives a UID-fenced deletion acknowledgement or confirms the old Pod is gone.
 2. **Hardware is a hard filter.** An incompatible CPU or `runsc` version is rejected. There is no filesystem-only restore.
 3. **Secrets are injected after restore.** They are not in the template `pages.img`.
 4. **`ExecutionID` fences routes, deletes, and `ktd` init.** A stale restore cannot overwrite a newer one.
