@@ -42,7 +42,9 @@ type plainDirHandle struct {
 
 func (h *plainDirHandle) Close() error {
 	if h.reader != nil {
-		_ = h.reader.Close()
+		if err := h.reader.Close(); err != nil {
+			return err
+		}
 	}
 	if h.dir != "" {
 		return os.RemoveAll(h.dir)
@@ -494,8 +496,13 @@ func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID str
 		return "", "", nil, err
 	}
 
+	if !filepath.IsLocal(viewID) || filepath.Base(viewID) != viewID || viewID == "." {
+		return "", "", nil, fmt.Errorf("invalid view ID %q", viewID)
+	}
 	viewDir := filepath.Join(m.cfg.ViewsDir, viewID)
-	_ = os.RemoveAll(viewDir)
+	if err = os.Mkdir(viewDir, 0700); err != nil {
+		return "", "", nil, err
+	}
 
 	// Check Tier 1: L1 tmpfs pinned directory!
 	m.mu.RLock()

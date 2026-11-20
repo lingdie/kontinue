@@ -83,6 +83,12 @@ func main() {
 	}
 
 	advertiseGRPC := *nodeIP + *grpcListen
+	scratch := filepath.Join(*l2Dir, "scratch")
+	lock, err := hydrator.LockNodeState(scratch)
+	if err != nil {
+		log.Fatalf("lock node ownership: %v", err)
+	}
+	defer lock.Close()
 	arenaMgr, err := arena.NewManager(arena.ManagerConfig{
 		NodeID:          *nodeID,
 		P2PAddr:         advertiseGRPC,
@@ -114,10 +120,11 @@ func main() {
 		BaseRootfsCache: "/var/lib/kontinue-arena/base-rootfs",
 	})
 	svc := hydrator.NewService(hydrator.ServiceConfig{
+		Carriers:     criRT,
 		NodeID:       *nodeID,
 		NodeIP:       *nodeIP,
 		NodeGRPCAddr: advertiseGRPC,
-		ScratchDir:   filepath.Join(*l2Dir, "scratch"),
+		ScratchDir:   scratch,
 		ShimAdminURL: *shimAdminSock,
 		Fingerprint:  fp,
 		Arena:        arenaMgr,
@@ -160,6 +167,7 @@ func main() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		publish := func() {
+			svc.RefreshOwnership(ctx)
 			l1, l2 := arenaMgr.Inventory()
 			_ = catalog.UpsertNodeHeartbeat(ctx, protocol.NodeHeartbeat{
 				NodeID:          *nodeID,

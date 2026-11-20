@@ -41,6 +41,7 @@ type CarrierSlot struct {
 
 // RouteRecord is stored at kt:route:{sandbox_id} in Redis, guarded by Lua ExecutionID fencing.
 type RouteRecord struct {
+	OwnerKey       string    `json:"ownerKey,omitempty"`
 	SandboxID      string    `json:"sandboxId"`
 	ExecutionID    int64     `json:"executionId"`
 	LifecycleID    string    `json:"lifecycleId"`
@@ -136,6 +137,7 @@ type HydrateSlotResponse struct {
 }
 
 type ReleaseSlotRequest struct {
+	LifecycleID string `json:"lifecycleId,omitempty"`
 	SlotID      string `json:"slotId"`
 	SandboxID   string `json:"sandboxId"`
 	ExecutionID int64  `json:"executionId"`
@@ -143,8 +145,9 @@ type ReleaseSlotRequest struct {
 }
 
 type ReleaseSlotResponse struct {
-	Released bool `json:"released"`
-	Tainted  bool `json:"tainted"`
+	PodUID   string `json:"podUid,omitempty"`
+	Released bool   `json:"released"`
+	Tainted  bool   `json:"tainted"`
 }
 
 type PrewarmTemplateRequest struct {

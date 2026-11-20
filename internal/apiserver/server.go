@@ -347,14 +347,15 @@ func (s *Server) BuildGoldenTemplate(ctx context.Context, req CreateTemplateRequ
 		return nil, err
 	}
 	defer func() {
-		_, _ = nodeClient.ReleaseSlot(context.Background(), &protocol.ReleaseSlotRequest{
+		released, err := nodeClient.ReleaseSlot(context.Background(), &protocol.ReleaseSlotRequest{
 			SlotID:      dec.Slot.SlotID,
 			SandboxID:   builderID,
 			ExecutionID: 1,
+			LifecycleID: builderLife,
 			ReuseSlot:   s.cfg.ReuseSlots,
 		})
-		if !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
-			s.cfg.Replenisher.EnqueueTaintedPod(dec.Slot.PodNamespace, dec.Slot.PodName)
+		if err == nil && released.Released && !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
+			s.cfg.Replenisher.EnqueueTaintedPod(dec.Slot.PodNamespace, dec.Slot.PodName, released.PodUID)
 		}
 	}()
 
@@ -538,7 +539,7 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 			break
 		}
 		retErr = err
-		s.abandonHydratedSlot(ctx, dec, req.SandboxID, 1)
+		s.abandonHydratedSlot(ctx, dec, req.SandboxID, 1, lifecycleID)
 	}
 	if retErr != nil {
 		return nil, retErr
@@ -573,7 +574,7 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 		AllowFilesystemOnlyFallback: req.AllowFilesystemOnlyFallback,
 	}
 	if err := s.cfg.Meta.CreateSandbox(ctx, sbx); err != nil {
-		s.abandonHydratedSlot(ctx, dec, req.SandboxID, 1)
+		s.abandonHydratedSlot(ctx, dec, req.SandboxID, 1, lifecycleID)
 		retErr = err
 		return nil, err
 	}
@@ -698,12 +699,15 @@ func (s *Server) releaseExecution(ctx context.Context, sbx *store.SandboxRecord)
 	if err != nil {
 		return err
 	}
-	_, err = nc.ReleaseSlot(ctx, &protocol.ReleaseSlotRequest{SlotID: sbx.CurrentSlotID, SandboxID: sbx.SandboxID, ExecutionID: sbx.ExecutionID, ReuseSlot: s.cfg.ReuseSlots})
+	released, err := nc.ReleaseSlot(ctx, &protocol.ReleaseSlotRequest{SlotID: sbx.CurrentSlotID, SandboxID: sbx.SandboxID, ExecutionID: sbx.ExecutionID, LifecycleID: sbx.LifecycleID, ReuseSlot: s.cfg.ReuseSlots})
 	if err != nil {
 		return err
 	}
+	if !released.Released {
+		return fmt.Errorf("slot %s release is unconfirmed", sbx.CurrentSlotID)
+	}
 	if !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
-		s.cfg.Replenisher.EnqueueTaintedPod(sbx.CarrierPodNamespace, sbx.CarrierPodName)
+		s.cfg.Replenisher.EnqueueTaintedPod(sbx.CarrierPodNamespace, sbx.CarrierPodName, released.PodUID)
 	}
 	return nil
 }
@@ -812,6 +816,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 			if health.SandboxID != sbx.SandboxID || health.ExecutionID != sbx.ExecutionID || !health.Healthy || health.Frozen {
 				return nil, store.ErrStaleExecutionFence
 			}
+			r.OwnerKey = store.OwnerKey(*r)
 			if err := s.cfg.Catalog.PublishRoute(ctx, *r); err != nil {
 				return nil, err
 			}
@@ -875,7 +880,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 			break
 		}
 		retErr = err
-		s.abandonHydratedSlot(ctx, dec, sbx.SandboxID, nextExecID)
+		s.abandonHydratedSlot(ctx, dec, sbx.SandboxID, nextExecID, nextLifeID)
 	}
 	if retErr != nil {
 		return nil, retErr
@@ -896,7 +901,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 	sbx.CarrierPodName = dec.Slot.PodName
 	sbx.PodIP = hydResp.PodIP
 	if err := s.cfg.Meta.SaveSandbox(ctx, sbx); err != nil {
-		s.abandonHydratedSlot(ctx, dec, sbx.SandboxID, nextExecID)
+		s.abandonHydratedSlot(ctx, dec, sbx.SandboxID, nextExecID, nextLifeID)
 		retErr = err
 		return nil, err
 	}
@@ -904,26 +909,26 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 	return sbx, nil
 }
 
-func (s *Server) abandonHydratedSlot(ctx context.Context, dec *PlacementDecision, sandboxID string, executionID int64) {
+func (s *Server) abandonHydratedSlot(ctx context.Context, dec *PlacementDecision, sandboxID string, executionID int64, lifecycleID string) {
 	if dec == nil {
 		return
 	}
-	if nc, err := s.nodeClient(dec.Node.GRPCAddr); err == nil {
-		_, _ = nc.ReleaseSlot(ctx, &protocol.ReleaseSlotRequest{
-			SlotID:      dec.Slot.SlotID,
-			SandboxID:   sandboxID,
-			ExecutionID: executionID,
-			ReuseSlot:   false,
-		})
+	nc, err := s.nodeClient(dec.Node.GRPCAddr)
+	if err != nil {
+		return
+	}
+	released, err := nc.ReleaseSlot(ctx, &protocol.ReleaseSlotRequest{SlotID: dec.Slot.SlotID, SandboxID: sandboxID, ExecutionID: executionID, LifecycleID: lifecycleID})
+	if err != nil || !released.Released {
+		return
 	}
 	if s.cfg.Replenisher != nil {
-		s.cfg.Replenisher.EnqueueTaintedPod(dec.Slot.PodNamespace, dec.Slot.PodName)
+		s.cfg.Replenisher.EnqueueTaintedPod(dec.Slot.PodNamespace, dec.Slot.PodName, released.PodUID)
 	}
 }
 
 func (s *Server) routeForExecution(ctx context.Context, sbx *store.SandboxRecord) (*protocol.RouteRecord, error) {
 	if existing, err := s.cfg.Catalog.GetRoute(ctx, sbx.SandboxID); err == nil {
-		if existing.ExecutionID != sbx.ExecutionID || existing.SlotID != sbx.CurrentSlotID {
+		if existing.ExecutionID != sbx.ExecutionID || existing.SlotID != sbx.CurrentSlotID || existing.LifecycleID != sbx.LifecycleID || existing.NodeID != sbx.CurrentNodeID {
 			return nil, store.ErrStaleExecutionFence
 		}
 		return existing, nil
@@ -1141,7 +1146,7 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 				MemoryBytes:         src.MemoryBytes,
 			}
 			if err := s.cfg.Meta.CreateSandbox(gCtx, rec); err != nil {
-				s.abandonHydratedSlot(gCtx, dec, forkID, branchExecution)
+				s.abandonHydratedSlot(gCtx, dec, forkID, branchExecution, lifeID)
 				return err
 			}
 			out[idx] = rec
@@ -1211,6 +1216,9 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 	running, err := s.cfg.Meta.ListSandboxesToSweep(ctx)
 	if err == nil {
 		for _, sbx := range running {
+			if s.reconcileSandbox(ctx, &sbx) {
+				continue
+			}
 			if sbx.State == store.SandboxStateSuspending || sbx.State == store.SandboxStateSuspended {
 				_, _ = s.suspendSandbox(ctx, sbx.SandboxID, &sbx)
 				continue
@@ -1234,6 +1242,50 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 	if err := s.collectSnapshots(ctx); err != nil {
 		log.Printf("snapshot GC: %v", err)
 	}
+}
+
+func (s *Server) reconcileSandbox(ctx context.Context, observed *store.SandboxRecord) bool {
+	if observed.CurrentSlotID == "" || (observed.State != store.SandboxStateRunning && observed.State != store.SandboxStateSuspending) {
+		return false
+	}
+	r := protocol.RouteRecord{SandboxID: observed.SandboxID, SlotID: observed.CurrentSlotID, ExecutionID: observed.ExecutionID, LifecycleID: observed.LifecycleID, NodeID: observed.CurrentNodeID}
+	report, err := s.cfg.Catalog.ExecutionReport(ctx, r)
+	if err != nil {
+		return false
+	}
+	if report.State == store.OwnerReady {
+		if observed.State == store.SandboxStateRunning {
+			if _, err := s.cfg.Catalog.GetRoute(ctx, observed.SandboxID); errors.Is(err, store.ErrNotFound) {
+				_, _ = s.ResumeSandbox(ctx, observed.SandboxID)
+			}
+		}
+		return false
+	}
+	if report.State != store.OwnerFailed {
+		return true
+	}
+	unlock, err := s.lockExecution(ctx, observed.SandboxID)
+	if err != nil {
+		return true
+	}
+	defer unlock()
+	sb, err := s.cfg.Meta.GetSandbox(ctx, observed.SandboxID)
+	if err != nil || sb.ExecutionID != r.ExecutionID || sb.LifecycleID != r.LifecycleID || sb.CurrentSlotID != r.SlotID || sb.CurrentNodeID != r.NodeID || sb.State != observed.State {
+		return true
+	}
+	if sb.State == store.SandboxStateSuspending && sb.PendingSnapshotID != "" {
+		// A snapshot committed before the crash can still finish its normal release.
+		if _, err := s.cfg.Meta.GetSnapshot(ctx, sb.PendingSnapshotID); err == nil {
+			return false
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return true
+		}
+	}
+	sb.State, sb.FailureReason = store.SandboxStateFailed, report.Reason
+	if err := s.cfg.Meta.SaveSandbox(ctx, sb); err != nil {
+		log.Printf("persist recovery failure for %s: %v", sb.SandboxID, err)
+	}
+	return true
 }
 
 func (s *Server) collectSnapshots(ctx context.Context) error {

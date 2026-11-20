@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"os"
 	"testing"
@@ -120,4 +121,65 @@ func TestPostgresPublicationBarrierAcrossReplicas(t *testing.T) {
 		t.Fatal(err)
 	}
 	release()
+}
+
+func TestFailedOwnershipCannotForwardOrResurrect(t *testing.T) {
+	t.Run("memory", func(t *testing.T) { checkFailedOwnership(t, store.NewMemoryRuntimeCatalog()) })
+	t.Run("redis", func(t *testing.T) {
+		addr := os.Getenv("KONTINUE_TEST_REDIS")
+		if addr == "" {
+			t.Skip("KONTINUE_TEST_REDIS is unset")
+		}
+		cat := store.NewRedisRuntimeCatalog(addr, "", 0)
+		defer cat.Close()
+		checkFailedOwnership(t, cat)
+	})
+}
+
+func checkFailedOwnership(t *testing.T, cat store.RuntimeCatalog) {
+	ctx := context.Background()
+	id := "recovery-" + rand.Text()
+	old := protocol.RouteRecord{SandboxID: id, ExecutionID: 1, LifecycleID: "old", SlotID: "a", NodeID: "worker"}
+	old.OwnerKey = store.OwnerKey(old)
+	if err := cat.PublishRoute(ctx, old); !errors.Is(err, store.ErrStaleExecutionFence) {
+		t.Fatal(err)
+	}
+	if err := cat.ReportExecution(ctx, old, store.ExecutionReport{State: store.OwnerReady}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.PublishRoute(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.AdmitRoute(ctx, id, "in-flight"); err != nil {
+		t.Fatal(err)
+	}
+	fail := store.ExecutionReport{State: store.OwnerFailed, Reason: "ArenaFS serving process exited"}
+	if err := cat.ReportExecution(ctx, old, fail); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.AdmitRoute(ctx, id, "late"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal(err)
+	}
+	if err := cat.RenewAdmission(ctx, id, "in-flight"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal(err)
+	}
+	if err := cat.PublishRoute(ctx, old); !errors.Is(err, store.ErrStaleExecutionFence) {
+		t.Fatal(err)
+	}
+	next := old
+	next.ExecutionID++
+	next.LifecycleID = "new"
+	next.OwnerKey = store.OwnerKey(next)
+	if err := cat.ReportExecution(ctx, next, store.ExecutionReport{State: store.OwnerReady}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.PublishRoute(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.ReportExecution(ctx, old, fail); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := cat.AdmitRoute(ctx, id, "current"); err != nil || r.ExecutionID != 2 {
+		t.Fatalf("new route=%v err=%v", r, err)
+	}
 }

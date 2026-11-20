@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/kontinue-sh/kontinue/internal/node/arena"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
@@ -61,18 +62,21 @@ func (j ownershipJournal) write(o ownership, create bool) error {
 	} else if err := syncDirectory(filepath.Dir(string(j))); err != nil {
 		return err
 	}
+	return j.persist(j.path(o.Slot.SlotID), o, create)
+}
+
+func (j ownershipJournal) persist(path string, value any, create bool) error {
 	f, err := os.CreateTemp(string(j), ".pending-")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(f.Name())
-	if err = json.NewEncoder(f).Encode(o); err == nil {
+	if err = json.NewEncoder(f).Encode(value); err == nil {
 		err = f.Sync()
 	}
 	if err = errors.Join(err, f.Close()); err != nil {
 		return err
 	}
-	path := j.path(o.Slot.SlotID)
 	if create {
 		// Link is atomic and cannot overwrite an earlier daemon's unresolved claim.
 		err = os.Link(f.Name(), path)
@@ -119,4 +123,42 @@ func (j ownershipJournal) load(nodeID string) ([]ownership, error) {
 		claims = append(claims, o)
 	}
 	return claims, nil
+}
+
+func (j ownershipJournal) receipt(req *protocol.ReleaseSlotRequest) string {
+	fields := []any{req.SlotID, req.SandboxID, req.ExecutionID, req.LifecycleID}
+	key, _ := json.Marshal(fields)
+	return filepath.Join(string(j), fmt.Sprintf("%x.receipt", sha256.Sum256(key)))
+}
+
+func (j ownershipJournal) previousRelease(req *protocol.ReleaseSlotRequest) (*protocol.ReleaseSlotResponse, error) {
+	raw, err := os.ReadFile(j.receipt(req))
+	if errors.Is(err, os.ErrNotExist) {
+		return &protocol.ReleaseSlotResponse{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var resp protocol.ReleaseSlotResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// LockNodeState allows only one daemon to reconcile and refresh this node's
+// ownership leases. The kernel releases the lock on exit, including SIGKILL.
+func LockNodeState(dir string) (*os.File, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }

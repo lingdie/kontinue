@@ -26,6 +26,8 @@ return meta
 
 // Lua Script 2: Monotonic ExecutionID-fenced route upsert (prevents stale starts overwriting newer executions).
 var luaPublishRouteFenced = redis.NewScript(`
+local state=redis.call("HGET",KEYS[2],"state")
+if (state or ARGV[6]~="") and state~="ready" then return 0 end
 local cur = redis.call("GET", KEYS[1])
 if cur then
     local parsed = cjson.decode(cur)
@@ -56,6 +58,8 @@ return 1
 var luaAdmitRoute = redis.NewScript(`
 local route = redis.call("GET", KEYS[1])
 if not route then return nil end
+local owner=cjson.decode(route).ownerKey
+if owner and redis.call("HGET",owner,"state")~="ready" then return nil end
 local now = tonumber(redis.call("TIME")[1])
 redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", now)
 redis.call("ZADD", KEYS[2], now+tonumber(ARGV[2]), ARGV[1])
@@ -156,8 +160,8 @@ func (c *RedisRuntimeCatalog) PublishRoute(ctx context.Context, route protocol.R
 	if err != nil {
 		return err
 	}
-	res, err := luaPublishRouteFenced.Run(ctx, c.rdb, []string{protocol.RouteKey(route.SandboxID)},
-		route.ExecutionID, string(raw), int((24 * time.Hour).Seconds()), route.SlotID, route.LifecycleID).Int()
+	res, err := luaPublishRouteFenced.Run(ctx, c.rdb, []string{protocol.RouteKey(route.SandboxID), OwnerKey(route)},
+		route.ExecutionID, string(raw), int((24 * time.Hour).Seconds()), route.SlotID, route.LifecycleID, route.OwnerKey).Int()
 	if err != nil {
 		return err
 	}
@@ -213,6 +217,10 @@ func admissionsKey(id string) string { return "kt:admissions:" + id }
 
 var luaRenewAdmission = redis.NewScript(`
 local now = tonumber(redis.call("TIME")[1])
+local route=redis.call("GET",KEYS[2])
+if not route then return 0 end
+local owner=cjson.decode(route).ownerKey
+if owner and redis.call("HGET",owner,"state")~="ready" then return 0 end
 local expires = redis.call("ZSCORE", KEYS[1], ARGV[1])
 if not expires or tonumber(expires) <= now then return 0 end
 redis.call("ZADD", KEYS[1], now+tonumber(ARGV[2]), ARGV[1])
@@ -221,7 +229,7 @@ return 1
 `)
 
 func (c *RedisRuntimeCatalog) RenewAdmission(ctx context.Context, id, requestID string) error {
-	n, err := luaRenewAdmission.Run(ctx, c.rdb, []string{admissionsKey(id)}, requestID, int(AdmissionTTL.Seconds())).Int()
+	n, err := luaRenewAdmission.Run(ctx, c.rdb, []string{admissionsKey(id), protocol.RouteKey(id)}, requestID, int(AdmissionTTL.Seconds())).Int()
 	if err == nil && n == 0 {
 		return ErrNotFound
 	}

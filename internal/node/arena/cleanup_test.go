@@ -91,3 +91,28 @@ func TestReleaseViewRetriesBusyUnmount(t *testing.T) {
 		t.Fatalf("attempts=%d views=%d", v.attempts, len(m.activeViews))
 	}
 }
+
+func TestConfirmReleaseRecognizesStagingAfterViewRemoval(t *testing.T) {
+	root := t.TempDir()
+	m := &Manager{cfg: ManagerConfig{ViewsDir: filepath.Join(root, "views"), L2CASDir: root}}
+	path := filepath.Join(m.cfg.ViewsDir, "view-one")
+	stage := filepath.Join(root, "staging", "view-one")
+	if err := os.MkdirAll(stage, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfirmReleaseView("view-one", path, &ViewIdentity{}); err == nil {
+		t.Fatal("removed unconfirmed staging")
+	}
+	id, err := m.stagingIdentity("view-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := m.ConfirmReleaseView("view-one", path, &ViewIdentity{Staging: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(stage); !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}

@@ -75,3 +75,26 @@ func TestStopKeepsBundleWhenRuntimeDeleteFails(t *testing.T) {
 		t.Fatal("lost runtime bundle", err)
 	}
 }
+
+func TestReleaseReceiptSurvivesRestartAndDistinguishesUnknownLife(t *testing.T) {
+	ctx := context.Background()
+	d := &recordingDriver{}
+	cfg := ServiceConfig{Driver: d, ScratchDir: t.TempDir()}
+	s := NewService(cfg)
+	o := ownership{Slot: protocol.CarrierSlot{SlotID: "slot", PodUID: "pod-uid"}, SandboxID: "box", ExecutionID: 1, LifecycleID: "life", ContainerID: "kt-one", Phase: activeExecution}
+	st := &activeSlotState{ownership: o}
+	s.activeSlots["slot"] = st
+	s.byContainer["kt-one"] = st
+	req := protocol.ReleaseSlotRequest{SlotID: "slot", SandboxID: "box", ExecutionID: 1, LifecycleID: "life"}
+	for _, node := range []*Service{s, NewService(cfg)} {
+		resp, err := node.ReleaseSlot(ctx, &req)
+		if err != nil || !resp.Released || resp.PodUID != "pod-uid" || len(d.stopped) != 1 {
+			t.Fatalf("response=%v err=%v stops=%v", resp, err, d.stopped)
+		}
+	}
+	req.LifecycleID = "another"
+	resp, err := s.ReleaseSlot(ctx, &req)
+	if err != nil || resp.Released {
+		t.Fatalf("unconfirmed release %v %v", resp, err)
+	}
+}

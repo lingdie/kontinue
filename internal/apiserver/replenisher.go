@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -51,6 +52,7 @@ type CarrierPoolReplenisher struct {
 }
 
 type taintedPodRef struct {
+	uid       types.UID
 	namespace string
 	podName   string
 }
@@ -92,15 +94,15 @@ func (r *CarrierPoolReplenisher) TargetIdlePerNode() int {
 	return r.cfg.MinIdlePerNode + r.cfg.IdleBurstBuffer
 }
 
-func (r *CarrierPoolReplenisher) EnqueueTaintedPod(namespace, podName string) {
-	if r == nil || r.kube == nil || podName == "" {
+func (r *CarrierPoolReplenisher) EnqueueTaintedPod(namespace, podName, podUID string) {
+	if r == nil || r.kube == nil || podName == "" || podUID == "" {
 		return
 	}
 	if namespace == "" {
 		namespace = r.cfg.Namespace
 	}
 	select {
-	case r.taintedCh <- taintedPodRef{namespace: namespace, podName: podName}:
+	case r.taintedCh <- taintedPodRef{namespace: namespace, podName: podName, uid: types.UID(podUID)}:
 	default:
 	}
 }
@@ -119,6 +121,7 @@ func (r *CarrierPoolReplenisher) Start(ctx context.Context) {
 					grace := int64(0)
 					_ = r.kube.CoreV1().Pods(item.namespace).Delete(ctx, item.podName, metav1.DeleteOptions{
 						GracePeriodSeconds: &grace,
+						Preconditions:      &metav1.Preconditions{UID: &item.uid},
 					})
 				}
 			}

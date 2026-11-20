@@ -251,6 +251,7 @@ func cloneSandbox(in SandboxRecord) SandboxRecord {
 
 // MemoryRuntimeCatalog implements RuntimeCatalog with identical atomic fencing semantics to Redis Lua scripts.
 type MemoryRuntimeCatalog struct {
+	reports     map[string]timedReport
 	mu          sync.Mutex
 	idlePools   map[string][]protocol.CarrierSlot
 	routes      map[string]protocol.RouteRecord
@@ -274,6 +275,7 @@ type idempEntry struct {
 
 func NewMemoryRuntimeCatalog() *MemoryRuntimeCatalog {
 	return &MemoryRuntimeCatalog{
+		reports:     make(map[string]timedReport),
 		idlePools:   make(map[string][]protocol.CarrierSlot),
 		routes:      make(map[string]protocol.RouteRecord),
 		activeAt:    make(map[string]time.Time),
@@ -341,6 +343,9 @@ func (c *MemoryRuntimeCatalog) CountIdleSlots(_ context.Context, nodeID, tier st
 func (c *MemoryRuntimeCatalog) PublishRoute(_ context.Context, route protocol.RouteRecord) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.canPublishLocked(route) {
+		return ErrStaleExecutionFence
+	}
 	if cur, ok := c.routes[route.SandboxID]; ok {
 		if cur.ExecutionID > route.ExecutionID || (cur.ExecutionID == route.ExecutionID && (cur.SlotID != route.SlotID || cur.LifecycleID != route.LifecycleID)) {
 			return ErrStaleExecutionFence
@@ -375,7 +380,7 @@ func (c *MemoryRuntimeCatalog) AdmitRoute(_ context.Context, id, requestID strin
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r, ok := c.routes[id]
-	if !ok {
+	if !ok || !c.canPublishLocked(r) {
 		return nil, ErrNotFound
 	}
 	if c.admissions[id] == nil {
@@ -388,7 +393,8 @@ func (c *MemoryRuntimeCatalog) AdmitRoute(_ context.Context, id, requestID strin
 func (c *MemoryRuntimeCatalog) RenewAdmission(_ context.Context, id, requestID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !time.Now().Before(c.admissions[id][requestID]) {
+	r, ok := c.routes[id]
+	if !ok || !c.canPublishLocked(r) || !time.Now().Before(c.admissions[id][requestID]) {
 		return ErrNotFound
 	}
 	c.admissions[id][requestID] = time.Now().Add(AdmissionTTL)

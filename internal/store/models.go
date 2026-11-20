@@ -66,6 +66,7 @@ type SnapshotRecord struct {
 }
 
 type SandboxRecord struct {
+	FailureReason               string            `json:"failureReason,omitempty"`
 	SandboxID                   string            `json:"sandboxId"`
 	TemplateID                  string            `json:"templateId,omitempty"`
 	BaseImage                   string            `json:"baseImage"`
@@ -124,6 +125,9 @@ type MetadataStore interface {
 
 // RuntimeCatalog coordinates sub-millisecond routes, Carrier Pod slots, ExecutionID fences, and node heartbeats (Redis).
 type RuntimeCatalog interface {
+	BeginNodeRecovery(context.Context, string) error
+	ReportExecution(context.Context, protocol.RouteRecord, ExecutionReport) error
+	ExecutionReport(context.Context, protocol.RouteRecord) (ExecutionReport, error)
 	RegisterIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error
 	RemoveIdleSlot(ctx context.Context, nodeID, tier, slotID string) error
 	ClaimIdleSlot(ctx context.Context, nodeID, tier string) (*protocol.CarrierSlot, error)

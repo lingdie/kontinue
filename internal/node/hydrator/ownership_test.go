@@ -47,3 +47,21 @@ func TestOwnershipClaimSurvivesServiceReplacement(t *testing.T) {
 		t.Fatalf("reuse confirmed release: %v", err)
 	}
 }
+
+func TestNodeStateHasOnlyOneWriter(t *testing.T) {
+	dir := t.TempDir()
+	first, err := LockNodeState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if another, err := LockNodeState(dir); err == nil {
+		another.Close()
+		t.Fatal("locked by two daemons")
+	}
+	first.Close()
+	next, err := LockNodeState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next.Close()
+}

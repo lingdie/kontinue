@@ -50,8 +50,9 @@ type SwapContainerOptions struct {
 
 // RoutePublisher updates Redis route records with ExecutionID Lua fencing when a slot goes live.
 type RoutePublisher interface {
+	BeginNodeRecovery(context.Context, string) error
+	ReportExecution(context.Context, protocol.RouteRecord, store.ExecutionReport) error
 	PublishRoute(ctx context.Context, route protocol.RouteRecord) error
-	DeleteRouteFenced(ctx context.Context, sandboxID string, executionID int64, slotID string) error
 }
 
 type activeSlotState struct {
@@ -61,6 +62,7 @@ type activeSlotState struct {
 }
 
 type ServiceConfig struct {
+	Carriers     runtimeapi.RuntimeServiceClient
 	NodeID       string
 	NodeIP       string
 	NodeGRPCAddr string
@@ -379,19 +381,12 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 	s.mu.Unlock()
 
 	if s.cfg.Routes != nil && !req.SkipThaw {
-		if err := s.cfg.Routes.PublishRoute(ctx, protocol.RouteRecord{
-			SandboxID:      req.SandboxID,
-			ExecutionID:    req.ExecutionID,
-			LifecycleID:    req.LifecycleID,
-			NodeID:         s.cfg.NodeID,
-			NodeIP:         s.cfg.NodeIP,
-			NodeGRPCAddr:   s.cfg.NodeGRPCAddr,
-			SlotID:         req.Slot.SlotID,
-			CarrierPodName: req.Slot.PodName,
-			PodNamespace:   req.Slot.PodNamespace,
-			PodIP:          ktdEndpointHost(ktdEndpoint, req.Slot.PodIP),
-			StartedAt:      time.Now().UTC(),
-		}); err != nil {
+		r := st.route(s.cfg)
+		r.OwnerKey = store.OwnerKey(r)
+		if err := s.cfg.Routes.ReportExecution(ctx, r, store.ExecutionReport{State: store.OwnerReady}); err != nil {
+			return nil, err
+		}
+		if err := s.cfg.Routes.PublishRoute(ctx, r); err != nil {
 			retErr = fmt.Errorf("publish fenced route: %w", err)
 			return nil, retErr
 		}
@@ -419,18 +414,11 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	if req.SlotID == "" || req.SandboxID == "" || req.ExecutionID <= 0 {
 		return nil, fmt.Errorf("release requires slot, sandbox and execution IDs")
 	}
-	if s.cfg.Routes != nil {
-		err := s.cfg.Routes.DeleteRouteFenced(ctx, req.SandboxID, req.ExecutionID, req.SlotID)
-		// An obsolete instance can still own resources after its route has moved.
-		if err != nil && !errors.Is(err, store.ErrStaleExecutionFence) {
-			return nil, err
-		}
-	}
 	s.mu.Lock()
 	st := s.activeSlots[req.SlotID]
-	if st == nil || st.SandboxID != req.SandboxID || st.ExecutionID != req.ExecutionID {
+	if st == nil || st.SandboxID != req.SandboxID || st.ExecutionID != req.ExecutionID || (req.LifecycleID != "" && req.LifecycleID != st.LifecycleID) {
 		s.mu.Unlock()
-		return &protocol.ReleaseSlotResponse{}, nil
+		return s.journal.previousRelease(req)
 	}
 	s.mu.Unlock()
 
@@ -440,9 +428,17 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	current := s.activeSlots[req.SlotID] == st
 	s.mu.Unlock()
 	if !current {
-		return &protocol.ReleaseSlotResponse{}, nil
+		return s.journal.previousRelease(req)
+	}
+	if s.cfg.Routes != nil {
+		if err := s.cfg.Routes.ReportExecution(ctx, st.route(s.cfg), store.ExecutionReport{State: store.OwnerChecking}); err != nil {
+			return nil, err
+		}
 	}
 	if st.restored {
+		if st.FailureReason == errWrongOwner.Error() {
+			return nil, errWrongOwner
+		}
 		inspector, ok := s.cfg.Driver.(runtimeInspector)
 		if !ok {
 			return nil, fmt.Errorf("cannot confirm runtime ownership")
@@ -450,11 +446,7 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 		if err := inspector.inspectInstance(ctx, st.ownership); err != nil && !errors.Is(err, errInstanceLost) {
 			return nil, err
 		}
-		if st.ViewID != "" {
-			if err := s.cfg.Arena.AdoptView(st.ViewID, st.ViewPath, st.View); err != nil {
-				return nil, err
-			}
-		}
+
 	}
 	st.Phase = releasing
 	if err := s.journal.write(st.ownership, false); err != nil {
@@ -463,10 +455,18 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	if err := s.cfg.Driver.StopSandboxContainer(ctx, st.Slot, st.ContainerID); err != nil {
 		return nil, err
 	}
-	if st.ViewPath != "" {
+	if st.ViewID != "" && (st.restored || st.ViewPath == "") {
+		if err := s.cfg.Arena.ConfirmReleaseView(st.ViewID, st.ViewPath, st.View); err != nil {
+			return nil, err
+		}
+	} else if st.ViewPath != "" {
 		if err := s.cfg.Arena.ReleaseView(st.ViewPath); err != nil {
 			return nil, err
 		}
+	}
+	response := &protocol.ReleaseSlotResponse{Released: true, Tainted: !req.ReuseSlot, PodUID: st.Slot.PodUID}
+	if err := s.journal.persist(s.journal.receipt(req), response, false); err != nil {
+		return nil, err
 	}
 	if err := s.journal.remove(st.Slot.SlotID); err != nil {
 		return nil, err
@@ -480,10 +480,7 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 		delete(s.pendingCkpt, st.ContainerID)
 	}
 	s.mu.Unlock()
-	return &protocol.ReleaseSlotResponse{
-		Released: true,
-		Tainted:  !req.ReuseSlot,
-	}, nil
+	return response, nil
 }
 
 func (s *Service) PrewarmTemplate(ctx context.Context, req *protocol.PrewarmTemplateRequest) (*protocol.PrewarmTemplateResponse, error) {
