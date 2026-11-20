@@ -29,7 +29,9 @@ var luaPublishRouteFenced = redis.NewScript(`
 local cur = redis.call("GET", KEYS[1])
 if cur then
     local parsed = cjson.decode(cur)
-    if parsed["executionId"] and tonumber(parsed["executionId"]) > tonumber(ARGV[1]) then
+    local generation = tonumber(parsed.executionId)
+    if generation > tonumber(ARGV[1]) or
+       (generation == tonumber(ARGV[1]) and ((parsed.slotId or "") ~= ARGV[4] or (parsed.lifecycleId or "") ~= ARGV[5])) then
         return 0
     end
 end
@@ -155,7 +157,7 @@ func (c *RedisRuntimeCatalog) PublishRoute(ctx context.Context, route protocol.R
 		return err
 	}
 	res, err := luaPublishRouteFenced.Run(ctx, c.rdb, []string{protocol.RouteKey(route.SandboxID)},
-		route.ExecutionID, string(raw), int((24 * time.Hour).Seconds())).Int()
+		route.ExecutionID, string(raw), int((24 * time.Hour).Seconds()), route.SlotID, route.LifecycleID).Int()
 	if err != nil {
 		return err
 	}

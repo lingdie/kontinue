@@ -341,8 +341,10 @@ func (c *MemoryRuntimeCatalog) CountIdleSlots(_ context.Context, nodeID, tier st
 func (c *MemoryRuntimeCatalog) PublishRoute(_ context.Context, route protocol.RouteRecord) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if cur, ok := c.routes[route.SandboxID]; ok && cur.ExecutionID > route.ExecutionID {
-		return ErrStaleExecutionFence
+	if cur, ok := c.routes[route.SandboxID]; ok {
+		if cur.ExecutionID > route.ExecutionID || (cur.ExecutionID == route.ExecutionID && (cur.SlotID != route.SlotID || cur.LifecycleID != route.LifecycleID)) {
+			return ErrStaleExecutionFence
+		}
 	}
 	c.routes[route.SandboxID] = route
 	return nil

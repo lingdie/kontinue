@@ -246,11 +246,14 @@ func (d *GVisorSandboxDriver) StopSandboxContainer(ctx context.Context, _ protoc
 	if activeContainerID == "" {
 		return nil
 	}
-	_ = d.hostCommand(ctx, d.cfg.RunscWrapperBin, "--root="+d.cfg.RunscStateRoot, "kill", activeContainerID, "KILL").Run()
-	_ = d.hostCommand(ctx, d.cfg.RunscWrapperBin, "--root="+d.cfg.RunscStateRoot, "delete", "--force", activeContainerID).Run()
-	_ = d.releaseHostQuota(ctx, activeContainerID)
-	_ = os.RemoveAll(filepath.Join(d.cfg.BundlesDir, activeContainerID))
-	return nil
+	root := "--root=" + d.cfg.RunscStateRoot
+	if out, err := d.hostCommand(ctx, d.cfg.RunscWrapperBin, root, "delete", "--force", activeContainerID).CombinedOutput(); err != nil {
+		return fmt.Errorf("delete sandbox %s: %w (%s)", activeContainerID, err, out)
+	}
+	if err := d.releaseHostQuota(ctx, activeContainerID); err != nil {
+		return err
+	}
+	return os.RemoveAll(filepath.Join(d.cfg.BundlesDir, activeContainerID))
 }
 
 func (d *GVisorSandboxDriver) imageIdentity(ctx context.Context, imageRef string) string {

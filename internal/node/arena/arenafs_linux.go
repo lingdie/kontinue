@@ -35,20 +35,26 @@ func (h *fuseViewHandle) SnapshotID() string {
 }
 
 func (h *fuseViewHandle) Close() error {
-	var err error
 	if h.server != nil {
-		err = h.server.Unmount()
+		if err := h.server.Unmount(); err != nil {
+			return err
+		}
+		h.server = nil
 	}
 	if h.reader != nil {
-		_ = h.reader.Close()
+		if err := h.reader.Close(); err != nil {
+			return err
+		}
 	}
 	if h.staging != "" {
-		_ = os.RemoveAll(h.staging)
+		if err := os.RemoveAll(h.staging); err != nil {
+			return err
+		}
 	}
 	if h.mountDir != "" {
-		_ = os.RemoveAll(h.mountDir)
+		return os.RemoveAll(h.mountDir)
 	}
-	return err
+	return nil
 }
 
 type arenaFSRoot struct {

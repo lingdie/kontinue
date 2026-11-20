@@ -73,7 +73,7 @@ func (d *realRustKtdDriver) ShutdownAll() {
 	}
 }
 
-func (d *realRustKtdDriver) SwapAndStartSandboxContainer(_ context.Context, opts hydrator.SwapContainerOptions) (string, string, error) {
+func (d *realRustKtdDriver) SwapAndStartSandboxContainer(ctx context.Context, opts hydrator.SwapContainerOptions) (string, string, error) {
 	idNum := d.seq.Add(1)
 	cid := fmt.Sprintf("kt-gvisor-ctr-%d", idNum)
 	workDir := filepath.Join(d.root, cid, "rootfs")
@@ -89,7 +89,15 @@ func (d *realRustKtdDriver) SwapAndStartSandboxContainer(_ context.Context, opts
 		mem[2*protocol.DefaultChunkSize+i] = 'D'
 	}
 
+	var inherited protocol.HealthResponse
 	if opts.RestoreViewDir != "" && opts.RestoreMode == protocol.RestoreModeMemory {
+		meta, err := os.ReadFile(filepath.Join(opts.RestoreViewDir, protocol.GVisorPagesMetaImg))
+		if err != nil {
+			return "", "", err
+		}
+		if err := json.Unmarshal(meta, &inherited); err != nil {
+			return "", "", err
+		}
 		if restoredMem, err := os.ReadFile(filepath.Join(opts.RestoreViewDir, protocol.GVisorPagesImg)); err == nil {
 			mem = restoredMem
 		}
@@ -135,10 +143,28 @@ func (d *realRustKtdDriver) SwapAndStartSandboxContainer(_ context.Context, opts
 		addr:      addr,
 	}
 	d.mu.Unlock()
+	// A real memory restore resumes the original ktd, including its monotonic fence.
+	if inherited.ExecutionID > 0 {
+		startup, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		client := protocol.NewKtdClient(time.Second)
+		for {
+			_, err := client.HeldInit(startup, addr, opts.BootstrapToken, protocol.InitPayload{
+				SandboxID: inherited.SandboxID, ExecutionID: inherited.ExecutionID, SkipThaw: true,
+			})
+			if err == nil {
+				break
+			}
+			if startup.Err() != nil {
+				return "", "", fmt.Errorf("restore test guest identity: %w", err)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 	return cid, addr, nil
 }
 
-func (d *realRustKtdDriver) CheckpointSandboxContainer(_ context.Context, containerID, rawOutputDir string, leaveRunning bool) error {
+func (d *realRustKtdDriver) CheckpointSandboxContainer(ctx context.Context, containerID, rawOutputDir string, leaveRunning bool) error {
 	d.mu.Lock()
 	inst, ok := d.procs[containerID]
 	d.mu.Unlock()
@@ -174,7 +200,15 @@ func (d *realRustKtdDriver) CheckpointSandboxContainer(_ context.Context, contai
 	if err := os.WriteFile(filepath.Join(rawOutputDir, protocol.GVisorCheckpointImg), ckptState, 0o600); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(rawOutputDir, protocol.GVisorPagesMetaImg), []byte("gvisor-pages-meta-v1"), 0o600); err != nil {
+	health, err := protocol.NewKtdClient(time.Second).Health(ctx, inst.addr, "")
+	if err != nil {
+		return err
+	}
+	guestIdentity, err := json.Marshal(health)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(rawOutputDir, protocol.GVisorPagesMetaImg), guestIdentity, 0o600); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(rawOutputDir, protocol.GVisorPagesImg), pages, 0o600); err != nil {
@@ -463,6 +497,21 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 	_ = json.NewDecoder(cResp.Body).Decode(&sbx)
 	_ = cResp.Body.Close()
 
+	if _, err := apiSrvImpl.CreateSandbox(ctx, apiserver.CreateSandboxRequest{SandboxID: sbx.SandboxID}); !errors.Is(err, store.ErrSandboxExists) {
+		t.Fatalf("duplicate create: %v", err)
+	}
+	route, err := catalog.GetRoute(ctx, sbx.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicting := *route
+	conflicting.SlotID = "different-slot"
+	if err := catalog.PublishRoute(ctx, conflicting); !errors.Is(err, store.ErrStaleExecutionFence) {
+		t.Fatalf("conflicting slot in same generation: %v", err)
+	}
+	if err := catalog.PublishRoute(ctx, *route); err != nil {
+		t.Fatalf("idempotent route publication: %v", err)
+	}
 	// Security check: Gateway MUST reject external calls to /internal/init!
 	secReq, _ := http.NewRequest(http.MethodPost, gwHTTP.URL+protocol.PathInternalInit, strings.NewReader(`{}`))
 	secReq.Header.Set(protocol.HeaderKontinueSandboxID, sbx.SandboxID)
@@ -569,7 +618,7 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 			break
 		}
 	}
-	_ = catalog.RegisterIdleSlot(ctx, protocol.CarrierSlot{
+	slotB := protocol.CarrierSlot{
 		SlotID:                "slot-b-1",
 		NodeID:                "worker-node-b",
 		NodeIP:                "10.0.0.12",
@@ -582,7 +631,10 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 		PodSandboxID:          "podsbx-b-1",
 		PlaceholderID:         "placeholder-carrier-b-1",
 		ExpectedContainerHash: "pleg-hash-b",
-	})
+	}
+	if err := catalog.RegisterIdleSlot(ctx, slotB); err != nil {
+		t.Fatal(err)
+	}
 
 	// Fire 16 concurrent Agent requests at kontinue-gateway while sbx-agent-007 is SUSPENDED!
 	const concurrentCallers = 16
@@ -619,6 +671,27 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 	if resumedSbx.ExecutionID != 2 || resumedSbx.CurrentNodeID != "worker-node-b" {
 		t.Fatalf("expected singleflight resume to executionId=2 on worker-node-b, got exec=%d node=%s",
 			resumedSbx.ExecutionID, resumedSbx.CurrentNodeID)
+	}
+
+	slotB.SlotID = "slot-b-2"
+	slotB.PodName = "carrier-b-2"
+	slotB.PodUID = "uid-b-2"
+	slotB.PodSandboxID = "podsbx-b-2"
+	slotB.PlaceholderID = "placeholder-carrier-b-2"
+	if err := catalog.RegisterIdleSlot(ctx, slotB); err != nil {
+		t.Fatal(err)
+	}
+	branches, err := apiSrvImpl.ForkSandbox(ctx, sbx.SandboxID, apiserver.ForkSandboxRequest{Count: 1})
+	if err != nil {
+		t.Fatalf("fork resumed sandbox: %v", err)
+	}
+	branch := branches[0]
+	health, err := protocol.NewKtdClient(time.Second).Health(ctx, branch.PodIP, branch.AccessToken)
+	if err != nil || health.SandboxID != branch.SandboxID || health.ExecutionID != branch.ExecutionID || branch.ExecutionID <= resumedSbx.ExecutionID {
+		t.Fatalf("fork guest identity: %+v err=%v", health, err)
+	}
+	if out, _, err := execThroughGateway(branch.SandboxID, branch.AccessToken, "cat ./session.txt"); err != nil || out.Stdout != "turn-1-state" {
+		t.Fatalf("resumed fork command: %+v err=%v", out, err)
 	}
 
 	// =========================================================================

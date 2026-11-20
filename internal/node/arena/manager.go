@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,6 +21,7 @@ import (
 	"github.com/kontinue-sh/kontinue/pkg/storage"
 	"github.com/kontinue-sh/kontinue/pkg/telemetry"
 	"go.opentelemetry.io/otel/attribute"
+	"golang.org/x/sync/singleflight"
 	"lukechampine.com/blake3"
 )
 
@@ -104,6 +106,7 @@ type ManagerConfig struct {
 type Manager struct {
 	cfg ManagerConfig
 
+	releases    singleflight.Group
 	mu          sync.RWMutex
 	l1Pinned    map[string]string
 	l2Manifests map[string]*protocol.SnapshotManifest
@@ -565,12 +568,14 @@ type faultSource interface {
 }
 
 func (m *Manager) ReleaseView(viewPath string) error {
-	m.mu.Lock()
+	_, err, _ := m.releases.Do(viewPath, func() (any, error) { return nil, m.closeView(viewPath) })
+	return err
+}
+
+func (m *Manager) closeView(viewPath string) error {
+	m.mu.RLock()
 	closer, ok := m.activeViews[viewPath]
-	if ok {
-		delete(m.activeViews, viewPath)
-	}
-	m.mu.Unlock()
+	m.mu.RUnlock()
 	if !ok || closer == nil {
 		return nil
 	}
@@ -580,11 +585,16 @@ func (m *Manager) ReleaseView(viewPath string) error {
 		faults = src.RecordedFaults()
 		snapshotID = src.SnapshotID()
 	}
-	err := closer.Close()
+	if err := closer.Close(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	delete(m.activeViews, viewPath)
+	m.mu.Unlock()
 	if snapshotID != "" && len(faults) > 0 {
 		m.persistFaultOrder(snapshotID, faults)
 	}
-	return err
+	return nil
 }
 
 func (m *Manager) persistFaultOrder(snapshotID string, faults []uint32) {
@@ -592,18 +602,19 @@ func (m *Manager) persistFaultOrder(snapshotID string, faults []uint32) {
 	if err != nil || mf == nil || sameU32(mf.HotPageIndices, faults) {
 		return
 	}
-	mf.HotPageIndices = append([]uint32(nil), faults...)
-	raw, err := json.MarshalIndent(mf, "", "  ")
+	updated := *mf
+	updated.HotPageIndices = append([]uint32(nil), faults...)
+	raw, err := json.MarshalIndent(&updated, "", "  ")
 	if err != nil {
 		return
 	}
 	path := filepath.Join(m.cfg.L2CASDir, storage.ArtifactKey(snapshotID, protocol.ManifestFileName))
 	_ = writeAtomicFile(path, raw)
 	m.mu.Lock()
-	m.l2Manifests[snapshotID] = mf
+	m.l2Manifests[snapshotID] = &updated
 	m.mu.Unlock()
 	if m.cfg.RemoteStore != nil {
-		_, _ = m.cfg.RemoteStore.PutManifest(context.Background(), snapshotID, mf)
+		_, _ = m.cfg.RemoteStore.PutManifest(context.Background(), snapshotID, &updated)
 	}
 }
 
@@ -624,17 +635,17 @@ func (m *Manager) Close() error {
 		_ = m.hookSrv.Close()
 	}
 	m.uploadWG.Wait()
-	m.mu.Lock()
-	views := make([]ViewCloser, 0, len(m.activeViews))
-	for k, c := range m.activeViews {
-		views = append(views, c)
-		delete(m.activeViews, k)
+	m.mu.RLock()
+	paths := make([]string, 0, len(m.activeViews))
+	for path := range m.activeViews {
+		paths = append(paths, path)
 	}
-	m.mu.Unlock()
-	for _, c := range views {
-		_ = c.Close()
+	m.mu.RUnlock()
+	var err error
+	for _, path := range paths {
+		err = errors.Join(err, m.ReleaseView(path))
 	}
-	return nil
+	return err
 }
 
 // HealOrphans removes leftover ArenaFS view directories and best-effort kills stale

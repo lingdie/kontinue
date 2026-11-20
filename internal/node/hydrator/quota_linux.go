@@ -81,14 +81,9 @@ fi
 }
 
 func (d *GVisorSandboxDriver) releaseHostQuota(ctx context.Context, containerID string) error {
-	script := fmt.Sprintf(`cg=/sys/fs/cgroup/kontinue/%s
-if [ -d "$cg" ]; then
-  while read -r pid; do
-    echo "$pid" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
-  done < "$cg/cgroup.procs"
-  rmdir "$cg" 2>/dev/null || true
-fi
-`, containerID)
-	_, _ = d.hostCommand(ctx, "sh", "-c", script).CombinedOutput()
+	out, err := d.hostCommand(ctx, "sh", "-c", `if [ -d "$1" ]; then rmdir "$1"; fi`, "sh", "/sys/fs/cgroup/kontinue/"+containerID).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("remove sandbox cgroup: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
 	return nil
 }

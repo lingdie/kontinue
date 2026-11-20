@@ -9,6 +9,7 @@ import (
 )
 
 var (
+	ErrSandboxExists       = errors.New("sandbox ID is already in use")
 	ErrNotFound            = errors.New("record not found")
 	ErrStaleExecutionFence = errors.New("stale executionId rejected by route fence")
 	ErrNoIdleCarrierSlot   = errors.New("no pre-warmed carrier pod slot available")

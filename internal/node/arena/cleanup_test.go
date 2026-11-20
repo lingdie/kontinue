@@ -2,6 +2,7 @@ package arena
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -76,5 +77,28 @@ func TestHealOrphansRemovesUntrackedViewsOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cas, "staging", "sbx-live-exec-1")); err != nil {
 		t.Fatalf("live staging removed: %v", err)
+	}
+}
+
+type retryUnmount struct{ attempts int }
+
+func (v *retryUnmount) Close() error {
+	v.attempts++
+	if v.attempts == 1 {
+		return errors.New("mount is busy")
+	}
+	return nil
+}
+func TestReleaseViewRetriesBusyUnmount(t *testing.T) {
+	v := &retryUnmount{}
+	m := &Manager{activeViews: map[string]ViewCloser{"view": v}}
+	if err := m.ReleaseView("view"); err == nil {
+		t.Fatal("expected unmount error")
+	}
+	if err := m.ReleaseView("view"); err != nil {
+		t.Fatal(err)
+	}
+	if v.attempts != 2 || len(m.activeViews) != 0 {
+		t.Fatalf("attempts=%d views=%d", v.attempts, len(m.activeViews))
 	}
 }

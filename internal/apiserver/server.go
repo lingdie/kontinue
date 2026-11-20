@@ -186,6 +186,9 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 	sbx, err := s.CreateSandbox(r.Context(), req)
 	if err != nil {
 		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrSandboxExists) || errors.Is(err, store.ErrTransitionLocked) {
+			status = http.StatusConflict
+		}
 		if errors.Is(err, store.ErrNoIdleCarrierSlot) {
 			status = http.StatusServiceUnavailable
 		}
@@ -444,6 +447,17 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
+	unlock, err := s.lockExecution(ctx, req.SandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if _, err := s.cfg.Meta.GetSandbox(ctx, req.SandboxID); err == nil {
+		return nil, store.ErrSandboxExists
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+
 	var snap *store.SnapshotRecord
 	baseImage := req.BaseImage
 	tier := req.Tier
@@ -663,6 +677,16 @@ func (s *Server) finishSuspendRelease(ctx context.Context, sbx *store.SandboxRec
 	if sbx.CurrentSlotID == "" {
 		return nil
 	}
+	if err := s.releaseExecution(ctx, sbx); err != nil {
+		return err
+	}
+	sbx.CurrentNodeID = ""
+	sbx.CurrentSlotID = ""
+	sbx.PodIP = ""
+	return s.cfg.Meta.SaveSandbox(ctx, sbx)
+}
+
+func (s *Server) releaseExecution(ctx context.Context, sbx *store.SandboxRecord) error {
 	route, err := s.routeForExecution(ctx, sbx)
 	if err != nil {
 		return err
@@ -678,10 +702,7 @@ func (s *Server) finishSuspendRelease(ctx context.Context, sbx *store.SandboxRec
 	if !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
 		s.cfg.Replenisher.EnqueueTaintedPod(sbx.CarrierPodNamespace, sbx.CarrierPodName)
 	}
-	sbx.CurrentNodeID = ""
-	sbx.CurrentSlotID = ""
-	sbx.PodIP = ""
-	return s.cfg.Meta.SaveSandbox(ctx, sbx)
+	return nil
 }
 
 func (s *Server) captureSuspend(ctx context.Context, sbx *store.SandboxRecord, route *protocol.RouteRecord) (*store.SnapshotRecord, error) {
@@ -895,49 +916,6 @@ func (s *Server) abandonHydratedSlot(ctx context.Context, dec *PlacementDecision
 	}
 }
 
-// releaseSandboxResources stops the gVisor process and unmounts its restore view.
-// A missing route still uses the slot and node recorded on the sandbox.
-func (s *Server) releaseSandboxResources(ctx context.Context, sandboxID string, executionID int64, slotID, nodeID string) {
-	if route, err := s.cfg.Catalog.GetRoute(ctx, sandboxID); err == nil {
-		if route.ExecutionID != executionID || (slotID != "" && slotID != route.SlotID) {
-			return
-		}
-		slotID = route.SlotID
-		s.releaseOnNode(ctx, route.NodeGRPCAddr, slotID, sandboxID, executionID)
-		_ = s.cfg.Catalog.DeleteRouteFenced(ctx, sandboxID, executionID, slotID)
-		return
-	}
-	if nodeID == "" {
-		return
-	}
-	nodes, err := s.cfg.Catalog.ListHealthyNodes(ctx)
-	if err != nil {
-		return
-	}
-	for _, n := range nodes {
-		if n.NodeID == nodeID {
-			s.releaseOnNode(ctx, n.GRPCAddr, slotID, sandboxID, executionID)
-			return
-		}
-	}
-}
-
-func (s *Server) releaseOnNode(ctx context.Context, grpcAddr, slotID, sandboxID string, executionID int64) {
-	if grpcAddr == "" {
-		return
-	}
-	nc, err := s.nodeClient(grpcAddr)
-	if err != nil {
-		return
-	}
-	_, _ = nc.ReleaseSlot(ctx, &protocol.ReleaseSlotRequest{
-		SlotID:      slotID,
-		SandboxID:   sandboxID,
-		ExecutionID: executionID,
-		ReuseSlot:   s.cfg.ReuseSlots,
-	})
-}
-
 func (s *Server) routeForExecution(ctx context.Context, sbx *store.SandboxRecord) (*protocol.RouteRecord, error) {
 	if existing, err := s.cfg.Catalog.GetRoute(ctx, sbx.SandboxID); err == nil {
 		if existing.ExecutionID != sbx.ExecutionID || existing.SlotID != sbx.CurrentSlotID {
@@ -1083,6 +1061,9 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 		return nil, retErr
 	}
 
+	// The restored guest carries its parent's execution fence, including in
+	// snapshots baked with older ktd binaries. Branch IDs have their own routes.
+	branchExecution := src.ExecutionID + 1
 	out := make([]*store.SandboxRecord, req.Count)
 	g, gCtx := errgroup.WithContext(ctx)
 	for i := 0; i < req.Count; i++ {
@@ -1116,7 +1097,7 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 				Slot:           dec.Slot,
 				SandboxID:      forkID,
 				TemplateID:     src.TemplateID,
-				ExecutionID:    1,
+				ExecutionID:    branchExecution,
 				LifecycleID:    lifeID,
 				SnapshotID:     forkSnap.SnapshotID,
 				BaseImage:      src.BaseImage,
@@ -1136,7 +1117,7 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 				BaseImage:           src.BaseImage,
 				Tier:                src.Tier,
 				State:               store.SandboxStateRunning,
-				ExecutionID:         1,
+				ExecutionID:         branchExecution,
 				LifecycleID:         lifeID,
 				ActiveSnapshotID:    forkSnap.SnapshotID,
 				CurrentNodeID:       dec.Node.NodeID,
@@ -1153,7 +1134,7 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 				MemoryBytes:         src.MemoryBytes,
 			}
 			if err := s.cfg.Meta.CreateSandbox(gCtx, rec); err != nil {
-				s.abandonHydratedSlot(gCtx, dec, forkID, 1)
+				s.abandonHydratedSlot(gCtx, dec, forkID, branchExecution)
 				return err
 			}
 			out[idx] = rec
@@ -1180,25 +1161,10 @@ func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
 	if err != nil {
 		return err
 	}
-	slotID := sbx.CurrentSlotID
-	nodeID := sbx.CurrentNodeID
-	var podNS, podName string
-	if route, rErr := s.cfg.Catalog.GetRoute(ctx, sandboxID); rErr == nil {
-		if route.ExecutionID != sbx.ExecutionID || (slotID != "" && slotID != route.SlotID) {
-			return store.ErrStaleExecutionFence
+	if sbx.CurrentSlotID != "" {
+		if err := s.releaseExecution(ctx, sbx); err != nil {
+			return err
 		}
-		podNS = route.PodNamespace
-		podName = route.CarrierPodName
-		if route.SlotID != "" {
-			slotID = route.SlotID
-		}
-		if route.NodeID != "" {
-			nodeID = route.NodeID
-		}
-	}
-	s.releaseSandboxResources(ctx, sandboxID, sbx.ExecutionID, slotID, nodeID)
-	if podNS != "" && !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
-		s.cfg.Replenisher.EnqueueTaintedPod(podNS, podName)
 	}
 	if sbx.ActiveSnapshotID != "" {
 		if snap, sErr := s.cfg.Meta.GetSnapshot(ctx, sbx.ActiveSnapshotID); sErr == nil && snap.Kind == protocol.SnapshotKindSessionSuspend {

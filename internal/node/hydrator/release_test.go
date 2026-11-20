@@ -2,6 +2,8 @@ package hydrator
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/kontinue-sh/kontinue/internal/store"
@@ -51,5 +53,25 @@ func TestReleaseOnlyStopsTheClaimedExecution(t *testing.T) {
 	}
 	if len(d.stopped) != 1 || s.ActiveCount() != 0 {
 		t.Fatalf("stops=%v active=%d", d.stopped, s.ActiveCount())
+	}
+}
+
+func TestStopKeepsBundleWhenRuntimeDeleteFails(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "runtime")
+	bundle := filepath.Join(dir, "bundles", "kt-test")
+	if err := os.MkdirAll(bundle, 0700); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	d := &GVisorSandboxDriver{cfg: GVisorDriverConfig{RunscWrapperBin: bin, RunscStateRoot: dir, BundlesDir: filepath.Dir(bundle)}}
+	if err := d.StopSandboxContainer(context.Background(), protocol.CarrierSlot{}, "kt-test"); err == nil {
+		t.Fatal("reported success while container is present")
+	}
+	if _, err := os.Stat(bundle); err != nil {
+		t.Fatal("lost runtime bundle", err)
 	}
 }

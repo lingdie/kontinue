@@ -324,9 +324,17 @@ func writeAtomicFile(dst string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
-	tmp := fmt.Sprintf("%s.tmp.%d", dst, os.Getpid())
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(dst), ".chunk-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, dst)
+	defer os.Remove(f.Name())
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), dst)
 }
