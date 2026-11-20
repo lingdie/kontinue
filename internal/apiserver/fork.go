@@ -126,7 +126,7 @@ func (s *Server) prepareFork(ctx context.Context, sourceID string, req *ForkSand
 		if err != nil {
 			return nil, err
 		}
-		snapshot, err = s.captureSandbox(ctx, src, route, fork.SnapshotID, protocol.SnapshotKindLiveFork)
+		snapshot, err = s.captureSandbox(ctx, src, route, fork.SnapshotID, protocol.SnapshotKindLiveFork, checkpointCaptureIfMissing)
 		if err != nil {
 			return nil, err
 		}

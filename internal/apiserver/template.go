@@ -168,6 +168,6 @@ func (s *Server) captureTemplate(ctx context.Context, t *store.TemplateRecord) e
 	}
 	prep := &protocol.PrepareCheckpointRequest{SandboxID: "builder-" + t.TemplateID, ExecutionID: 1, LifecycleID: b.LifecycleID, SlotID: b.Slot.SlotID, PodNamespace: b.Slot.PodNamespace, PodName: b.Slot.PodName, PodIP: b.Slot.PodIP,
 		TargetSnapshotID: b.SnapshotID, Kind: protocol.SnapshotKindGoldenTemplate, TemplateID: t.TemplateID, BaseImage: t.BaseImage, BootstrapToken: b.BootstrapToken, LeaveRunning: true, TraceHotPages: t.TraceHotPages}
-	_, err := s.publishCheckpoint(ctx, prep, b.Slot.NodeID, b.Slot.NodeIP, b.Slot.NodeGRPCAddr, b.PeerAddr)
+	_, err := s.publishCheckpoint(ctx, prep, b.Slot.NodeID, b.Slot.NodeIP, b.Slot.NodeGRPCAddr, b.PeerAddr, checkpointCaptureIfMissing)
 	return err
 }

@@ -3,14 +3,19 @@ package apiserver
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestRecoveryPersistsFailureOnlyForCurrentAllocation(t *testing.T) {
@@ -47,6 +52,99 @@ func TestRecoveryPersistsFailureOnlyForCurrentAllocation(t *testing.T) {
 	got, err = meta.GetSandbox(ctx, "box")
 	if err != nil || got.State != store.SandboxStateFailed || got.CurrentSlotID != "slot" || got.ActiveSnapshotID != "snapshot" || got.FailureReason != report.Reason {
 		t.Fatalf("lost failure evidence: %v %v", got, err)
+	}
+}
+
+type checkpointReplayNode struct {
+	protocol.NodeControlServer
+	wantKind protocol.SnapshotKind
+	result   string
+	queries  atomic.Int32
+	prepares atomic.Int32
+}
+
+func (n *checkpointReplayNode) GetLatestSnapshotResult(_ context.Context, req *protocol.GetLatestSnapshotResultRequest) (*protocol.GetLatestSnapshotResultResponse, error) {
+	n.queries.Add(1)
+	prep := req.Expected
+	if req.SnapshotID != "pending" || prep == nil || prep.TargetSnapshotID != req.SnapshotID || prep.SandboxID != "box" || prep.ExecutionID != 2 || prep.LifecycleID != "life" || prep.SlotID != "slot" || prep.Kind != n.wantKind {
+		return nil, status.Error(codes.InvalidArgument, "checkpoint probe has a different identity")
+	}
+	if n.result == "unavailable" {
+		return nil, status.Error(codes.Unavailable, "node journal temporarily unavailable")
+	}
+	return &protocol.GetLatestSnapshotResultResponse{Found: n.result == "found", Manifest: protocol.SnapshotManifest{SnapshotID: req.SnapshotID}, ManifestURI: "file://pending"}, nil
+}
+
+func (n *checkpointReplayNode) PrepareCheckpoint(context.Context, *protocol.PrepareCheckpointRequest) (*protocol.PrepareCheckpointResponse, error) {
+	n.prepares.Add(1)
+	return nil, status.Error(codes.FailedPrecondition, "lost execution cannot capture again")
+}
+
+func TestLostOwnerRecoversPublishedCheckpointBeforeFailing(t *testing.T) {
+	for _, tc := range []struct {
+		name, result string
+		kind         protocol.SnapshotKind
+	}{
+		{"published suspend", "found", protocol.SnapshotKindSessionSuspend},
+		{"published fork", "found", protocol.SnapshotKindLiveFork},
+		{"no capture", "missing", protocol.SnapshotKindSessionSuspend},
+		{"worker temporarily unavailable", "unavailable", protocol.SnapshotKindSessionSuspend},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			listen, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			node := &checkpointReplayNode{wantKind: tc.kind, result: tc.result}
+			worker := grpc.NewServer()
+			defer worker.Stop()
+			protocol.RegisterNodeControlServer(worker, node)
+			go func() { _ = worker.Serve(listen) }()
+			meta := store.NewMemoryMetadataStore()
+			catalog := store.NewMemoryRuntimeCatalog()
+			server := NewServer(ServerConfig{Meta: meta, Catalog: catalog})
+			defer server.Close()
+			box := &store.SandboxRecord{SandboxID: "box", ExecutionID: 2, LifecycleID: "life", CurrentSlotID: "slot", CurrentNodeID: "node", PodIP: "10.0.0.1", State: store.SandboxStateSuspending, PendingSnapshotID: "pending"}
+			if tc.kind == protocol.SnapshotKindLiveFork {
+				box.State, box.PendingSnapshotID = store.SandboxStateRunning, ""
+				box.PendingFork = &store.PendingFork{SnapshotID: "pending"}
+			}
+			if err := meta.CreateSandbox(ctx, box); err != nil {
+				t.Fatal(err)
+			}
+			if err := catalog.UpsertNodeHeartbeat(ctx, protocol.NodeHeartbeat{NodeID: "node", GRPCAddr: listen.Addr().String()}, time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			if err := catalog.ReportExecution(ctx, protocol.RouteRecord{SandboxID: "box", ExecutionID: 2, LifecycleID: "life", SlotID: "slot", NodeID: "node"}, store.ExecutionReport{State: store.OwnerFailed, Reason: "restore view lost"}); err != nil {
+				t.Fatal(err)
+			}
+			if stopped := server.reconcileSandbox(ctx, box); stopped != (tc.result != "found") {
+				t.Fatalf("unexpected last capture decision: stopped=%t", stopped)
+			}
+			if node.queries.Load() != 1 || node.prepares.Load() != 0 {
+				t.Fatalf("reconciliation did not use only the stored result: queries=%d prepares=%d", node.queries.Load(), node.prepares.Load())
+			}
+			state := box.State
+			pending := "pending"
+			if tc.result == "found" {
+				pending = ""
+				snapshot, err := meta.GetSnapshot(ctx, "pending")
+				if err != nil || snapshot.Kind != tc.kind || snapshot.ManifestURI != "file://pending" {
+					t.Fatalf("did not publish replayed snapshot: got=%+v err=%v", snapshot, err)
+				}
+			} else if tc.result == "missing" {
+				state = store.SandboxStateFailed
+			}
+			got, err := meta.GetSandbox(ctx, "box")
+			if err != nil || got.State != state {
+				t.Fatalf("unexpected current state: got=%+v err=%v", got, err)
+			}
+			if got, err := meta.UnpublishedSnapshot(ctx); err != nil || got != pending {
+				t.Fatalf("unexpected collection barrier: pending=%q err=%v", got, err)
+			}
+		})
 	}
 }
 

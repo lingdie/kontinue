@@ -443,7 +443,7 @@ func (s *Server) suspendSandbox(ctx context.Context, sandboxID string, observed 
 	}
 	snapRec, err := s.cfg.Meta.GetSnapshot(ctx, sbx.PendingSnapshotID)
 	if errors.Is(err, store.ErrNotFound) {
-		snapRec, err = s.captureSandbox(ctx, sbx, route, sbx.PendingSnapshotID, protocol.SnapshotKindSessionSuspend)
+		snapRec, err = s.captureSandbox(ctx, sbx, route, sbx.PendingSnapshotID, protocol.SnapshotKindSessionSuspend, checkpointCaptureIfMissing)
 	}
 	if err != nil {
 		return nil, err
@@ -506,7 +506,14 @@ func (s *Server) releaseExecution(ctx context.Context, sbx *store.SandboxRecord)
 	return nil
 }
 
-func (s *Server) captureSandbox(ctx context.Context, sbx *store.SandboxRecord, route *protocol.RouteRecord, newSnapID string, kind protocol.SnapshotKind) (*store.SnapshotRecord, error) {
+type checkpointMode int
+
+const (
+	checkpointCaptureIfMissing checkpointMode = iota
+	checkpointRecoverOnly
+)
+
+func (s *Server) captureSandbox(ctx context.Context, sbx *store.SandboxRecord, route *protocol.RouteRecord, newSnapID string, kind protocol.SnapshotKind, mode checkpointMode) (*store.SnapshotRecord, error) {
 	prep := &protocol.PrepareCheckpointRequest{
 		SandboxID:        sbx.SandboxID,
 		ExecutionID:      sbx.ExecutionID,
@@ -523,10 +530,10 @@ func (s *Server) captureSandbox(ctx context.Context, sbx *store.SandboxRecord, r
 		LeaveRunning:     true,
 		BootstrapToken:   sbx.BootstrapToken,
 	}
-	return s.publishCheckpoint(ctx, prep, route.NodeID, route.NodeIP, route.NodeGRPCAddr, route.NodeGRPCAddr)
+	return s.publishCheckpoint(ctx, prep, route.NodeID, route.NodeIP, route.NodeGRPCAddr, route.NodeGRPCAddr, mode)
 }
 
-func (s *Server) publishCheckpoint(ctx context.Context, prep *protocol.PrepareCheckpointRequest, nodeID, nodeIP, grpcAddr, peerAddr string) (*store.SnapshotRecord, error) {
+func (s *Server) publishCheckpoint(ctx context.Context, prep *protocol.PrepareCheckpointRequest, nodeID, nodeIP, grpcAddr, peerAddr string, mode checkpointMode) (*store.SnapshotRecord, error) {
 	releaseSnapshots, err := s.cfg.Meta.LockSnapshotSet(ctx, false)
 	if err != nil {
 		return nil, err
@@ -543,6 +550,9 @@ func (s *Server) publishCheckpoint(ctx context.Context, prep *protocol.PrepareCh
 		return nil, err
 	}
 	if !snapRes.Found {
+		if mode == checkpointRecoverOnly {
+			return nil, nil
+		}
 		if _, err := nodeClient.PrepareCheckpoint(ctx, prep); err != nil {
 			return nil, err
 		}
@@ -872,12 +882,21 @@ func (s *Server) reconcileSandbox(ctx context.Context, observed *store.SandboxRe
 		}
 		return false
 	}
-	if sb.State == store.SandboxStateSuspending && sb.PendingSnapshotID != "" {
-		// A snapshot committed before the crash can still finish its normal release.
-		if _, err := s.cfg.Meta.GetSnapshot(ctx, sb.PendingSnapshotID); err == nil {
-			return false
-		} else if !errors.Is(err, store.ErrNotFound) {
+	var pendingID string
+	var kind protocol.SnapshotKind
+	if sb.State == store.SandboxStateSuspending {
+		pendingID, kind = sb.PendingSnapshotID, protocol.SnapshotKindSessionSuspend
+	} else if sb.PendingFork != nil {
+		pendingID, kind = sb.PendingFork.SnapshotID, protocol.SnapshotKindLiveFork
+	}
+	if pendingID != "" {
+		snapshot, err := s.recoverPendingCheckpoint(ctx, sb, pendingID, kind)
+		if err != nil {
+			log.Printf("recover checkpoint %q for sandbox %q: %v", pendingID, sb.SandboxID, err)
 			return true
+		}
+		if snapshot != nil {
+			return false
 		}
 	}
 	sb.State, sb.FailureReason = store.SandboxStateFailed, report.Reason
@@ -887,6 +906,19 @@ func (s *Server) reconcileSandbox(ctx context.Context, observed *store.SandboxRe
 		log.Printf("sandbox recovery failed sandbox=%q execution=%d detail=%q", sb.SandboxID, sb.ExecutionID, report.Reason)
 	}
 	return true
+}
+
+// A lost runtime may have completed the checkpoint before its owner went away.
+// Consult the original node's durable result without asking kubelet to capture again.
+func (s *Server) recoverPendingCheckpoint(ctx context.Context, sb *store.SandboxRecord, id string, kind protocol.SnapshotKind) (*store.SnapshotRecord, error) {
+	if snapshot, err := s.cfg.Meta.GetSnapshot(ctx, id); !errors.Is(err, store.ErrNotFound) {
+		return snapshot, err
+	}
+	route, err := s.routeForExecution(ctx, sb)
+	if err != nil {
+		return nil, err
+	}
+	return s.captureSandbox(ctx, sb, route, id, kind, checkpointRecoverOnly)
 }
 
 func (s *Server) collectSnapshots(ctx context.Context) error {
