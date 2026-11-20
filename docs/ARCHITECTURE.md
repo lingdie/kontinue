@@ -1,6 +1,6 @@
 # Kontinue architecture, component duties, and MVP plan
 
-> **Name:** Kontinue (Kubernetes + Continue). Freeze a container and resume it from the same memory image in about a hundred milliseconds.
+> **Name:** Kontinue (Kubernetes + Continue). Freeze a guest and resume its process tree from the captured memory image.
 > **Role:** A high-throughput memory snapshot and resume platform for agent workloads: coding sandboxes, browser use, RL rollouts, and interactive analysis.
 > **Stack:** PostgreSQL and Redis for the control plane, a pre-warmed Carrier Pod pool, the Kubernetes Kubelet checkpoint API, gVisor (`runsc`) with a three-tier memory arena (tmpfs, NVMe CAS, ArenaFS FUSE plus P2P), and OpenTelemetry traces.
 > **Related docs:** The task ledger is [PLAN.md](./PLAN.md). Language rules are [DEVELOPMENT_STANDARDS.md](./DEVELOPMENT_STANDARDS.md). The 1-to-N clone path is [TEMPLATE_TO_SANDBOX.md](./TEMPLATE_TO_SANDBOX.md). GPU `cuda-checkpoint` stays deferred. Through M4 the product is a CPU and memory sandbox.
@@ -116,7 +116,15 @@ Owns the lifecycle API: bake a template, clone a sandbox (1-to-N), suspend, resu
 
 Placement reads node heartbeats from Redis, rejects incompatible hardware, and ranks an origin-node L2 hit above an L1 tmpfs hit above free memory. A Redis Lua `SPOP` claims an idle Carrier slot. The API then calls `HydrateSlot` on that node.
 
-Checkpoint sends `PrepareCheckpoint` to `kontinued`, then `POST https://<node-ip>:10250/checkpoint/{ns}/{carrier-pod}/sandbox`. The snapshot row is written to PostgreSQL after that succeeds.
+On a cold activation, the API persists the execution intent and starts or reuses its Carrier under the lifecycle lock. It gives the PostgreSQL connection back while it waits for readiness. The worker can reserve the Carrier for the expected lifecycle. The API reacquires the lock and verifies the record before proceeding. Deletion can cancel the expectation or release the unused reservation while activation waits.
+
+A dedicated Carrier can start a standalone guest once CRI confirms its Pod identity and CNI network. That reservation belongs to one lifecycle. The worker can admit a cancelled Pod to the shared pool after its placeholder starts and normal checks pass. If the guest takes a native checkpoint, the worker binds the running placeholder's CRI ID to the guest before kubelet invokes the shim.
+
+Checkpoint sends `PrepareCheckpoint` to `kontinued`, then `POST https://<node-ip>:10250/checkpoint/{ns}/{carrier-pod}/sandbox`. The API writes the snapshot row to PostgreSQL after the node confirms capture and upload. A PostgreSQL advisory lock serializes lifecycle operations on the same sandbox. Each fork starts above the execution generation retained in its parent’s guest memory.
+
+Suspend atomically checks Redis for active gateway requests and removes the matching route. An active request leaves the route open and the suspend caller receives HTTP 409. Once drained, the API persists `SUSPENDING` and the target snapshot ID before capture. The idle sweeper retries interrupted transitions, reuses an already registered snapshot, and clears the recorded slot after node cleanup succeeds.
+
+Snapshot publishers hold a shared PostgreSQL advisory lock from before upload through registration. Physical GC takes the exclusive lock and recomputes candidates. A failed live-manifest read aborts the sweep. GC retains the candidate row until its physical deletions complete.
 
 `CarrierPoolReplenisher` runs off the hot path. It tops up idle Carrier Pods, deletes tainted pods, suspends idle sandboxes, and garbage-collects unreferenced snapshots.
 
@@ -130,7 +138,7 @@ A hit on `kt:route:{id}` in the `Running` state is forwarded straight to `{pod_i
 
 A miss, or a sandbox that is suspended, joins a `singleflight.Group`. One caller invokes `ResumeSandbox`. The others wait, then all of them are forwarded.
 
-Every `/internal/*` request from outside returns 404. In-flight connections update `kt:active_at:{id}` and `kt:inflight:{id}`.
+Every `/internal/*` request from outside returns 404. The gateway atomically admits each request against its current route and renews its Redis admission lease for long-lived streams. It records activity in `kt:active_at:{id}`.
 
 It does not use PostgreSQL, the Kubernetes API, or local durable state.
 
@@ -142,7 +150,7 @@ It proxies `RuntimeService` and `ImageService` to `containerd.sock`, keeps `io.k
 
 ### 4.4 `kontinued`
 
-`SlotHydrator` reuses a Carrier Pod's sandbox, CNI `eth0`, and Pod IP. One pool can host any base image. It stops the placeholder, mounts an arena view, starts the restored `sandbox` container, calls `ktd /internal/init`, and publishes the fenced Redis route.
+`SlotHydrator` reuses a Carrier Pod's sandbox, CNI `eth0`, and Pod IP. One pool can host any base image. The standalone driver keeps the CRI placeholder visible to Kubelet, mounts an arena view, starts a separate runsc instance in the Carrier network namespace, calls `ktd /internal/init`, and publishes the fenced Redis route.
 
 Checkpoint calls `ktd /internal/freeze`, runs `runsc checkpoint --compression=none`, diffs 2MiB BLAKE3 chunks against the parent, uploads only dirty chunks, and writes a small descriptor tar under `/var/lib/kubelet/checkpoints/` for Kubelet.
 
@@ -213,12 +221,15 @@ sequenceDiagram
     participant PG as PostgreSQL
 
     Note over API,Node: Idle suspend
+    API->>RD: Drain route if no active admission
+    API->>PG: Persist SUSPENDING and target snapshot ID
     API->>Node: PrepareCheckpoint
     API->>Kube: POST /checkpoint
     Kube->>Node: CheckpointContainer via the CRI shim
     Node->>Node: Freeze, checkpoint, upload dirty 2MiB chunks
     API->>PG: Snapshot row, sandbox SUSPENDED
-    API->>RD: Delete the fenced route
+    API->>Node: Release the exact slot and execution
+    API->>PG: Clear slot after acknowledgement
 
     Note over SDK,PG: Next request resumes once
     SDK->>GW: POST /v1/process/exec
@@ -300,7 +311,7 @@ Target: after isolating the origin node, time to first instruction on a cold nod
 
 ### M4
 
-Cold Carrier fallback, snapshot reference-count GC, and orphan-mount heal on node restart. Incompatible hardware is rejected. There is no filesystem-only restore. `deploy/` and `hack/` are the Kind bundle.
+Cold Carrier fallback, snapshot reference-count GC, and journaled ownership reconciliation on daemon restart. The gateway admits a recovered execution only while the node renews its ownership report. Incompatible hardware is rejected. There is no filesystem-only restore. `deploy/` and `hack/` are the Kind bundle. [Node recovery](NODE_RECOVERY.md)
 
 ---
 
@@ -336,3 +347,13 @@ kontinue/
 ├── hack/
 └── docs/
 ```
+
+## Tenant credentials and lifecycle ownership
+
+The Kind deployment mounts `kontinue-api-credentials` into the API server. Its `tenants.json` maps tenant names to bearer credentials. Supply a tenant's bearer credential in the Authorization header for lifecycle and template requests. The Kind bootstrap script creates a random credential for `local` on first deployment. Add tenant entries to the Secret and roll out the API server to change access. The `trace-token` key authorizes administrative trace access on the API and gateway. `ktctl` reads `KONTINUE_TENANT_TOKEN` for lifecycle requests and `KONTINUE_TRACE_TOKEN` for trace collection.
+
+PostgreSQL stores the owner on sandboxes and templates. Existing records without an owner belong to `local`. Forks inherit their parent's tenant. Create idempotency keys are scoped to a tenant and the sandbox record's lifetime. An identical retry can recover the original credentials following API replacement. Changed options conflict. Create and fork issue sandbox credentials. Metadata queries, suspend and resume omit them.
+
+The gateway checks the sandbox credential for ktd and application ports. A suspended guest wakes only after the API checks its scoped credential under the lifecycle lock. The gateway strips the sandbox credential before forwarding a request to an application port. File operations in a newly built ktd fork a helper that runs as workload UID/GID 1000 and clears supplementary groups before opening the path. Linux permissions apply to the opened file. Rebuild base images and golden templates to deploy the updated guest binary. Existing memory snapshots retain the ktd version that was captured.
+
+The local standalone API without a tenant credential file operates as the single tenant `local`. These checks cover the public HTTP entry points. Worker gRPC, the CRI shim, PostgreSQL, Redis and the development MinIO service require a trusted cluster network. The development manifests use HTTP inside Kind.

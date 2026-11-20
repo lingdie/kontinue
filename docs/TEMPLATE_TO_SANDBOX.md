@@ -2,7 +2,7 @@
 
 > See [ARCHITECTURE.md](./ARCHITECTURE.md) for components, [PLAN.md](./PLAN.md) for progress, and [DEVELOPMENT_STANDARDS.md](./DEVELOPMENT_STANDARDS.md) for language rules.
 > APIs: `POST /v1/templates` bakes a template. `POST /v1/sandboxes` clones it.
-> Code: `BuildGoldenTemplate` and `CreateSandbox` in `internal/apiserver/server.go`, `HydrateSlot` in `internal/node/hydrator/service.go`, `PrepareRestoreView` in `internal/node/arena/manager.go`, plus `crates/kontinue-runsc` and `crates/ktd`.
+> Code: the template builder in `internal/apiserver/template.go`, `CreateSandbox` in `internal/apiserver/server.go`, `HydrateSlot` in `internal/node/hydrator/service.go`, `PrepareRestoreView` in `internal/node/arena/manager.go`, plus `crates/kontinue-runsc` and `crates/ktd`.
 
 ---
 
@@ -10,7 +10,7 @@
 
 A Kontinue template is not a container image. It is an uncompressed split gVisor snapshot of a process tree that has already been warmed.
 
-`POST /v1/sandboxes` does not call kube-apiserver, etcd, the scheduler, or CNI. It claims a pre-warmed Carrier slot, maps a memory view, restores gVisor in the background, and runs held init inside `ktd`. A warm clone does not write kube-apiserver.
+With a warm Carrier available, creation reuses its existing Pod and network. It maps a memory view, restores gVisor in the background and runs held init inside `ktd`. When the pool is empty, the API creates a Carrier Pod and waits for its registration.
 
 ---
 
@@ -21,20 +21,25 @@ sequenceDiagram
     autonumber
     participant Client
     participant API as kontinue-apiserver
+    participant DB as PostgreSQL
     participant Redis
     participant Node as kontinued
     participant Runsc as kontinue-runsc
     participant Ktd as ktd
 
     Client->>API: POST /v1/sandboxes
-    API->>Redis: Best-of-K, then SPOP a Carrier slot
+    API->>DB: Persist CREATING and generation
+    API->>Redis: Reserve Carrier for this lifecycle
+    API->>DB: Commit exact slot assignment
     API->>Node: HydrateSlot
     Node->>Node: PrepareRestoreView L1, L2, or L3
     Node->>Runsc: OCI create and start
     Runsc->>Runsc: Rewrite start to runsc restore --background
     Node->>Ktd: POST /internal/init
     Ktd->>Ktd: Rotate token, inject env, reseed, thaw
-    Node->>Redis: Fence kt:route to the Pod IP
+    Node-->>API: Journaled activation receipt
+    API->>DB: Commit RUNNING
+    API->>Redis: Publish fenced route
     API-->>Client: 201 Created
 ```
 
@@ -82,9 +87,9 @@ The API calls `HydrateSlot` with the slot, snapshot, tokens, and env.
 
 ### 4.2 Build the restore view
 
-`PrepareRestoreView` fills `/var/lib/kontinue-arena/views/<sandboxId>-exec-<executionId>`.
+Each execution owns a separate restore-view directory recorded in its node journal.
 
-**L1 tmpfs.** If the template is pinned, `os.Link` hardlinks `checkpoint.img`, `pages_meta.img`, and `pages.img`. No copy. Clones share the read-only pages. Writes happen in the instance address space.
+**L1 tmpfs.** If the template is pinned, `os.Link` hardlinks `checkpoint.img`, `pages_meta.img`, and `pages.img`. The view lives under `.views` on the same tmpfs as the immutable pin. A failed hardlink attempt falls through to the disk or lazy restore path. Hardlinked clones share the read-only pages. Writes happen in the instance address space.
 
 **L2 NVMe.** If every non-zero chunk is already in the local CAS, the view is materialized on disk. Resume on the origin node does not use the network.
 
@@ -123,7 +128,7 @@ Immediately after restore the guest is still the template: the cgroup is frozen,
 | 4 | Record clock skew against the snapshot |
 | 5 | Clear `cgroup.freeze` so the warmed processes continue |
 
-Redis Lua publishes `kt:route:{sandboxId}` only if the execution id is still current. The API marks the sandbox `RUNNING`. Later gateway requests go straight to that Pod IP.
+The API commits `RUNNING` in PostgreSQL after the node acknowledges activation. It then publishes a fenced Redis route. The gateway checks the sandbox credential and node ownership before forwarding.
 
 ---
 
@@ -134,7 +139,7 @@ Fork and resume use the same `HydrateSlot` path. Only the snapshot id and execut
 | Call | Snapshot | ExecutionID |
 | :--- | :--- | :--- |
 | `CreateSandbox` | Golden template | `1` |
-| Live fork | A `--leave-running` checkpoint of a running sandbox | Each child starts at `1` |
+| Live fork | A `--leave-running` checkpoint of a running sandbox | Parent generation plus 1, with a distinct child identity |
 | Resume | Session snapshot, a 2MiB diff against the parent | Previous value plus 1. Origin L2 is preferred, otherwise L3. |
 
 ---
@@ -143,7 +148,7 @@ Fork and resume use the same `HydrateSlot` path. Only the snapshot id and execut
 
 | Step | Path |
 | :--- | :--- |
-| Bake | `internal/apiserver/server.go` `BuildGoldenTemplate` |
+| Bake | `internal/apiserver/template.go` |
 | Create | `internal/apiserver/server.go` `CreateSandbox` |
 | Placement | `internal/apiserver/placement.go` `SelectAndClaimSlot` |
 | Replenish | `internal/apiserver/replenisher.go` |
