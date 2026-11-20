@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -33,9 +34,6 @@ type ReplenisherConfig struct {
 	// allocate so concurrent siblings can claim surplus warm slots.
 	ColdBurstExtra int
 	PollInterval   time.Duration
-	// ResyncNode optionally triggers an immediate CarrierPodWatcher sync on the
-	// target node after cold Pod creates (avoids waiting for the poll ticker).
-	ResyncNode func(ctx context.Context, nodeGRPCAddr string) error
 }
 
 // CarrierPoolReplenisher runs off the hot path in the background:
@@ -169,7 +167,7 @@ func (r *CarrierPoolReplenisher) reconcilePoolWatermarks(ctx context.Context) {
 			go func() {
 				defer wg.Done()
 				defer func() { <-sem }()
-				_, _ = r.createDirectBoundPod(ctx, nodeID, protocol.DefaultCarrierTier)
+				_, _ = r.createDirectBoundPod(ctx, nodeID, protocol.DefaultCarrierTier, "")
 			}()
 		}
 	}
@@ -194,7 +192,11 @@ func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, no
 		createWG.Add(1)
 		go func(idx int) {
 			defer createWG.Done()
-			_, err := r.createDirectBoundPod(ctx, node.NodeID, tier)
+			life := ""
+			if idx == 0 {
+				life = lifecycleID
+			}
+			_, err := r.createDirectBoundPod(ctx, node.NodeID, tier, life)
 			errs[idx] = err
 		}(i)
 	}
@@ -204,41 +206,34 @@ func (r *CarrierPoolReplenisher) AllocateColdCarrierSlot(ctx context.Context, no
 		return nil, retErr
 	}
 
-	if r.cfg.ResyncNode != nil && node.GRPCAddr != "" {
-		_ = r.cfg.ResyncNode(ctx, node.GRPCAddr)
-	}
-
-	waitCtx, waitSpan := telemetry.StartSpan(ctx, "kontinue-apiserver", "replenisher.wait_slot_ready",
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	waitCtx, waitSpan := telemetry.StartSpan(waitCtx, "kontinue-apiserver", "replenisher.wait_slot_ready",
 		attribute.String(telemetry.AttrNodeID, node.NodeID),
 	)
-	deadline := time.Now().Add(30 * time.Second)
-	var slot *store.SlotReservation
-	for time.Now().Before(deadline) {
-		if waitCtx.Err() != nil {
-			retErr = waitCtx.Err()
-			telemetry.EndSpan(waitSpan, retErr)
+	defer func() { telemetry.EndSpan(waitSpan, retErr) }()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		slot, err := r.catalog.ReserveIdleSlot(waitCtx, node.NodeID, tier, lifecycleID, true)
+		if err == nil {
+			span.SetAttributes(attribute.String(telemetry.AttrSlotID, slot.Slot.SlotID))
+			return slot, nil
+		}
+		if !errors.Is(err, store.ErrNoIdleCarrierSlot) {
+			retErr = err
 			return nil, retErr
 		}
-		if claimed, cErr := r.catalog.ReserveIdleSlot(waitCtx, node.NodeID, tier, lifecycleID, true); cErr == nil && claimed != nil {
-			slot = claimed
-			break
+		select {
+		case <-waitCtx.Done():
+			retErr = fmt.Errorf("waiting for a Carrier on %s: %w", node.NodeID, waitCtx.Err())
+			return nil, retErr
+		case <-ticker.C:
 		}
-		if r.cfg.ResyncNode != nil && node.GRPCAddr != "" {
-			_ = r.cfg.ResyncNode(waitCtx, node.GRPCAddr)
-		}
-		time.Sleep(25 * time.Millisecond)
 	}
-	if slot == nil {
-		retErr = fmt.Errorf("cold carrier fallback on %s timed out waiting for watcher registration", node.NodeID)
-		telemetry.EndSpan(waitSpan, retErr)
-		return nil, retErr
-	}
-	telemetry.EndSpan(waitSpan, nil)
-	span.SetAttributes(attribute.String(telemetry.AttrSlotID, slot.Slot.SlotID))
-	return slot, nil
 }
 
-func (r *CarrierPoolReplenisher) createDirectBoundPod(ctx context.Context, nodeID, tier string) (*corev1.Pod, error) {
+func (r *CarrierPoolReplenisher) createDirectBoundPod(ctx context.Context, nodeID, tier, life string) (*corev1.Pod, error) {
 	ctx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "replenisher.create_carrier_pod",
 		attribute.String(telemetry.AttrNodeID, nodeID),
 	)
@@ -256,6 +251,14 @@ func (r *CarrierPoolReplenisher) createDirectBoundPod(ctx context.Context, nodeI
 	}
 
 	pod := newCarrierPod(r.cfg.Namespace, r.cfg.CarrierImage, nodeID, tier)
+	if life != "" {
+		pod.Labels[protocol.LabelColdLifecycle] = life
+		// Keep this request's capacity out of the shared idle pool while it waits.
+		if err := r.catalog.ExpectColdCarrier(ctx, life, "slot-"+pod.Name, 45*time.Second); err != nil {
+			retErr = err
+			return nil, err
+		}
+	}
 	created, err := r.kube.CoreV1().Pods(r.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
 		retErr = err

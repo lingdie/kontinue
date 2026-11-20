@@ -105,12 +105,27 @@ func (c *RedisRuntimeCatalog) Close() error { return c.rdb.Close() }
 
 var luaRegisterIdleSlot = redis.NewScript(`
 if redis.call("EXISTS",KEYS[1])==1 then return 0 end
+if ARGV[3]~="" and redis.call("GET",KEYS[4])==ARGV[2] and redis.call("EXISTS",KEYS[5])==0 then
+    redis.call("DEL",KEYS[2],KEYS[4])
+    redis.call("SREM",KEYS[3],ARGV[2])
+    redis.call("SET",KEYS[1],ARGV[3],"EX",86400)
+    redis.call("SET",KEYS[5],cjson.encode({slot=cjson.decode(ARGV[1]),cold=true}))
+    return 1
+end
 redis.call("SET",KEYS[2],ARGV[1],"EX",86400)
 redis.call("SADD",KEYS[3],ARGV[2])
 return 1
 `)
 
 func (c *RedisRuntimeCatalog) RegisterIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error {
+	return c.RegisterColdCarrier(ctx, slot, "")
+}
+
+func (c *RedisRuntimeCatalog) ExpectColdCarrier(ctx context.Context, life, slotID string, ttl time.Duration) error {
+	return c.rdb.Set(ctx, "kt:cold:expected:"+life, slotID, ttl).Err()
+}
+
+func (c *RedisRuntimeCatalog) RegisterColdCarrier(ctx context.Context, slot protocol.CarrierSlot, life string) error {
 	if slot.Tier == "" {
 		slot.Tier = protocol.DefaultCarrierTier
 	}
@@ -118,7 +133,8 @@ func (c *RedisRuntimeCatalog) RegisterIdleSlot(ctx context.Context, slot protoco
 	if err != nil {
 		return err
 	}
-	return luaRegisterIdleSlot.Run(ctx, c.rdb, []string{"kt:carrier:used:" + slot.SlotID, protocol.CarrierMetaKey(slot.SlotID), protocol.IdlePoolKey(slot.NodeID, slot.Tier)}, raw, slot.SlotID).Err()
+	return luaRegisterIdleSlot.Run(ctx, c.rdb, []string{"kt:carrier:used:" + slot.SlotID, protocol.CarrierMetaKey(slot.SlotID),
+		protocol.IdlePoolKey(slot.NodeID, slot.Tier), "kt:cold:expected:" + life, "kt:placement:" + life}, raw, slot.SlotID, life).Err()
 }
 
 func (c *RedisRuntimeCatalog) RemoveIdleSlot(ctx context.Context, nodeID, tier, slotID string) error {
@@ -159,6 +175,7 @@ func (c *RedisRuntimeCatalog) ReserveIdleSlot(ctx context.Context, nodeID, tier,
 }
 
 var luaFinishReservation = redis.NewScript(`
+redis.call("DEL",KEYS[2])
 local raw=redis.call("GET",KEYS[1])
 if not raw then return 1 end
 if ARGV[2]=="1" then
@@ -175,7 +192,7 @@ return 1
 `)
 
 func (c *RedisRuntimeCatalog) FinishReservation(ctx context.Context, life string, returnUnused bool) error {
-	return luaFinishReservation.Run(ctx, c.rdb, []string{"kt:placement:" + life}, life, returnUnused, protocol.RedisPrefixCarrierMeta, protocol.RedisPrefixIdlePool).Err()
+	return luaFinishReservation.Run(ctx, c.rdb, []string{"kt:placement:" + life, "kt:cold:expected:" + life}, life, returnUnused, protocol.RedisPrefixCarrierMeta, protocol.RedisPrefixIdlePool).Err()
 }
 
 func (c *RedisRuntimeCatalog) CountIdleSlots(ctx context.Context, nodeID, tier string) (int, error) {

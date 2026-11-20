@@ -375,6 +375,7 @@ func cloneSandbox(in SandboxRecord) SandboxRecord {
 type MemoryRuntimeCatalog struct {
 	usedSlots    map[string]string
 	reservations map[string]SlotReservation
+	expectedCold map[string]coldCarrierExpectation
 	reports      map[string]timedReport
 	mu           sync.Mutex
 	idlePools    map[string][]protocol.CarrierSlot
@@ -391,6 +392,11 @@ type nodeEntry struct {
 	expires time.Time
 }
 
+type coldCarrierExpectation struct {
+	slotID  string
+	expires time.Time
+}
+
 type idempEntry struct {
 	status  int
 	body    []byte
@@ -400,6 +406,7 @@ type idempEntry struct {
 func NewMemoryRuntimeCatalog() *MemoryRuntimeCatalog {
 	return &MemoryRuntimeCatalog{
 		reservations: make(map[string]SlotReservation),
+		expectedCold: make(map[string]coldCarrierExpectation),
 		usedSlots:    make(map[string]string),
 		reports:      make(map[string]timedReport),
 		idlePools:    make(map[string][]protocol.CarrierSlot),
@@ -412,7 +419,24 @@ func NewMemoryRuntimeCatalog() *MemoryRuntimeCatalog {
 	}
 }
 
-func (c *MemoryRuntimeCatalog) RegisterIdleSlot(_ context.Context, slot protocol.CarrierSlot) error {
+func (c *MemoryRuntimeCatalog) RegisterIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error {
+	return c.RegisterColdCarrier(ctx, slot, "")
+}
+
+func (c *MemoryRuntimeCatalog) ExpectColdCarrier(_ context.Context, life, slotID string, ttl time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for key, expected := range c.expectedCold {
+		if !now.Before(expected.expires) {
+			delete(c.expectedCold, key)
+		}
+	}
+	c.expectedCold[life] = coldCarrierExpectation{slotID: slotID, expires: now.Add(ttl)}
+	return nil
+}
+
+func (c *MemoryRuntimeCatalog) RegisterColdCarrier(_ context.Context, slot protocol.CarrierSlot, life string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if slot.Tier == "" {
@@ -420,6 +444,19 @@ func (c *MemoryRuntimeCatalog) RegisterIdleSlot(_ context.Context, slot protocol
 	}
 	k := protocol.IdlePoolKey(slot.NodeID, slot.Tier)
 	if _, used := c.usedSlots[slot.SlotID]; used {
+		return nil
+	}
+	expected := c.expectedCold[life]
+	if _, reserved := c.reservations[life]; life != "" && expected.slotID == slot.SlotID && time.Now().Before(expected.expires) && !reserved {
+		c.usedSlots[slot.SlotID] = life
+		c.reservations[life] = SlotReservation{Slot: slot, Cold: true}
+		delete(c.expectedCold, life)
+		for i, idle := range c.idlePools[k] {
+			if idle.SlotID == slot.SlotID {
+				c.idlePools[k] = slices.Delete(c.idlePools[k], i, i+1)
+				break
+			}
+		}
 		return nil
 	}
 	for i, prior := range c.idlePools[k] {
@@ -461,6 +498,7 @@ func (c *MemoryRuntimeCatalog) ClaimIdleSlot(ctx context.Context, nodeID, tier s
 func (c *MemoryRuntimeCatalog) FinishReservation(_ context.Context, life string, returnUnused bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	delete(c.expectedCold, life)
 	r, ok := c.reservations[life]
 	if ok && returnUnused && c.usedSlots[r.Slot.SlotID] == life {
 		delete(c.usedSlots, r.Slot.SlotID)

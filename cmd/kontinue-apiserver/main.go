@@ -12,11 +12,8 @@ import (
 
 	"github.com/kontinue-sh/kontinue/internal/apiserver"
 	"github.com/kontinue-sh/kontinue/internal/store"
-	"github.com/kontinue-sh/kontinue/pkg/protocol"
 	"github.com/kontinue-sh/kontinue/pkg/storage"
 	"github.com/kontinue-sh/kontinue/pkg/telemetry"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -78,20 +75,6 @@ func main() {
 		kubeClient, _ = kubernetes.NewForConfig(kCfg)
 	}
 
-	resyncNode := func(ctx context.Context, nodeGRPCAddr string) error {
-		if nodeGRPCAddr == "" {
-			return nil
-		}
-		cc, err := grpc.NewClient(nodeGRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			return err
-		}
-		defer cc.Close()
-		cli := protocol.NewNodeControlClient(cc)
-		_, err = cli.ResyncIdleCarriers(ctx, &protocol.ResyncIdleCarriersRequest{})
-		return err
-	}
-
 	replenisher := apiserver.NewCarrierPoolReplenisher(kubeClient, catalog, apiserver.ReplenisherConfig{
 		Namespace:       *namespace,
 		CarrierImage:    *carrierImg,
@@ -99,7 +82,6 @@ func main() {
 		MinIdlePerNode:  *minIdleSlots,
 		IdleBurstBuffer: *idleBurstBuffer,
 		ColdBurstExtra:  *coldBurstExtra,
-		ResyncNode:      resyncNode,
 	})
 	replenisher.Start(ctx)
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"sync"
 
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
@@ -38,12 +39,15 @@ type ColdSlotAllocator interface {
 type PlacementEngine struct {
 	catalog       store.RuntimeCatalog
 	coldAllocator ColdSlotAllocator
+	coldMu        sync.Mutex
+	coldInFlight  map[string]int
 }
 
 func NewPlacementEngine(catalog store.RuntimeCatalog, coldAllocator ColdSlotAllocator) *PlacementEngine {
 	return &PlacementEngine{
 		catalog:       catalog,
 		coldAllocator: coldAllocator,
+		coldInFlight:  make(map[string]int),
 	}
 }
 
@@ -139,9 +143,27 @@ func (p *PlacementEngine) SelectAndClaimSlot(ctx context.Context, req PlacementR
 		}
 	}
 	if p.coldAllocator != nil {
-		pick := candidates[rand.IntN(len(candidates))]
+		// Count both provisioning and queued requests so a burst does not
+		// concentrate its Carrier starts on one compatible worker.
+		p.coldMu.Lock()
+		pick := candidates[0]
+		for _, cand := range candidates[1:] {
+			if p.coldInFlight[cand.hb.NodeID] < p.coldInFlight[pick.hb.NodeID] {
+				pick = cand
+			}
+		}
+		nodeID := pick.hb.NodeID
+		p.coldInFlight[nodeID]++
+		p.coldMu.Unlock()
 		r, err := p.coldAllocator.AllocateColdCarrierSlot(ctx, pick.hb, req.Tier, req.LifecycleID)
+		p.coldMu.Lock()
+		p.coldInFlight[nodeID]--
+		if p.coldInFlight[nodeID] == 0 {
+			delete(p.coldInFlight, nodeID)
+		}
+		p.coldMu.Unlock()
 		if err != nil {
+			retErr = err
 			return nil, err
 		}
 		return decision(r)

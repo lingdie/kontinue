@@ -38,6 +38,7 @@ const (
 	// Kubernetes labels for Carrier Pods and Node pools.
 	LabelRole            = "kontinue.sh/role"
 	LabelCarrierTier     = "kontinue.sh/tier"
+	LabelColdLifecycle   = "kontinue.sh/cold-lifecycle"
 	LabelCPUProfile      = "kontinue.sh/cpu-profile"
 	LabelMemoryCkptReady = "kontinue.sh/memory-ckpt-ready"
 

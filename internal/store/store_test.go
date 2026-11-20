@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -216,6 +217,62 @@ func TestPlacementClaimReplaysAcrossSchedulingDecisions(t *testing.T) {
 		}
 		if err := cat.FinishReservation(ctx, "next-"+life, false); err != nil {
 			t.Fatal(err)
+		}
+	}
+	t.Run("memory", func(t *testing.T) { check(t, store.NewMemoryRuntimeCatalog()) })
+	t.Run("redis", func(t *testing.T) {
+		addr := os.Getenv("KONTINUE_TEST_REDIS")
+		if addr == "" {
+			t.Skip("KONTINUE_TEST_REDIS is unset")
+		}
+		cat := store.NewRedisRuntimeCatalog(addr, "", 0)
+		defer cat.Close()
+		check(t, cat)
+	})
+}
+
+func TestColdCarrierGoesToWaitingLifecycle(t *testing.T) {
+	check := func(t *testing.T, cat store.RuntimeCatalog) {
+		ctx := context.Background()
+		life := fmt.Sprintf("cold-%d", time.Now().UnixNano())
+		slot := protocol.CarrierSlot{SlotID: "slot-" + life, NodeID: "node-a", Tier: life}
+		if err := cat.ExpectColdCarrier(ctx, life, slot.SlotID, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if err := cat.RegisterColdCarrier(ctx, slot, life); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cat.ReserveIdleSlot(ctx, slot.NodeID, slot.Tier, "other-"+life, false); !errors.Is(err, store.ErrNoIdleCarrierSlot) {
+			t.Fatalf("competing lifecycle claimed a dedicated Carrier: %v", err)
+		}
+		r, err := cat.ReserveIdleSlot(ctx, "node-b", slot.Tier, life, false)
+		if err != nil || r.Slot != slot || !r.Cold {
+			t.Fatalf("could not replay the dedicated reservation: %+v %v", r, err)
+		}
+		if err := cat.FinishReservation(ctx, life, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := cat.RegisterColdCarrier(ctx, slot, life); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cat.ClaimIdleSlot(ctx, slot.NodeID, slot.Tier); !errors.Is(err, store.ErrNoIdleCarrierSlot) {
+			t.Fatalf("discovery exposed a committed allocation: %v", err)
+		}
+
+		cancelled := "cancelled-" + life
+		slot.SlotID = "slot-" + cancelled
+		if err := cat.ExpectColdCarrier(ctx, cancelled, slot.SlotID, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if err := cat.FinishReservation(ctx, cancelled, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := cat.RegisterColdCarrier(ctx, slot, cancelled); err != nil {
+			t.Fatal(err)
+		}
+		shared, err := cat.ClaimIdleSlot(ctx, slot.NodeID, slot.Tier)
+		if err != nil || *shared != slot {
+			t.Fatalf("late registration did not return to the shared pool: %+v %v", shared, err)
 		}
 	}
 	t.Run("memory", func(t *testing.T) { check(t, store.NewMemoryRuntimeCatalog()) })

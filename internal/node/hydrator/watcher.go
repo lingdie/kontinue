@@ -11,6 +11,8 @@ import (
 
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -30,8 +32,10 @@ type CarrierPodWatcher struct {
 	catalog store.RuntimeCatalog
 	cfg     WatcherConfig
 
-	mu   sync.Mutex
-	seen map[string]protocol.CarrierSlot
+	mu    sync.Mutex
+	seen  map[string]protocol.CarrierSlot
+	wake  chan struct{}
+	syncs singleflight.Group
 }
 
 func NewCarrierPodWatcher(rt runtimeapi.RuntimeServiceClient, catalog store.RuntimeCatalog, cfg WatcherConfig) *CarrierPodWatcher {
@@ -43,30 +47,65 @@ func NewCarrierPodWatcher(rt runtimeapi.RuntimeServiceClient, catalog store.Runt
 		catalog: catalog,
 		cfg:     cfg,
 		seen:    make(map[string]protocol.CarrierSlot),
+		wake:    make(chan struct{}, 1),
 	}
 }
 
 func (w *CarrierPodWatcher) Start(ctx context.Context) {
+	go w.watchCRIEvents(ctx)
 	go func() {
 		ticker := time.NewTicker(w.cfg.PollInterval)
 		defer ticker.Stop()
+		w.ForceSync(ctx)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				w.syncOnce(ctx)
+				w.ForceSync(ctx)
+			case <-w.wake:
+				w.ForceSync(ctx)
 			}
 		}
 	}()
 }
 
-// ForceSync runs an immediate Carrier discovery pass (used after cold Pod creates).
+func (w *CarrierPodWatcher) watchCRIEvents(ctx context.Context) {
+	for ctx.Err() == nil {
+		stream, err := w.rt.GetContainerEvents(ctx, &runtimeapi.GetEventsRequest{})
+		for err == nil {
+			event, recvErr := stream.Recv()
+			err = recvErr
+			if err != nil {
+				break
+			}
+			if event.GetContainerEventType() == runtimeapi.ContainerEventType_CONTAINER_STARTED_EVENT &&
+				event.GetPodSandboxStatus().GetLabels()[protocol.LabelRole] == protocol.RoleCarrierPod {
+				select {
+				case w.wake <- struct{}{}:
+				default:
+				}
+			}
+		}
+		// Older or temporarily unavailable runtimes still have periodic scans.
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+}
+
+// ForceSync coalesces concurrent requests from older API server replicas.
 func (w *CarrierPodWatcher) ForceSync(ctx context.Context) {
 	if w == nil {
 		return
 	}
-	w.syncOnce(ctx)
+	w.syncs.Do("carrier discovery", func() (any, error) {
+		w.syncOnce(ctx)
+		return nil, nil
+	})
 }
 
 func (w *CarrierPodWatcher) syncOnce(ctx context.Context) {
@@ -83,6 +122,8 @@ func (w *CarrierPodWatcher) syncOnce(ctx context.Context) {
 	}
 
 	activeIDs := make(map[string]bool, len(resp.Items))
+	var checks errgroup.Group
+	checks.SetLimit(4)
 	for _, sb := range resp.Items {
 		activeIDs[sb.Id] = true
 
@@ -93,81 +134,13 @@ func (w *CarrierPodWatcher) syncOnce(ctx context.Context) {
 			continue
 		}
 
-		stResp, err := w.rt.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{
-			PodSandboxId: sb.Id,
-			Verbose:      true,
+		checks.Go(func() error {
+			w.registerCarrier(ctx, sb)
+			return nil
 		})
-		if err != nil || stResp.Status == nil || stResp.Status.Network == nil || stResp.Status.Network.Ip == "" {
-			continue
-		}
-		podIP := stResp.Status.Network.Ip
-		netnsPath := extractNetNSPath(stResp.Info)
-		if netnsPath == "" {
-			continue
-		}
-		// Never register a Carrier Pod into the idle pool if a live ktd sandbox is already listening on :49983!
-		if conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", podIP, protocol.DefaultKtdPort), 40*time.Millisecond); dialErr == nil {
-			_ = conn.Close()
-			w.mu.Lock()
-			w.seen[sb.Id] = protocol.CarrierSlot{SlotID: "slot-" + sb.Metadata.Name}
-			w.mu.Unlock()
-			continue
-		}
-
-		ctrsResp, err := w.rt.ListContainers(ctx, &runtimeapi.ListContainersRequest{
-			Filter: &runtimeapi.ContainerFilter{
-				PodSandboxId: sb.Id,
-				State:        &runtimeapi.ContainerStateValue{State: runtimeapi.ContainerState_CONTAINER_RUNNING},
-			},
-		})
-		if err != nil || len(ctrsResp.Containers) == 0 {
-			continue
-		}
-		var placeholder *runtimeapi.Container
-		for _, c := range ctrsResp.Containers {
-			if c.Metadata != nil && c.Metadata.Name == protocol.ContainerNameSandbox {
-				placeholder = c
-				break
-			}
-		}
-		if placeholder == nil {
-			placeholder = ctrsResp.Containers[0]
-		}
-
-		var logPath string
-		if cSt, cErr := w.rt.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: placeholder.Id}); cErr == nil && cSt.Status != nil {
-			logPath = cSt.Status.LogPath
-		}
-
-		tier := sb.Labels[protocol.LabelCarrierTier]
-		if tier == "" {
-			tier = protocol.DefaultCarrierTier
-		}
-		slot := protocol.CarrierSlot{
-			SlotID:                "slot-" + sb.Metadata.Name,
-			NodeID:                w.cfg.NodeID,
-			NodeIP:                w.cfg.NodeIP,
-			NodeGRPCAddr:          w.cfg.NodeGRPCAddr,
-			Tier:                  tier,
-			PodNamespace:          sb.Metadata.Namespace,
-			PodName:               sb.Metadata.Name,
-			PodUID:                sb.Metadata.Uid,
-			PodIP:                 podIP,
-			PodSandboxID:          sb.Id,
-			NetNSPath:             netnsPath,
-			PlaceholderID:         placeholder.Id,
-			ExpectedContainerHash: placeholder.Labels[protocol.K8sLabelContainerHash],
-			LogPath:               logPath,
-		}
-
-		if err := w.catalog.RegisterIdleSlot(ctx, slot); err == nil {
-			w.mu.Lock()
-			w.seen[sb.Id] = slot
-			w.mu.Unlock()
-			log.Printf("kontinued registered idle Carrier Slot %s (pod=%s/%s ip=%s netns=%s)",
-				slot.SlotID, slot.PodNamespace, slot.PodName, slot.PodIP, slot.NetNSPath)
-		}
 	}
+
+	_ = checks.Wait()
 
 	var stale []protocol.CarrierSlot
 	w.mu.Lock()
@@ -182,6 +155,83 @@ func (w *CarrierPodWatcher) syncOnce(ctx context.Context) {
 		if s.SlotID != "" {
 			_ = w.catalog.RemoveIdleSlot(ctx, w.cfg.NodeID, s.Tier, s.SlotID)
 		}
+	}
+}
+
+func (w *CarrierPodWatcher) registerCarrier(ctx context.Context, sb *runtimeapi.PodSandbox) {
+	stResp, err := w.rt.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{
+		PodSandboxId: sb.Id,
+		Verbose:      true,
+	})
+	if err != nil || stResp.Status == nil || stResp.Status.Network == nil || stResp.Status.Network.Ip == "" {
+		return
+	}
+	podIP := stResp.Status.Network.Ip
+	netnsPath := extractNetNSPath(stResp.Info)
+	if netnsPath == "" {
+		return
+	}
+	// Never register a Carrier Pod into the idle pool if a live ktd sandbox is already listening on :49983!
+	if conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", podIP, protocol.DefaultKtdPort), 40*time.Millisecond); dialErr == nil {
+		_ = conn.Close()
+		w.mu.Lock()
+		w.seen[sb.Id] = protocol.CarrierSlot{SlotID: "slot-" + sb.Metadata.Name}
+		w.mu.Unlock()
+		return
+	}
+
+	ctrsResp, err := w.rt.ListContainers(ctx, &runtimeapi.ListContainersRequest{
+		Filter: &runtimeapi.ContainerFilter{
+			PodSandboxId: sb.Id,
+			State:        &runtimeapi.ContainerStateValue{State: runtimeapi.ContainerState_CONTAINER_RUNNING},
+		},
+	})
+	if err != nil || len(ctrsResp.Containers) == 0 {
+		return
+	}
+	var placeholder *runtimeapi.Container
+	for _, c := range ctrsResp.Containers {
+		if c.Metadata != nil && c.Metadata.Name == protocol.ContainerNameSandbox {
+			placeholder = c
+			break
+		}
+	}
+	if placeholder == nil {
+		placeholder = ctrsResp.Containers[0]
+	}
+
+	var logPath string
+	if cSt, cErr := w.rt.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: placeholder.Id}); cErr == nil && cSt.Status != nil {
+		logPath = cSt.Status.LogPath
+	}
+
+	tier := sb.Labels[protocol.LabelCarrierTier]
+	if tier == "" {
+		tier = protocol.DefaultCarrierTier
+	}
+	slot := protocol.CarrierSlot{
+		SlotID:                "slot-" + sb.Metadata.Name,
+		NodeID:                w.cfg.NodeID,
+		NodeIP:                w.cfg.NodeIP,
+		NodeGRPCAddr:          w.cfg.NodeGRPCAddr,
+		Tier:                  tier,
+		PodNamespace:          sb.Metadata.Namespace,
+		PodName:               sb.Metadata.Name,
+		PodUID:                sb.Metadata.Uid,
+		PodIP:                 podIP,
+		PodSandboxID:          sb.Id,
+		NetNSPath:             netnsPath,
+		PlaceholderID:         placeholder.Id,
+		ExpectedContainerHash: placeholder.Labels[protocol.K8sLabelContainerHash],
+		LogPath:               logPath,
+	}
+
+	if err := w.catalog.RegisterColdCarrier(ctx, slot, sb.Labels[protocol.LabelColdLifecycle]); err == nil {
+		w.mu.Lock()
+		w.seen[sb.Id] = slot
+		w.mu.Unlock()
+		log.Printf("kontinued registered idle Carrier Slot %s (pod=%s/%s ip=%s netns=%s)",
+			slot.SlotID, slot.PodNamespace, slot.PodName, slot.PodIP, slot.NetNSPath)
 	}
 }
 

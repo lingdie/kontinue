@@ -370,14 +370,14 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (_
 
 // A session-scoped lock covers checkpoint, upload and commit, regardless of their duration.
 func (s *Server) lockExecution(ctx context.Context, id string) (func(), error) {
+	ctx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "apiserver.acquire_execution_lock",
+		attribute.String(telemetry.AttrSandboxID, id))
 	release, ok, err := s.cfg.Meta.TryLeader(ctx, "sandbox/"+id)
-	if err != nil {
-		return nil, err
+	if err == nil && !ok {
+		err = store.ErrTransitionLocked
 	}
-	if !ok {
-		return nil, store.ErrTransitionLocked
-	}
-	return release, nil
+	telemetry.EndSpan(span, err)
+	return release, err
 }
 
 // SuspendSandbox checkpoints a running sandbox via Kubelet's native /checkpoint API,

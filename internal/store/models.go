@@ -176,11 +176,13 @@ type SlotReservation struct {
 
 type RuntimeCatalog interface {
 	ReserveIdleSlot(ctx context.Context, nodeID, tier, lifecycle string, cold bool) (*SlotReservation, error)
+	ExpectColdCarrier(ctx context.Context, lifecycle, slotID string, ttl time.Duration) error
 	FinishReservation(ctx context.Context, lifecycle string, returnUnused bool) error
 	BeginNodeRecovery(context.Context, string) error
 	ReportExecution(context.Context, protocol.RouteRecord, ExecutionReport) error
 	ExecutionReport(context.Context, protocol.RouteRecord) (ExecutionReport, error)
 	RegisterIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error
+	RegisterColdCarrier(ctx context.Context, slot protocol.CarrierSlot, lifecycle string) error
 	RemoveIdleSlot(ctx context.Context, nodeID, tier, slotID string) error
 	ClaimIdleSlot(ctx context.Context, nodeID, tier string) (*protocol.CarrierSlot, error)
 	CountIdleSlots(ctx context.Context, nodeID, tier string) (int, error)
