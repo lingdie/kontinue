@@ -483,17 +483,17 @@ func (c *MemoryRuntimeCatalog) RegisterColdCarrier(_ context.Context, slot proto
 	return true, nil
 }
 
-func (c *MemoryRuntimeCatalog) RemoveIdleSlot(_ context.Context, nodeID, tier, slotID string) error {
+func (c *MemoryRuntimeCatalog) RemoveIdleSlot(_ context.Context, slot protocol.CarrierSlot) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if tier == "" {
-		tier = protocol.DefaultCarrierTier
+	if slot.Tier == "" {
+		slot.Tier = protocol.DefaultCarrierTier
 	}
-	k := protocol.IdlePoolKey(nodeID, tier)
+	k := protocol.IdlePoolKey(slot.NodeID, slot.Tier)
 	list := c.idlePools[k]
 	filtered := list[:0]
 	for _, s := range list {
-		if s.SlotID != slotID {
+		if s.SlotID != slot.SlotID || s.PodUID != slot.PodUID || s.PodSandboxID != slot.PodSandboxID {
 			filtered = append(filtered, s)
 		}
 	}

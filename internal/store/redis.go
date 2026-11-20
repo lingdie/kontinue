@@ -148,15 +148,24 @@ func (c *RedisRuntimeCatalog) RegisterColdCarrier(ctx context.Context, slot prot
 	return result == 1, err
 }
 
-func (c *RedisRuntimeCatalog) RemoveIdleSlot(ctx context.Context, nodeID, tier, slotID string) error {
-	if tier == "" {
-		tier = protocol.DefaultCarrierTier
+var luaRemoveIdleSlot = redis.NewScript(`
+local meta=redis.call("GET",KEYS[2])
+if meta then
+    local slot=cjson.decode(meta)
+    if slot.nodeId==ARGV[2] and slot.tier==ARGV[3] then
+        if (slot.podUid or "")~=ARGV[4] or (slot.podSandboxId or "")~=ARGV[5] then return 0 end
+        redis.call("DEL",KEYS[2])
+    end
+end
+return redis.call("SREM",KEYS[1],ARGV[1])
+`)
+
+func (c *RedisRuntimeCatalog) RemoveIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error {
+	if slot.Tier == "" {
+		slot.Tier = protocol.DefaultCarrierTier
 	}
-	pipe := c.rdb.TxPipeline()
-	pipe.SRem(ctx, protocol.IdlePoolKey(nodeID, tier), slotID)
-	pipe.Del(ctx, protocol.CarrierMetaKey(slotID))
-	_, err := pipe.Exec(ctx)
-	return err
+	return luaRemoveIdleSlot.Run(ctx, c.rdb, []string{protocol.IdlePoolKey(slot.NodeID, slot.Tier), protocol.CarrierMetaKey(slot.SlotID)},
+		slot.SlotID, slot.NodeID, slot.Tier, slot.PodUID, slot.PodSandboxID).Err()
 }
 
 func (c *RedisRuntimeCatalog) ClaimIdleSlot(ctx context.Context, nodeID, tier string) (*protocol.CarrierSlot, error) {

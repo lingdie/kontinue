@@ -184,7 +184,7 @@ type RuntimeCatalog interface {
 	ExecutionReport(context.Context, protocol.RouteRecord) (ExecutionReport, error)
 	RegisterIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error
 	RegisterColdCarrier(ctx context.Context, slot protocol.CarrierSlot, lifecycle string) (published bool, err error)
-	RemoveIdleSlot(ctx context.Context, nodeID, tier, slotID string) error
+	RemoveIdleSlot(ctx context.Context, slot protocol.CarrierSlot) error
 	ClaimIdleSlot(ctx context.Context, nodeID, tier string) (*protocol.CarrierSlot, error)
 	CountIdleSlots(ctx context.Context, nodeID, tier string) (int, error)
 

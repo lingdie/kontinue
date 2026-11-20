@@ -309,3 +309,45 @@ func TestColdCarrierGoesToWaitingLifecycle(t *testing.T) {
 		check(t, cat)
 	})
 }
+
+func TestIdleCarrierRemovalIsFencedByPodIdentity(t *testing.T) {
+	check := func(t *testing.T, cat store.RuntimeCatalog) {
+		ctx := context.Background()
+		old := protocol.CarrierSlot{SlotID: "slot-" + rand.Text(), NodeID: "node", Tier: rand.Text(), PodUID: "uid-1", PodSandboxID: "cri-1"}
+		replacement := old
+		replacement.PodUID, replacement.PodSandboxID = "uid-2", "cri-2"
+		for _, slot := range []protocol.CarrierSlot{old, replacement} {
+			if err := cat.RegisterIdleSlot(ctx, slot); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := cat.RemoveIdleSlot(ctx, old); err != nil {
+			t.Fatal(err)
+		}
+		// Kubelet can also recreate the CRI sandbox under the same Pod UID.
+		oldRuntime := replacement
+		oldRuntime.PodSandboxID = "previous-cri"
+		if err := cat.RemoveIdleSlot(ctx, oldRuntime); err != nil {
+			t.Fatal(err)
+		}
+		if count, err := cat.CountIdleSlots(ctx, old.NodeID, old.Tier); err != nil || count != 1 {
+			t.Fatalf("stale withdrawal removed the replacement: count=%d err=%v", count, err)
+		}
+		if err := cat.RemoveIdleSlot(ctx, replacement); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cat.ClaimIdleSlot(ctx, old.NodeID, old.Tier); !errors.Is(err, store.ErrNoIdleCarrierSlot) {
+			t.Fatalf("current Carrier is still claimable: %v", err)
+		}
+	}
+	t.Run("memory", func(t *testing.T) { check(t, store.NewMemoryRuntimeCatalog()) })
+	t.Run("redis", func(t *testing.T) {
+		addr := os.Getenv("KONTINUE_TEST_REDIS")
+		if addr == "" {
+			t.Skip("KONTINUE_TEST_REDIS is unset")
+		}
+		cat := store.NewRedisRuntimeCatalog(addr, "", 0)
+		defer cat.Close()
+		check(t, cat)
+	})
+}

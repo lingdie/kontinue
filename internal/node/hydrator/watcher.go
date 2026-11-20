@@ -143,19 +143,22 @@ func (w *CarrierPodWatcher) syncOnce(ctx context.Context) {
 
 	_ = checks.Wait()
 
-	var stale []protocol.CarrierSlot
+	stale := make(map[string]protocol.CarrierSlot)
 	w.mu.Lock()
 	for id, slot := range w.seen {
 		if !activeIDs[id] {
-			stale = append(stale, slot)
-			delete(w.seen, id)
+			stale[id] = slot
 		}
 	}
 	w.mu.Unlock()
-	for _, s := range stale {
-		if s.SlotID != "" {
-			_ = w.catalog.RemoveIdleSlot(ctx, w.cfg.NodeID, s.Tier, s.SlotID)
+	for id, slot := range stale {
+		if err := w.catalog.RemoveIdleSlot(ctx, slot); err != nil {
+			log.Printf("withdraw stale Carrier %s: %v", slot.SlotID, err)
+			continue
 		}
+		w.mu.Lock()
+		delete(w.seen, id)
+		w.mu.Unlock()
 	}
 }
 
@@ -212,7 +215,7 @@ func (w *CarrierPodWatcher) registerCarrier(ctx context.Context, sb *runtimeapi.
 	if conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", podIP, protocol.DefaultKtdPort), 40*time.Millisecond); dialErr == nil {
 		_ = conn.Close()
 		w.mu.Lock()
-		w.seen[sb.Id] = protocol.CarrierSlot{SlotID: "slot-" + sb.Metadata.Name}
+		w.seen[sb.Id] = slot
 		w.mu.Unlock()
 		return
 	}
