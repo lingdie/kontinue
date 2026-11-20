@@ -366,6 +366,9 @@ pub fn finish_spawn_in_child(notify_fd: i32) -> Result<(), String> {
         } else if let Some(fd) = listener {
             libc::close(fd);
         }
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            return Err(format!("clear supplementary groups: {}", std::io::Error::last_os_error()));
+        }
         if libc::setgid(WORKLOAD_GID) != 0 {
             return Err(format!("setgid: {}", std::io::Error::last_os_error()));
         }

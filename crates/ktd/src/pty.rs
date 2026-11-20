@@ -30,7 +30,9 @@ pub fn serve(
     query: &str,
 ) -> io::Result<()> {
     use std::io::{BufReader, Cursor};
-    use std::os::fd::FromRawFd;
+    use std::net::Shutdown;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::net::UnixStream;
     use std::process::{Command, Stdio};
     use std::thread;
 
@@ -122,26 +124,41 @@ pub fn serve(
         });
     }
 
+    let mut master_write = unsafe { std::fs::File::from_raw_fd(master) };
+    let mut master_read = master_write.try_clone()?;
+    let (stop_output, stop_signal) = UnixStream::pair()?;
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let writer_bg = Arc::clone(&writer);
+    let mut reader = BufReader::new(Cursor::new(prebuffered.to_vec()).chain(stream.try_clone()?));
+
+    svc.enter_foreground_wait();
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            unsafe { libc::close(master) };
+            svc.leave_foreground_wait();
             return Err(e);
         }
     };
+    // Command owns the parent's copies of the slave descriptors even after spawn.
+    // Close them so the master observes EOF when the terminal process exits.
+    drop(cmd);
     let parent_fd = guard.take_parent_fd();
     if parent_fd >= 0 {
         thread::spawn(move || super::platform::supervise_spawn_guard(parent_fd));
     }
-    svc.enter_foreground_wait();
-    let master_file = unsafe { std::fs::File::from_raw_fd(master) };
-    let mut master_read = master_file.try_clone()?;
-    let mut master_write = master_file;
-    let writer = Arc::new(Mutex::new(stream.try_clone()?));
-    let writer_bg = Arc::clone(&writer);
     let output = thread::spawn(move || {
+        let mut fds = [
+            libc::pollfd { fd: master_read.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: stop_signal.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
         let mut buf = [0u8; 4096];
         loop {
+            // Client disconnect must also end the pump when another process holds a slave fd.
+            if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted { continue; }
+                break;
+            }
+            if fds[1].revents != 0 { break; }
             match master_read.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
@@ -153,9 +170,12 @@ pub fn serve(
                 }
             }
         }
+        if let Ok(mut w) = writer_bg.lock() {
+            let _ = write_frame(&mut *w, 0x8, &[]);
+            let _ = w.shutdown(Shutdown::Read);
+        }
     });
 
-    let mut reader = BufReader::new(Cursor::new(prebuffered.to_vec()).chain(stream.try_clone()?));
     loop {
         match read_frame(&mut reader) {
             Ok(Some((0x8, _))) | Ok(None) => break,
@@ -173,6 +193,8 @@ pub fn serve(
             Err(_) => break,
         }
     }
+    drop(stop_output);
+    let _ = stream.shutdown(Shutdown::Both);
     let _ = child.kill();
     let _ = child.wait();
     svc.leave_foreground_wait();

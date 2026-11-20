@@ -1,6 +1,7 @@
 //! Core state machine, process executor, and zero-GC HTTP/1.1 server for `ktd`
 //! (supporting explicit `Expect: 100-continue` held requests, W3C `traceparent` spans, and `/debug/traces`).
 
+pub mod files;
 pub mod platform;
 mod pty;
 
@@ -103,14 +104,14 @@ impl KtdService {
         let Ok(g) = self.state.lock() else {
             return false;
         };
-        constant_time_eq(&g.bootstrap_token, token)
+        !token.is_empty() && constant_time_eq(&g.bootstrap_token, token)
     }
 
     pub fn verify_access(&self, token: &str) -> bool {
         let Ok(g) = self.state.lock() else {
             return false;
         };
-        constant_time_eq(&g.access_token, token)
+        !token.is_empty() && constant_time_eq(&g.access_token, token)
     }
 
     pub fn tenant_spawn_env(&self) -> Result<BTreeMap<String, String>, String> {
@@ -185,7 +186,7 @@ impl KtdService {
             while g.in_flight_spawns > 0 {
                 let now = Instant::now();
                 if now >= deadline {
-                    break;
+                    return Err("workload operations are still in progress".into());
                 }
                 let (next_g, _) = self
                     .spawn_cv
@@ -824,10 +825,9 @@ fn dispatch_route(
             let Some(file_path) = params.get("path") else {
                 return json_err(400, "missing path query parameter");
             };
-            match fs::read(file_path) {
+            match svc.file_request(file_path, None) {
                 Ok(bytes) => (200, "application/octet-stream", bytes, String::new()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => json_err(404, &e.to_string()),
-                Err(e) => json_err(500, &e.to_string()),
+                Err((code, message)) => json_err(code, &message),
             }
         }
         ("PUT", "/v1/files") | ("POST", "/v1/files") => {
@@ -842,21 +842,10 @@ fn dispatch_route(
             if req.path.is_empty() {
                 return json_err(400, "missing path");
             }
-            let p = Path::new(&req.path);
-            if let Some(parent) = p.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    return json_err(500, &e.to_string());
-                }
+            match svc.file_request(&req.path, Some((&req.content, req.mode))) {
+                Ok(_) => (204, "application/json", Vec::new(), String::new()),
+                Err((code, message)) => json_err(code, &message),
             }
-            if let Err(e) = fs::write(p, &req.content) {
-                return json_err(500, &e.to_string());
-            }
-            #[cfg(unix)]
-            if req.mode != 0 {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(p, fs::Permissions::from_mode(req.mode));
-            }
-            (204, "application/json", Vec::new(), String::new())
         }
         _ => json_err(404, "route not found"),
     }
@@ -890,6 +879,7 @@ fn write_http_resp(
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
         413 => "Payload Too Large",

@@ -4,6 +4,12 @@ use ktd::{serve_http, KtdConfig, KtdService};
 use kt_protocol::ExecRequest;
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--workload-file") {
+        let [_, operation, path, mode] = args.as_slice() else { std::process::exit(1) };
+        let Ok(mode) = mode.parse::<u32>() else { std::process::exit(1) };
+        std::process::exit(ktd::files::helper(operation, std::path::Path::new(path), mode));
+    }
     let mut listen_addr = "0.0.0.0:49983".to_string();
     let mut bootstrap_token = std::env::var("KTD_BOOTSTRAP_TOKEN")
         .unwrap_or_else(|_| "kontinue-default-bootstrap-token".to_string());
@@ -14,7 +20,6 @@ fn main() {
     let mut workload_cgroup = "/sys/fs/cgroup/kontinue-workload".to_string();
     let mut startup_cmd = std::env::var("KTD_STARTUP_CMD").unwrap_or_default();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
