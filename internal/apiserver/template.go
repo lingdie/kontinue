@@ -26,7 +26,7 @@ func (s *Server) BuildGoldenTemplate(ctx context.Context, req CreateTemplateRequ
 		return nil, err
 	}
 	defer unlock()
-	t := &store.TemplateRecord{TemplateID: req.TemplateID, Name: req.Name, BaseImage: req.BaseImage, Tier: req.Tier, WarmupScript: req.WarmupScript, PinInL1Tmpfs: req.PinInL1Tmpfs, TraceHotPages: req.TraceHotPages, Phase: "Allocating",
+	t := &store.TemplateRecord{TenantID: tenantID(ctx), TemplateID: req.TemplateID, Name: req.Name, BaseImage: req.BaseImage, Tier: req.Tier, WarmupScript: req.WarmupScript, PinInL1Tmpfs: req.PinInL1Tmpfs, TraceHotPages: req.TraceHotPages, Phase: "Allocating",
 		Build: &store.TemplateBuild{SnapshotID: "snap-golden-" + randHex(12), LifecycleID: "life-" + randHex(12), AccessToken: "warmup-" + randHex(16), BootstrapToken: "boot-" + randHex(16)}}
 	if err := s.cfg.Meta.CreateTemplate(ctx, t); err != nil {
 		return nil, err

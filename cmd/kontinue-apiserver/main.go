@@ -23,6 +23,7 @@ import (
 
 func main() {
 	var (
+		keyFile         = flag.String("tenant-keys-file", os.Getenv("KONTINUE_TENANT_KEYS_FILE"), "JSON file mapping tenants to bearer credentials")
 		listenAddr      = flag.String("listen", ":8081", "HTTP API listen address")
 		pgDSN           = flag.String("postgres-dsn", os.Getenv("POSTGRES_DSN"), "PostgreSQL connection string (empty uses in-memory store)")
 		redisAddr       = flag.String("redis-addr", os.Getenv("REDIS_ADDR"), "Redis address (empty uses in-memory catalog)")
@@ -111,9 +112,16 @@ func main() {
 		}
 	}
 
+	var keys apiserver.TenantKeys
+	if *keyFile != "" {
+		keys, err = apiserver.LoadTenantKeys(*keyFile)
+		if err != nil {
+			log.Fatalf("load tenant credentials: %v", err)
+		}
+	}
 	kubelet := apiserver.NewHTTPSKubeletClient(os.Getenv("KUBELET_BEARER_TOKEN"), *kubeletInsec)
 	srv := apiserver.NewServer(apiserver.ServerConfig{
-		Meta:        metaStore,
+		TraceToken: os.Getenv("KONTINUE_TRACE_TOKEN"), TenantKeys: keys, Meta: metaStore,
 		Catalog:     catalog,
 		Replenisher: replenisher,
 		Kubelet:     kubelet,

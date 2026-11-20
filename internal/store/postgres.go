@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS kt_templates (
 );
 
 ALTER TABLE kt_templates ADD COLUMN IF NOT EXISTS build JSONB;
+ALTER TABLE kt_templates ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
 
 CREATE TABLE IF NOT EXISTS kt_snapshots (
     snapshot_id        TEXT PRIMARY KEY,
@@ -67,6 +68,8 @@ CREATE TABLE IF NOT EXISTS kt_fork_receipts (
     PRIMARY KEY (source_id, request_key)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kt_sandboxes_create_key
+ON kt_sandboxes ((payload_json->>'createKey')) WHERE payload_json ? 'createKey';
 CREATE INDEX IF NOT EXISTS idx_kt_sandboxes_state ON kt_sandboxes(state);
 CREATE INDEX IF NOT EXISTS idx_kt_snapshots_superseded ON kt_snapshots(superseded);
 `
@@ -153,10 +156,10 @@ func (s *PostgresMetadataStore) CreateTemplate(ctx context.Context, tpl *Templat
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO kt_templates (
 			template_id, name, base_image, warmup_script, tier, pin_in_l1_tmpfs,
-			trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, build
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, build, tenant_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		tpl.TemplateID, tpl.Name, tpl.BaseImage, tpl.WarmupScript, tpl.Tier, tpl.PinInL1Tmpfs,
-		tpl.TraceHotPages, tpl.Phase, tpl.GoldenSnapshotID, tpl.StatusMessage, tpl.CreatedAt, tpl.UpdatedAt, tpl.Build,
+		tpl.TraceHotPages, tpl.Phase, tpl.GoldenSnapshotID, tpl.StatusMessage, tpl.CreatedAt, tpl.UpdatedAt, tpl.Build, tpl.TenantID,
 	)
 	return err
 }
@@ -165,11 +168,11 @@ func (s *PostgresMetadataStore) GetTemplate(ctx context.Context, templateID stri
 	var t TemplateRecord
 	err := s.pool.QueryRow(ctx, `
 		SELECT template_id, name, base_image, warmup_script, tier, pin_in_l1_tmpfs,
-		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at,build
+		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, build, tenant_id
 		FROM kt_templates WHERE template_id = $1`, templateID,
 	).Scan(
 		&t.TemplateID, &t.Name, &t.BaseImage, &t.WarmupScript, &t.Tier, &t.PinInL1Tmpfs,
-		&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt, &t.Build,
+		&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt, &t.Build, &t.TenantID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -197,7 +200,7 @@ func (s *PostgresMetadataStore) ListPendingTemplateIDs(ctx context.Context) ([]s
 func (s *PostgresMetadataStore) ListTemplates(ctx context.Context) ([]TemplateRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT template_id, name, base_image, warmup_script, tier, pin_in_l1_tmpfs,
-		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at
+		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, tenant_id
 		FROM kt_templates ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -208,7 +211,7 @@ func (s *PostgresMetadataStore) ListTemplates(ctx context.Context) ([]TemplateRe
 		var t TemplateRecord
 		if err := rows.Scan(
 			&t.TemplateID, &t.Name, &t.BaseImage, &t.WarmupScript, &t.Tier, &t.PinInL1Tmpfs,
-			&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt,
+			&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt, &t.TenantID,
 		); err != nil {
 			return nil, err
 		}
@@ -403,6 +406,10 @@ func insertSandbox(ctx context.Context, db sandboxWriter, sbx *SandboxRecord) er
 		VALUES ($1, $2, $3, $4, $5)`,
 		sbx.SandboxID, raw, string(sbx.State), sbx.ActiveSnapshotID, sbx.UpdatedAt,
 	)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return ErrSandboxExists
+	}
 	return err
 }
 

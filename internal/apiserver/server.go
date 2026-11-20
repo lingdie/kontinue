@@ -25,6 +25,8 @@ import (
 )
 
 type ServerConfig struct {
+	TraceToken  string
+	TenantKeys  TenantKeys
 	Meta        store.MetadataStore
 	Catalog     store.RuntimeCatalog
 	Placement   *PlacementEngine
@@ -87,13 +89,14 @@ func (s *Server) registerRoutes() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	if s.cfg.Recorder != nil {
-		s.mux.HandleFunc(protocol.PathDebugTraces, s.cfg.Recorder.Handler())
+	s.mux.HandleFunc("POST /internal/gateway/sandboxes/{id}/{action}", s.gatewayAction)
+	if s.cfg.Recorder != nil && (s.cfg.TraceToken != "" || s.cfg.TenantKeys == nil) {
+		s.mux.HandleFunc(protocol.PathDebugTraces, s.cfg.Recorder.OperatorHandler(s.cfg.TraceToken))
 	}
-	s.mux.HandleFunc("/v1/templates", s.handleTemplates)
-	s.mux.HandleFunc("/v1/templates/", s.handleTemplateByID)
-	s.mux.HandleFunc("/v1/sandboxes", s.handleSandboxes)
-	s.mux.HandleFunc("/v1/sandboxes/", s.handleSandboxActions)
+	s.mux.Handle("/v1/templates", s.tenantHandler(http.HandlerFunc(s.handleTemplates)))
+	s.mux.Handle("/v1/templates/", s.tenantHandler(http.HandlerFunc(s.handleTemplateByID)))
+	s.mux.Handle("/v1/sandboxes", s.tenantHandler(http.HandlerFunc(s.handleSandboxes)))
+	s.mux.Handle("/v1/sandboxes/", s.tenantHandler(http.HandlerFunc(s.handleSandboxActions)))
 }
 
 type CreateTemplateRequest struct {
@@ -107,6 +110,7 @@ type CreateTemplateRequest struct {
 }
 
 type CreateSandboxRequest struct {
+	RequestKey                  string            `json:"-"`
 	SandboxID                   string            `json:"sandboxId,omitempty"`
 	TemplateID                  string            `json:"templateId,omitempty"`
 	BaseImage                   string            `json:"baseImage,omitempty"`
@@ -129,12 +133,14 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		list, err := s.cfg.Meta.ListTemplates(r.Context())
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
+			writeLifecycleError(w, err)
 			return
 		}
 		public := make([]templateResponse, 0, len(list))
 		for i := range list {
-			public = append(public, publicTemplate(&list[i]))
+			if visible(r.Context(), list[i].TenantID) {
+				public = append(public, publicTemplate(&list[i]))
+			}
 		}
 		writeJSON(w, http.StatusOK, public)
 	case http.MethodPost:
@@ -145,7 +151,7 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 		}
 		tpl, err := s.BuildGoldenTemplate(r.Context(), req)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
+			writeLifecycleError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, publicTemplate(tpl))
@@ -156,13 +162,13 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/v1/templates/")
-	tpl, err := s.cfg.Meta.GetTemplate(r.Context(), id)
+	tpl, err := s.template(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "template not found")
 		return
 	}
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeLifecycleError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, publicTemplate(tpl))
@@ -173,41 +179,18 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	idemKey := r.Header.Get(protocol.HeaderIdempotencyKey)
-	if idemKey != "" {
-		idemKey = "create-v2/" + idemKey
-		if code, body, ok, _ := s.cfg.Catalog.GetIdempotency(r.Context(), idemKey); ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(code)
-			_, _ = w.Write(body)
-			return
-		}
-	}
-
 	var req CreateSandboxRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.RequestKey = r.Header.Get(protocol.HeaderIdempotencyKey)
 	sbx, err := s.CreateSandbox(r.Context(), req)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, store.ErrSandboxExists) || errors.Is(err, store.ErrTransitionLocked) {
-			status = http.StatusConflict
-		}
-		if errors.Is(err, store.ErrNoIdleCarrierSlot) {
-			status = http.StatusServiceUnavailable
-		}
-		writeErr(w, status, err.Error())
+		writeLifecycleError(w, err)
 		return
 	}
-	raw, _ := json.Marshal(issueSandbox(sbx))
-	if idemKey != "" {
-		_ = s.cfg.Catalog.SaveIdempotency(r.Context(), idemKey, http.StatusCreated, raw, 10*time.Minute)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_, _ = w.Write(raw)
+	writeJSON(w, http.StatusCreated, issueSandbox(sbx))
 }
 
 func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
@@ -222,19 +205,19 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 1 {
 		switch r.Method {
 		case http.MethodGet:
-			sbx, err := s.cfg.Meta.GetSandbox(r.Context(), sandboxID)
+			sbx, err := s.sandbox(r.Context(), sandboxID)
 			if errors.Is(err, store.ErrNotFound) {
 				writeErr(w, http.StatusNotFound, "sandbox not found")
 				return
 			}
 			if err != nil {
-				writeErr(w, http.StatusInternalServerError, err.Error())
+				writeLifecycleError(w, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, publicSandbox(sbx))
 		case http.MethodDelete:
 			if err := s.DeleteSandbox(r.Context(), sandboxID); err != nil {
-				writeErr(w, http.StatusInternalServerError, err.Error())
+				writeLifecycleError(w, err)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -256,14 +239,14 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusConflict, err.Error())
 				return
 			}
-			writeErr(w, http.StatusInternalServerError, err.Error())
+			writeLifecycleError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, publicSnapshot(snap))
 	case "resume":
 		sbx, err := s.ResumeSandbox(r.Context(), sandboxID)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
+			writeLifecycleError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, publicSandbox(sbx))
@@ -282,7 +265,7 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusConflict, err.Error())
 				return
 			}
-			writeErr(w, http.StatusInternalServerError, err.Error())
+			writeLifecycleError(w, err)
 			return
 		}
 		pub := make([]issuedSandbox, 0, len(forks))
@@ -297,6 +280,18 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 
 // CreateSandbox clones a new 1-to-N sandbox from a Golden Template in ~100ms with 0 K8s etcd writes!
 func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*store.SandboxRecord, error) {
+	var createKey, requestHash string
+	if req.RequestKey != "" {
+		createKey = createKeyDigest(ctx, req.RequestKey)
+		raw, err := json.Marshal(req)
+		if err != nil {
+			return nil, err
+		}
+		requestHash = protocol.AccessDigest(string(raw))
+		if req.SandboxID == "" {
+			req.SandboxID = "sbx-" + createKey[:24]
+		}
+	}
 	if req.SandboxID == "" {
 		req.SandboxID = "sbx-" + randHex(6)
 	}
@@ -312,7 +307,13 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 		return nil, err
 	}
 	defer unlock()
-	if _, err := s.cfg.Meta.GetSandbox(ctx, req.SandboxID); err == nil {
+	if existing, err := s.cfg.Meta.GetSandbox(ctx, req.SandboxID); err == nil {
+		if createKey != "" && existing.CreateKey == createKey && existing.CreateRequestHash == requestHash && visible(ctx, existing.TenantID) {
+			if existing.State == store.SandboxStateCreating {
+				return s.advanceActivation(ctx, existing)
+			}
+			return existing, nil
+		}
 		return nil, store.ErrSandboxExists
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
@@ -322,7 +323,7 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 	baseImage := req.BaseImage
 	tier := req.Tier
 	if req.TemplateID != "" {
-		tpl, err := s.cfg.Meta.GetTemplate(ctx, req.TemplateID)
+		tpl, err := s.template(ctx, req.TemplateID)
 		if err != nil {
 			retErr = fmt.Errorf("load template %s: %w", req.TemplateID, err)
 			return nil, retErr
@@ -354,7 +355,7 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 	if bootTok == "" {
 		bootTok = "boot-" + randHex(12)
 	}
-	sbx := &store.SandboxRecord{SandboxID: req.SandboxID, TemplateID: req.TemplateID, BaseImage: baseImage, Tier: tier,
+	sbx := &store.SandboxRecord{CreateKey: createKey, CreateRequestHash: requestHash, TenantID: tenantID(ctx), SandboxID: req.SandboxID, TemplateID: req.TemplateID, BaseImage: baseImage, Tier: tier,
 		State: store.SandboxStateCreating, ExecutionID: 1, LifecycleID: "life-" + randHex(6), ActiveSnapshotID: snapID,
 		AccessToken: "kt_live_" + randHex(16), BootstrapToken: bootTok, EnvVars: req.EnvVars, IdleTimeoutSeconds: req.IdleTimeoutSeconds,
 		CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes, AllowFilesystemOnlyFallback: req.AllowFilesystemOnlyFallback}
@@ -396,7 +397,7 @@ func (s *Server) suspendSandbox(ctx context.Context, sandboxID string, observed 
 	}
 	defer unlock()
 
-	sbx, err := s.cfg.Meta.GetSandbox(ctx, sandboxID)
+	sbx, err := s.sandbox(ctx, sandboxID)
 	if err != nil {
 		retErr = err
 		return nil, err
@@ -594,7 +595,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 	}
 	defer unlock()
 
-	sbx, err := s.cfg.Meta.GetSandbox(ctx, sandboxID)
+	sbx, err := s.sandbox(ctx, sandboxID)
 	if err != nil {
 		retErr = err
 		return nil, err
@@ -612,6 +613,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 			if health.SandboxID != sbx.SandboxID || health.ExecutionID != sbx.ExecutionID || !health.Healthy || health.Frozen {
 				return nil, store.ErrStaleExecutionFence
 			}
+			r.AccessDigest = protocol.AccessDigest(sbx.AccessToken)
 			r.OwnerKey = store.OwnerKey(*r)
 			if err := s.cfg.Catalog.PublishRoute(ctx, *r); err != nil {
 				return nil, err
@@ -690,7 +692,7 @@ func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
 		return err
 	}
 	defer unlock()
-	sbx, err := s.cfg.Meta.GetSandbox(ctx, sandboxID)
+	sbx, err := s.sandbox(ctx, sandboxID)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil
 	}

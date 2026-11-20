@@ -43,6 +43,7 @@ type TemplateBuild struct {
 }
 
 type TemplateRecord struct {
+	TenantID         string         `json:"-"`
 	Build            *TemplateBuild `json:"-"`
 	TemplateID       string         `json:"templateId"`
 	Name             string         `json:"name"`
@@ -97,6 +98,9 @@ type PendingFork struct {
 }
 
 type SandboxRecord struct {
+	CreateKey                   string               `json:"createKey,omitempty"`
+	CreateRequestHash           string               `json:"createRequestHash,omitempty"`
+	TenantID                    string               `json:"tenantId,omitempty"`
 	PendingFork                 *PendingFork         `json:"pendingFork,omitempty"`
 	ForkOperationID             string               `json:"forkOperationId,omitempty"`
 	PendingPlacement            *ActivationPlacement `json:"pendingPlacement,omitempty"`

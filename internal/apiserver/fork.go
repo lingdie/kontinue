@@ -35,7 +35,7 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceID string, req ForkSandb
 				return err
 			}
 			defer unlock()
-			child, err := s.cfg.Meta.GetSandbox(ctx, id)
+			child, err := s.sandbox(ctx, id)
 			if err != nil {
 				return err
 			}
@@ -66,7 +66,7 @@ func (s *Server) prepareFork(ctx context.Context, sourceID string, req *ForkSand
 		return nil, err
 	}
 	defer unlock()
-	src, err := s.cfg.Meta.GetSandbox(ctx, sourceID)
+	src, err := s.sandbox(ctx, sourceID)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +139,7 @@ func (s *Server) prepareFork(ctx context.Context, sourceID string, req *ForkSand
 	children := make([]*store.SandboxRecord, 0, len(fork.ChildIDs))
 	for _, id := range fork.ChildIDs {
 		children = append(children, &store.SandboxRecord{
-			SandboxID: id, ForkOperationID: fork.OperationID, TemplateID: src.TemplateID, BaseImage: src.BaseImage, Tier: src.Tier,
+			TenantID: src.TenantID, SandboxID: id, ForkOperationID: fork.OperationID, TemplateID: src.TemplateID, BaseImage: src.BaseImage, Tier: src.Tier,
 			State: store.SandboxStateCreating, ExecutionID: src.ExecutionID + 1, LifecycleID: "life-" + randHex(6),
 			OriginNodeID: snapshot.OriginNodeID, ActiveSnapshotID: snapshot.SnapshotID, BootstrapToken: snapshot.BootstrapToken,
 			AccessToken: "kt_fork_" + randHex(16), EnvVars: env, CPUMillis: src.CPUMillis, MemoryBytes: src.MemoryBytes,

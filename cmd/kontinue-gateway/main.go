@@ -42,7 +42,7 @@ func main() {
 		catalog = store.NewMemoryRuntimeCatalog()
 	}
 
-	gw := gateway.NewGateway(gateway.Config{
+	gw := gateway.NewGateway(gateway.Config{TraceToken: os.Getenv("KONTINUE_TRACE_TOKEN"),
 		Catalog:      catalog,
 		APIServerURL: *apiURL,
 		BaseDomain:   *baseDomain,

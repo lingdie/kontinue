@@ -9,7 +9,7 @@ Walks through the complete AI Agent Sandbox lifecycle against a live Kontinue cl
   4. Background Web App + Port Proxy (Host: 8000-<sandboxId>.sandbox.local)
   5. 1-to-K Live Stateful Fork       (POST /v1/sandboxes/{id}/fork)
   6. 1-to-1 Suspend (Scale-to-Zero)  (POST /v1/sandboxes/{id}/suspend)
-  7. Traffic-Triggered Auto-Resume   (GET via Gateway wakes background server in ~40ms!)
+  7. Traffic-Triggered Auto-Resume   (GET via Gateway wakes the background server)
   8. Teardown & Cleanup              (DELETE /v1/sandboxes/{id})
 """
 
@@ -27,6 +27,8 @@ GATEWAY_BASE = os.environ.get("KONTINUE_GATEWAY_URL", "http://127.0.0.1:18080")
 
 def http_call(method: str, url: str, body=None, headers=None):
     hdrs = dict(headers or {})
+    if url.startswith(API_BASE.rstrip("/") + "/") and os.environ.get("KONTINUE_TENANT_TOKEN"):
+        hdrs["Authorization"] = "Bearer " + os.environ["KONTINUE_TENANT_TOKEN"]
     data = None
     if body is not None:
         if isinstance(body, (dict, list)):
@@ -64,7 +66,7 @@ def main():
         f"{API_BASE}/v1/templates",
         body={
             "name": "agent-python-web-demo",
-            "baseImage": "docker.io/kontinue/python-agent:dev",
+            "baseImage": os.environ.get("BASE_IMAGE", "docker.io/kontinue/python-agent:dev"),
             "warmupScript": (
                 "python3 -c 'import json; "
                 "open(\"/root/golden_env.json\", \"w\").write(json.dumps({\"framework\": \"kontinue\", \"prewarmed\": True}))'"
@@ -101,7 +103,6 @@ def main():
     token = sbx["accessToken"]
     print(f"  Clone Latency    : {ms:.1f} ms (HTTP {status}) | X-Trace-ID: {trace_id}")
     print(f"  Sandbox ID       : {sbx_id} (Node={sbx['currentNodeId']}, Carrier={sbx['carrierPodName']})")
-    print(f"  Access Token     : {token[:18]}... (Bootstrap token scrubbed)")
 
     # Retry with same Idempotency-Key -> guaranteed exact replay, no duplicate sandbox!
     _, replay_sbx, _, replay_ms = http_call(
@@ -192,10 +193,11 @@ http.server.HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
     print(f"  Started background Python HTTP server (PID={bg_res['pid']}) on port 8000")
 
     preview_host = f"8000-{sbx_id}.sandbox.local"
+    preview_headers = {"Host": preview_host, "X-Kontinue-Token": token}
     # Wait for Python's http.server module import & socket bind to become ready
     for _ in range(60):
         try:
-            http_call("GET", f"{GATEWAY_BASE}/", headers={"Host": preview_host})
+            http_call("GET", f"{GATEWAY_BASE}/", headers=preview_headers)
             break
         except Exception:
             time.sleep(0.1)
@@ -203,7 +205,7 @@ http.server.HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
     _, web_state, _, web_ms = http_call(
         "GET",
         f"{GATEWAY_BASE}/",
-        headers={"Host": preview_host},
+        headers=preview_headers,
     )
     print(f"  GET http://{preview_host}/ ({web_ms:.1f} ms) -> {web_state} (in-memory hits=2!)")
 
@@ -223,8 +225,9 @@ http.server.HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
     _, fork_a_web, _, _ = http_call(
         "GET",
         f"{GATEWAY_BASE}/",
-        headers={"Host": f"8000-{fork_a['sandboxId']}.sandbox.local"},
+        headers={"Host": f"8000-{fork_a['sandboxId']}.sandbox.local", "X-Kontinue-Token": fork_a["accessToken"]},
     )
+    assert fork_a_web["hits"] == web_state["hits"] + 1
     print(f"  Fork A port 8000 response -> {fork_a_web} (inherited live PID + hits=2 -> 3!)")
 
     # -------------------------------------------------------------------------
@@ -242,9 +245,10 @@ http.server.HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
     _, resumed_web, wake_trace, wake_ms = http_call(
         "GET",
         f"{GATEWAY_BASE}/",
-        headers={"Host": preview_host},
+        headers=preview_headers,
     )
     _, sbx_after, _, _ = http_call("GET", f"{API_BASE}/v1/sandboxes/{sbx_id}")
+    assert resumed_web["hits"] == web_state["hits"] + 1 and sbx_after["executionId"] == sbx["executionId"] + 1
     print(f"  Auto-Resumed & Served HTTP in {wake_ms:.1f} ms! | X-Trace-ID: {wake_trace}")
     print(f"  Web App Response : {resumed_web} (in-memory counter continued 2 -> 3 across hibernation!)")
     print(f"  New ExecutionID  : {sbx_after['executionId']} (New Carrier Pod={sbx_after['carrierPodName']}, New PodIP={sbx_after['podIp']})")
@@ -258,7 +262,7 @@ http.server.HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
         print(f"  Deleted sandbox {target_id}")
 
     ktctl_bin = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "ktctl")
-    if os.path.exists(ktctl_bin):
+    if os.path.exists(ktctl_bin) and os.environ.get("KONTINUE_TRACE_TOKEN"):
         print("\n--- Full Lifecycle Trace Waterfall (ktctl trace) ---")
         out = subprocess.check_output(
             [ktctl_bin, "trace", "--sandbox-id", sbx_id, "--endpoints", f"{GATEWAY_BASE},{API_BASE}"],

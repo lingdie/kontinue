@@ -240,6 +240,13 @@ func (m *MemoryMetadataStore) CreateSandbox(_ context.Context, sbx *SandboxRecor
 	if _, ok := m.sandboxes[sbx.SandboxID]; ok {
 		return ErrSandboxExists
 	}
+	if sbx.CreateKey != "" {
+		for _, existing := range m.sandboxes {
+			if existing.CreateKey == sbx.CreateKey {
+				return ErrSandboxExists
+			}
+		}
+	}
 	m.insertSandbox(sbx)
 	return nil
 }

@@ -3,9 +3,9 @@ package gateway
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -24,6 +24,7 @@ import (
 )
 
 type Config struct {
+	TraceToken   string
 	Catalog      store.RuntimeCatalog
 	APIServerURL string
 	BaseDomain   string
@@ -70,7 +71,7 @@ func (g *Gateway) Handler() http.Handler {
 		_, _ = w.Write([]byte("ok"))
 	})
 	if g.cfg.Recorder != nil {
-		mux.HandleFunc(protocol.PathDebugTraces, g.cfg.Recorder.Handler())
+		mux.HandleFunc(protocol.PathDebugTraces, g.cfg.Recorder.OperatorHandler(g.cfg.TraceToken))
 	}
 	mux.HandleFunc("/", g.handleProxy)
 	return telemetry.HTTPMiddleware("kontinue-gateway", mux)
@@ -99,15 +100,35 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	token := r.Header.Get(protocol.HeaderKontinueToken)
+	if token == "" {
+		http.Error(w, "sandbox credential required", http.StatusUnauthorized)
+		return
+	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	requestID := rand.Text()
 	route, err := g.cfg.Catalog.AdmitRoute(ctx, sandboxID, requestID)
 	if errors.Is(err, store.ErrNotFound) {
 		// Auto-Resume path: coalesce concurrent requests for this suspended sandbox into ONE wakeup flight!
-		if err = g.autoResumeSingleflight(ctx, sandboxID); err == nil {
+		if err = g.autoResumeSingleflight(ctx, sandboxID, token); err == nil {
 			route, err = g.cfg.Catalog.AdmitRoute(ctx, sandboxID, requestID)
 		}
+	}
+	if err == nil {
+		if route.AccessDigest == "" {
+			// Routes published by earlier workers require a metadata lookup.
+			err = g.gatewayAction(ctx, sandboxID, token, "authorize")
+		} else if subtle.ConstantTimeCompare([]byte(route.AccessDigest), []byte(protocol.AccessDigest(token))) != 1 {
+			err = errAccessDenied
+		}
+		if err != nil {
+			_ = g.cfg.Catalog.FinishAdmission(ctx, sandboxID, requestID)
+		}
+	}
+	if errors.Is(err, errAccessDenied) {
+		http.Error(w, "invalid sandbox credential", http.StatusUnauthorized)
+		return
 	}
 	if err != nil {
 		w.Header().Set("Retry-After", "2")
@@ -137,6 +158,9 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 			outReq.URL.Scheme = targetURL.Scheme
 			outReq.URL.Host = targetURL.Host
 			outReq.Host = targetURL.Host
+			if targetPort != protocol.DefaultKtdPort {
+				outReq.Header.Del(protocol.HeaderKontinueToken)
+			}
 		},
 		Transport: g.transport,
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, pErr error) {
@@ -166,37 +190,46 @@ func (g *Gateway) renewAdmission(ctx context.Context, cancel context.CancelFunc,
 	}
 }
 
-func (g *Gateway) autoResumeSingleflight(callerCtx context.Context, sandboxID string) error {
+func (g *Gateway) autoResumeSingleflight(callerCtx context.Context, sandboxID, token string) error {
 	ctx, span := telemetry.StartSpan(callerCtx, "kontinue-gateway", "gateway.auto_resume_singleflight",
 		attribute.String(telemetry.AttrSandboxID, sandboxID),
 	)
 	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
-	_, err, shared := g.resumeSF.Do(sandboxID, func() (any, error) {
+	_, err, shared := g.resumeSF.Do(sandboxID+"/"+protocol.AccessDigest(token), func() (any, error) {
 		// Detach from a single impatient caller cancellation so sibling callers in the flight still succeed.
 		detachedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 
-		resumeURL := fmt.Sprintf("%s/v1/sandboxes/%s/resume", strings.TrimRight(g.cfg.APIServerURL, "/"), sandboxID)
-		req, rErr := http.NewRequestWithContext(detachedCtx, http.MethodPost, resumeURL, nil)
-		if rErr != nil {
-			return nil, rErr
-		}
-		resp, doErr := g.httpClient.Do(req)
-		if doErr != nil {
-			return nil, doErr
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			return nil, fmt.Errorf("apiserver resume status %d: %s", resp.StatusCode, string(msg))
-		}
-		return nil, nil
+		return nil, g.gatewayAction(detachedCtx, sandboxID, token, "resume")
 	})
 	span.SetAttributes(attribute.Bool("singleflight.shared", shared))
 	retErr = err
 	return err
+}
+
+var errAccessDenied = errors.New("invalid sandbox credential")
+
+func (g *Gateway) gatewayAction(ctx context.Context, id, token, action string) error {
+	endpoint := fmt.Sprintf("%s/internal/gateway/sandboxes/%s/%s", strings.TrimRight(g.cfg.APIServerURL, "/"), url.PathEscape(id), action)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(protocol.HeaderKontinueToken, token)
+	resp, err := g.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound {
+		return errAccessDenied
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("sandbox %s returned status %d", action, resp.StatusCode)
+	}
+	return nil
 }
 
 func (g *Gateway) resolveTarget(r *http.Request) (sandboxID string, port int) {

@@ -81,6 +81,7 @@ func (s *Server) advanceActivation(ctx context.Context, sb *store.SandboxRecord)
 	}
 	route := protocol.RouteRecord{NodeID: sb.CurrentNodeID, NodeIP: p.Slot.NodeIP, NodeGRPCAddr: p.Slot.NodeGRPCAddr, SlotID: sb.CurrentSlotID,
 		SandboxID: sb.SandboxID, ExecutionID: sb.ExecutionID, LifecycleID: sb.LifecycleID, CarrierPodName: sb.CarrierPodName, PodNamespace: sb.CarrierPodNamespace, PodIP: sb.PodIP, StartedAt: time.Now().UTC()}
+	route.AccessDigest = protocol.AccessDigest(sb.AccessToken)
 	route.OwnerKey = store.OwnerKey(route)
 	if err := s.cfg.Catalog.PublishRoute(ctx, route); err != nil {
 		return nil, err

@@ -85,6 +85,9 @@ func CollectAndMergeTraces(ctx context.Context, endpoints []string, traceID, san
 		if err != nil {
 			continue
 		}
+		if key := os.Getenv("KONTINUE_TRACE_TOKEN"); key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			continue
@@ -208,6 +211,9 @@ func runSandboxCmd(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "request error: %v\n", err)
 		os.Exit(1)
+	}
+	if key := os.Getenv("KONTINUE_TENANT_TOKEN"); action != "exec" && key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)

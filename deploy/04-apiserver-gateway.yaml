@@ -20,6 +20,7 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - "--listen=:8081"
+            - "--tenant-keys-file=/etc/kontinue/auth/tenants.json"
             - "--carrier-namespace=kontinue-sandboxes"
             - "--carrier-image=kontinue/carrier:dev"
             - "--min-idle-slots=6"
@@ -27,6 +28,11 @@ spec:
             - "--cold-burst-extra=0"
             - "--local-cas-fallback=/var/lib/kontinue-arena/remote-cas"
           env:
+            - name: KONTINUE_TRACE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kontinue-api-credentials
+                  key: trace-token
             - name: POSTGRES_DSN
               value: "postgres://kontinue:kontinue@kontinue-postgres.kontinue-system.svc.cluster.local:5432/kontinue?sslmode=disable"
             - name: REDIS_ADDR
@@ -36,9 +42,18 @@ spec:
           ports:
             - containerPort: 8081
           volumeMounts:
+            - name: tenant-keys
+              mountPath: /etc/kontinue/auth
+              readOnly: true
             - name: shared-cas
               mountPath: /var/lib/kontinue-arena/remote-cas
       volumes:
+        - name: tenant-keys
+          secret:
+            secretName: kontinue-api-credentials
+            items:
+              - key: tenants.json
+                path: tenants.json
         - name: shared-cas
           hostPath:
             path: /tmp/kontinue-kind-shared-cas
@@ -78,6 +93,11 @@ spec:
           image: kontinue/kontinue-gateway:dev
           imagePullPolicy: IfNotPresent
           env:
+            - name: KONTINUE_TRACE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kontinue-api-credentials
+                  key: trace-token
             - name: KONTINUE_APISERVER_URL
               value: "http://kontinue-apiserver.kontinue-system.svc.cluster.local:8081"
             - name: REDIS_ADDR

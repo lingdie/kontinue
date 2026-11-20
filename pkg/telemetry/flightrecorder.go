@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"slices"
@@ -174,6 +175,21 @@ func (f *FlightRecorder) Query(traceID, sandboxID, snapshotID string, errorsOnly
 		return a.StartTime.Compare(b.StartTime)
 	})
 	return matched
+}
+
+// OperatorHandler protects traces across tenants on administrative endpoints.
+func (f *FlightRecorder) OperatorHandler(credential string) http.HandlerFunc {
+	handler := f.Handler()
+	if credential == "" {
+		return handler
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+credential)) != 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		handler(w, r)
+	}
 }
 
 func (f *FlightRecorder) Handler() http.HandlerFunc {

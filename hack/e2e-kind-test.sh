@@ -6,6 +6,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API_URL="${API_URL:-http://127.0.0.1:18081}"
 GW_URL="${GW_URL:-http://127.0.0.1:18080}"
 
+if [[ -z "${KONTINUE_TENANT_TOKEN:-}" ]]; then
+  KONTINUE_TENANT_TOKEN="$(kubectl -n kontinue-system get secret kontinue-api-credentials -o json | python3 -c 'import base64,json,sys; print(json.loads(base64.b64decode(json.load(sys.stdin)["data"]["tenants.json"]))["local"])')"
+fi
+if [[ -z "${KONTINUE_TRACE_TOKEN:-}" ]]; then
+  KONTINUE_TRACE_TOKEN="$(kubectl -n kontinue-system get secret kontinue-api-credentials -o json | python3 -c 'import base64,json,sys; print(base64.b64decode(json.load(sys.stdin)["data"]["trace-token"]).decode())')"
+fi
+export KONTINUE_TRACE_TOKEN
+api_curl() { curl -H "Authorization: Bearer ${KONTINUE_TENANT_TOKEN}" "$@"; }
+
 echo "==> [Step 0] Waiting for Carrier Pod pool to warm up in kontinue-sandboxes..."
 for i in $(seq 1 45); do
   READY_COUNT="$(kubectl -n kontinue-sandboxes get pods --no-headers 2>/dev/null | grep -c Running || true)"
@@ -19,12 +28,13 @@ kubectl -n kontinue-sandboxes get pods -o wide
 
 echo ""
 echo "==> [Step 1] Building Golden Memory Template (Python3 + Pre-baked state via Kubelet :10250/checkpoint)..."
-TPL_JSON="$(curl -fsS -X POST "${API_URL}/v1/templates" \
+export BASE_IMAGE="${BASE_IMAGE:-docker.io/kontinue/python-agent:dev}"
+TPL_JSON="$(api_curl -fsS -X POST "${API_URL}/v1/templates" \
   -H "Content-Type: application/json" \
-  --data-binary @- <<'JSON'
+  --data-binary @- <<JSON
 {
   "name": "python-agent-golden",
-  "baseImage": "docker.io/kontinue/python-agent:dev",
+  "baseImage": "${BASE_IMAGE}",
   "warmupScript": "python3 -c 'import json; open(\"/root/baked_state.json\", \"w\").write(json.dumps({\"baked\": True, \"python\": True}))'",
   "pinInL1Tmpfs": true,
   "traceHotPages": true
@@ -39,7 +49,7 @@ echo "  -> Golden Template Ready: templateId=${TPL_ID}, goldenSnapshotId=${SNAP_
 echo ""
 echo "==> [Step 2] Fast 1-to-N Sandbox Clone from Golden Memory Snapshot (0 K8s Pod Creation on Hot Path!)..."
 T0="$(python3 -c 'import time; print(int(time.time()*1000))')"
-SBX_JSON="$(curl -fsS -X POST "${API_URL}/v1/sandboxes" \
+SBX_JSON="$(api_curl -fsS -X POST "${API_URL}/v1/sandboxes" \
   -H "Content-Type: application/json" \
   -d "{
     \"templateId\": \"${TPL_ID}\",
@@ -47,7 +57,7 @@ SBX_JSON="$(curl -fsS -X POST "${API_URL}/v1/sandboxes" \
     \"idleTimeoutSeconds\": 120
   }")"
 T1="$(python3 -c 'import time; print(int(time.time()*1000))')"
-echo "  -> Cloned Sandbox in $((T1 - T0)) ms! Response: ${SBX_JSON}"
+echo "  -> Cloned Sandbox in $((T1 - T0)) ms! sandbox ready"
 
 SBX_ID="$(echo "${SBX_JSON}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["sandboxId"])')"
 TOKEN="$(echo "${SBX_JSON}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["accessToken"])')"
@@ -65,11 +75,11 @@ EXEC1="$(curl -fsS -D /tmp/kt_hdrs -X POST "${GW_URL}/v1/process/exec" \
 JSON
 )"
 TRACE_ID="$(grep -i '^X-Trace-ID:' /tmp/kt_hdrs | awk '{print $2}' | tr -d '\r')"
-echo "  Exec Result (X-Trace-ID=${TRACE_ID}): ${EXEC1}"
+echo "  Exec completed (X-Trace-ID=${TRACE_ID})"
 
 echo ""
 echo "==> [Step 4] Live 1-to-K Stateful Fork (spawning 2 parallel branch sandboxes)..."
-FORK_JSON="$(curl -fsS -X POST "${API_URL}/v1/sandboxes/${SBX_ID}/fork" \
+FORK_JSON="$(api_curl -fsS -X POST "${API_URL}/v1/sandboxes/${SBX_ID}/fork" \
   -H "Content-Type: application/json" \
   -d '{"count": 2}')"
 FORK1_ID="$(echo "${FORK_JSON}" | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["sandboxId"])')"
@@ -83,7 +93,7 @@ echo "  -> Forked Sandbox (${FORK1_ID}) inherited pre-fork state: ${FORK_EXEC}"
 
 echo ""
 echo "==> [Step 5] 1-to-1 Suspend (Scale-to-Zero via Kubelet /checkpoint + 2MiB Blake3 Incremental Diff)..."
-SUSP_JSON="$(curl -fsS -X POST "${API_URL}/v1/sandboxes/${SBX_ID}/suspend")"
+SUSP_JSON="$(api_curl -fsS -X POST "${API_URL}/v1/sandboxes/${SBX_ID}/suspend")"
 echo "  Suspend Snapshot: ${SUSP_JSON}"
 
 echo ""

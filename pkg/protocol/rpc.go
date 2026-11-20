@@ -41,6 +41,7 @@ type CarrierSlot struct {
 
 // RouteRecord is stored at kt:route:{sandbox_id} in Redis, guarded by Lua ExecutionID fencing.
 type RouteRecord struct {
+	AccessDigest   string    `json:"accessDigest,omitempty"`
 	OwnerKey       string    `json:"ownerKey,omitempty"`
 	SandboxID      string    `json:"sandboxId"`
 	ExecutionID    int64     `json:"executionId"`

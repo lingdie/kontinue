@@ -1,6 +1,18 @@
 package protocol
 
-import "strings"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+)
+
+func AccessDigest(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
 
 const (
 	// RuntimeClassName is the Kubernetes RuntimeClass backed by kontinue-runsc.

@@ -147,6 +147,7 @@ kubectl wait --for=condition=Ready nodes --all --timeout=180s
 
 echo "==> [7/7] Applying Kontinue Kubernetes manifests..."
 kubectl apply -f "${ROOT_DIR}/deploy/00-namespace-rbac.yaml"
+"${ROOT_DIR}/hack/ensure-kind-credentials.sh"
 kubectl apply -f "${ROOT_DIR}/deploy/01-runtimeclass.yaml"
 kubectl apply -f "${ROOT_DIR}/deploy/02-infra-dev.yaml"
 
