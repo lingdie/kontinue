@@ -609,24 +609,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 		return nil, err
 	}
 	if sbx.State == store.SandboxStateRunning {
-		if _, err := s.cfg.Catalog.GetRoute(ctx, sandboxID); errors.Is(err, store.ErrNotFound) {
-			r, err := s.routeForExecution(ctx, sbx)
-			if err != nil {
-				return nil, err
-			}
-			health, err := s.ktdClient.Health(ctx, sbx.PodIP, sbx.AccessToken)
-			if err != nil {
-				return nil, err
-			}
-			if health.SandboxID != sbx.SandboxID || health.ExecutionID != sbx.ExecutionID || !health.Healthy || health.Frozen {
-				return nil, store.ErrStaleExecutionFence
-			}
-			r.AccessDigest = protocol.AccessDigest(sbx.AccessToken)
-			r.OwnerKey = store.OwnerKey(*r)
-			if err := s.cfg.Catalog.PublishRoute(ctx, *r); err != nil {
-				return nil, err
-			}
-		} else if err != nil {
+		if err := s.ensureRunningRoute(ctx, sbx); err != nil {
 			return nil, err
 		}
 		return sbx, nil
@@ -649,6 +632,28 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 		return nil, err
 	}
 	return s.advanceActivation(ctx, sbx, lock)
+}
+
+// ensureRunningRoute repairs a missing route for a verified RUNNING record
+// while the caller holds the sandbox lifecycle lock.
+func (s *Server) ensureRunningRoute(ctx context.Context, sbx *store.SandboxRecord) error {
+	if _, err := s.cfg.Catalog.GetRoute(ctx, sbx.SandboxID); !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	r, err := s.routeForExecution(ctx, sbx)
+	if err != nil {
+		return err
+	}
+	health, err := s.ktdClient.Health(ctx, sbx.PodIP, sbx.AccessToken)
+	if err != nil {
+		return err
+	}
+	if health.SandboxID != sbx.SandboxID || health.ExecutionID != sbx.ExecutionID || (health.LifecycleID != "" && health.LifecycleID != sbx.LifecycleID) || !health.Healthy || health.Frozen {
+		return store.ErrStaleExecutionFence
+	}
+	r.AccessDigest = protocol.AccessDigest(sbx.AccessToken)
+	r.OwnerKey = store.OwnerKey(*r)
+	return s.cfg.Catalog.PublishRoute(ctx, *r)
 }
 
 func (s *Server) routeForExecution(ctx context.Context, sbx *store.SandboxRecord) (*protocol.RouteRecord, error) {
@@ -840,15 +845,16 @@ func (s *Server) reconcileSandbox(ctx context.Context, observed *store.SandboxRe
 	if err != nil {
 		return false
 	}
-	if report.State == store.OwnerReady {
-		if observed.State == store.SandboxStateRunning {
-			if _, err := s.cfg.Catalog.GetRoute(ctx, observed.SandboxID); errors.Is(err, store.ErrNotFound) {
-				_, _ = s.ResumeSandbox(ctx, observed.SandboxID)
-			}
+	switch report.State {
+	case store.OwnerReady:
+		if observed.State != store.SandboxStateRunning {
+			return false
 		}
-		return false
-	}
-	if report.State != store.OwnerFailed {
+		if _, err := s.cfg.Catalog.GetRoute(ctx, observed.SandboxID); !errors.Is(err, store.ErrNotFound) {
+			return false
+		}
+	case store.OwnerFailed:
+	default:
 		return true
 	}
 	unlock, err := s.lockExecution(ctx, observed.SandboxID)
@@ -859,6 +865,12 @@ func (s *Server) reconcileSandbox(ctx context.Context, observed *store.SandboxRe
 	sb, err := s.cfg.Meta.GetSandbox(ctx, observed.SandboxID)
 	if err != nil || sb.ExecutionID != r.ExecutionID || sb.LifecycleID != r.LifecycleID || sb.CurrentSlotID != r.SlotID || sb.CurrentNodeID != r.NodeID || sb.State != observed.State {
 		return true
+	}
+	if report.State == store.OwnerReady {
+		if err := s.ensureRunningRoute(ctx, sb); err != nil {
+			log.Printf("repair route for %s: %v", sb.SandboxID, err)
+		}
+		return false
 	}
 	if sb.State == store.SandboxStateSuspending && sb.PendingSnapshotID != "" {
 		// A snapshot committed before the crash can still finish its normal release.
