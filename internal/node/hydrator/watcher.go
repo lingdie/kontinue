@@ -15,6 +15,7 @@ import (
 )
 
 type WatcherConfig struct {
+	IsClaimed    func(string) bool
 	NodeID       string
 	NodeIP       string
 	NodeGRPCAddr string
@@ -88,7 +89,7 @@ func (w *CarrierPodWatcher) syncOnce(ctx context.Context) {
 		w.mu.Lock()
 		_, alreadySeen := w.seen[sb.Id]
 		w.mu.Unlock()
-		if alreadySeen {
+		if alreadySeen || (w.cfg.IsClaimed != nil && w.cfg.IsClaimed("slot-"+sb.Metadata.Name)) {
 			continue
 		}
 

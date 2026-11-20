@@ -97,7 +97,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("arena manager: %v", err)
 	}
-	defer arenaMgr.Close()
+	defer arenaMgr.Shutdown()
 
 	criConn, err := grpc.NewClient("unix://"+*criSock, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -131,14 +131,10 @@ func main() {
 		NodeGRPCAddr: advertiseGRPC,
 	})
 	svc.SetCarrierWatcher(watcher)
-	watcher.Start(ctx)
-
-	// Boot-time self-heal: drop orphan ArenaFS mounts / stale runsc sandboxes left by prior crashes.
-	if n, err := arenaMgr.HealOrphans(ctx, *runscWrapper); err != nil {
-		log.Printf("kontinued orphan heal warning: %v", err)
-	} else if n > 0 {
-		log.Printf("kontinued healed %d orphan arena/runsc artifacts on boot", n)
+	if err := svc.Recover(ctx); err != nil {
+		log.Fatalf("recover sandbox ownership: %v", err)
 	}
+	watcher.Start(ctx)
 
 	grpcLis, err := net.Listen("tcp", *grpcListen)
 	if err != nil {

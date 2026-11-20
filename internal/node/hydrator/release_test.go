@@ -25,7 +25,7 @@ func TestReleaseOnlyStopsTheClaimedExecution(t *testing.T) {
 	routes := store.NewMemoryRuntimeCatalog()
 	d := &recordingDriver{}
 	s := NewService(ServiceConfig{Driver: d, Routes: routes, ScratchDir: t.TempDir()})
-	live := &activeSlotState{sandboxID: "session", executionID: 2, slot: protocol.CarrierSlot{SlotID: "current"}, containerID: "live"}
+	live := &activeSlotState{ownership: ownership{SandboxID: "session", ExecutionID: 2, Slot: protocol.CarrierSlot{SlotID: "current"}, ContainerID: "live"}}
 	s.activeSlots["current"] = live
 	s.byContainer["live"] = live
 	if err := routes.PublishRoute(ctx, protocol.RouteRecord{SandboxID: "session", SlotID: "current", ExecutionID: 2}); err != nil {

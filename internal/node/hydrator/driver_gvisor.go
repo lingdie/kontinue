@@ -2,7 +2,6 @@ package hydrator
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
 	"strings"
 	"sync"
 
@@ -114,10 +114,24 @@ func (d *GVisorSandboxDriver) SwapAndStartSandboxContainer(ctx context.Context, 
 	}
 
 	// Each attempt owns its own bundle and cgroup, even if a slot is reused.
-	cid := "kt-" + rand.Text()
+	cid := opts.ContainerID
+	if cid == "" || filepath.Base(cid) != cid || !strings.HasPrefix(cid, "kt-") {
+		return "", "", fmt.Errorf("invalid runsc instance ID")
+	}
 	bundleDir := filepath.Join(d.cfg.BundlesDir, cid)
-	_ = os.RemoveAll(bundleDir)
-	if err := os.MkdirAll(bundleDir, 0o700); err != nil {
+	if err := os.Mkdir(bundleDir, 0o700); err != nil {
+		return "", "", err
+	}
+
+	// The wrapper strips control-plane annotations before runsc compares OCI
+	// specs during restore. Keep ownership outside the checkpointed spec.
+	instance := bundleIdentity{ContainerID: cid, SlotID: opts.Slot.SlotID, PodUID: opts.Slot.PodUID,
+		SandboxID: opts.SandboxID, ExecutionID: opts.ExecutionID, LifecycleID: opts.LifecycleID, ViewPath: opts.RestoreViewDir}
+	rawOwner, err := json.Marshal(instance)
+	if err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "owner.json"), rawOwner, 0600); err != nil {
 		return "", "", err
 	}
 

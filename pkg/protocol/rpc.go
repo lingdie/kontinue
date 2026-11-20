@@ -73,6 +73,8 @@ type NodeHeartbeat struct {
 // --- NodeControlService RPC messages (apiserver / cri-shim -> kontinued) ---
 
 type PrepareCheckpointRequest struct {
+	ExecutionID      int64        `json:"executionId,omitempty"`
+	LifecycleID      string       `json:"lifecycleId,omitempty"`
 	SandboxID        string       `json:"sandboxId"`
 	TemplateID       string       `json:"templateId,omitempty"`
 	BaseImage        string       `json:"baseImage"`

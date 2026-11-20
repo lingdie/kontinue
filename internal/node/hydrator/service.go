@@ -34,6 +34,9 @@ type RuntimeDriver interface {
 }
 
 type SwapContainerOptions struct {
+	ContainerID    string
+	ExecutionID    int64
+	LifecycleID    string
 	Slot           protocol.CarrierSlot
 	SandboxID      string
 	BaseImage      string
@@ -52,14 +55,9 @@ type RoutePublisher interface {
 }
 
 type activeSlotState struct {
-	releaseMu      sync.Mutex
-	slot           protocol.CarrierSlot
-	sandboxID      string
-	executionID    int64
-	containerID    string
-	ktdEndpoint    string
-	viewPath       string
-	bootstrapToken string
+	restored  bool
+	releaseMu sync.Mutex
+	ownership
 }
 
 type ServiceConfig struct {
@@ -79,10 +77,11 @@ type ServiceConfig struct {
 
 // Service implements protocol.NodeControlServer on each worker node (kontinued).
 type Service struct {
-	cfg ServiceConfig
+	cfg     ServiceConfig
+	journal ownershipJournal
 
 	mu          sync.Mutex
-	pendingCkpt map[string]*protocol.PrepareCheckpointRequest // keyed by podNamespace/podName and slotID
+	pendingCkpt map[string]*protocol.PrepareCheckpointRequest // keyed by verified runtime container ID
 	activeSlots map[string]*activeSlotState                   // keyed by slotID
 	byContainer map[string]*activeSlotState                   // keyed by activeContainerID
 	results     map[string]*protocol.ExecuteCheckpointResponse
@@ -98,6 +97,7 @@ func NewService(cfg ServiceConfig) *Service {
 	_ = os.MkdirAll(cfg.ScratchDir, 0o700)
 	return &Service{
 		cfg:         cfg,
+		journal:     ownershipJournal(filepath.Join(cfg.ScratchDir, "ownership")),
 		pendingCkpt: make(map[string]*protocol.PrepareCheckpointRequest),
 		activeSlots: make(map[string]*activeSlotState),
 		byContainer: make(map[string]*activeSlotState),
@@ -119,14 +119,19 @@ func (s *Service) PrepareCheckpoint(ctx context.Context, req *protocol.PrepareCh
 	defer telemetry.EndSpan(span, nil)
 
 	s.mu.Lock()
-	if req.PodNamespace != "" && req.PodName != "" {
-		s.pendingCkpt[req.PodNamespace+"/"+req.PodName] = req
-	}
-	if req.SlotID != "" {
-		s.pendingCkpt["slot:"+req.SlotID] = req
-	}
-	s.pendingCkpt["default"] = req
+	st := s.activeSlots[req.SlotID]
 	s.mu.Unlock()
+	if st == nil {
+		return nil, fmt.Errorf("unknown slot %s", req.SlotID)
+	}
+	st.releaseMu.Lock()
+	defer st.releaseMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byContainer[st.ContainerID] != st || st.Phase != activeExecution || st.SandboxID != req.SandboxID || (req.ExecutionID != 0 && req.ExecutionID != st.ExecutionID) || (req.LifecycleID != "" && req.LifecycleID != st.LifecycleID) {
+		return nil, store.ErrStaleExecutionFence
+	}
+	s.pendingCkpt[st.ContainerID] = req
 	return &protocol.PrepareCheckpointResponse{Accepted: true}, nil
 }
 
@@ -140,17 +145,19 @@ func (s *Service) ExecuteCheckpoint(ctx context.Context, req *protocol.ExecuteCh
 
 	s.mu.Lock()
 	active := s.byContainer[req.ContainerID]
-	var prep *protocol.PrepareCheckpointRequest
-	if req.PodNamespace != "" && req.PodName != "" {
-		prep = s.pendingCkpt[req.PodNamespace+"/"+req.PodName]
-	}
-	if prep == nil && active != nil {
-		prep = s.pendingCkpt["slot:"+active.slot.SlotID]
-	}
-	if prep == nil {
-		prep = s.pendingCkpt["default"]
-	}
 	s.mu.Unlock()
+	if active == nil {
+		return nil, fmt.Errorf("unowned checkpoint container %s", req.ContainerID)
+	}
+	active.releaseMu.Lock()
+	defer active.releaseMu.Unlock()
+	s.mu.Lock()
+	prep := s.pendingCkpt[req.ContainerID]
+	current := s.byContainer[req.ContainerID] == active && active.Phase == activeExecution
+	s.mu.Unlock()
+	if !current {
+		return nil, store.ErrStaleExecutionFence
+	}
 
 	if prep == nil {
 		retErr = fmt.Errorf("no prepared checkpoint metadata found for container %s (%s/%s)", req.ContainerID, req.PodNamespace, req.PodName)
@@ -167,11 +174,11 @@ func (s *Service) ExecuteCheckpoint(ctx context.Context, req *protocol.ExecuteCh
 	}
 	bootstrapTok := prep.BootstrapToken
 	if active != nil {
-		if active.ktdEndpoint != "" {
-			ktdAddr = active.ktdEndpoint
+		if active.KtdEndpoint != "" {
+			ktdAddr = active.KtdEndpoint
 		}
 		if bootstrapTok == "" {
-			bootstrapTok = active.bootstrapToken
+			bootstrapTok = active.BootstrapToken
 		}
 	}
 
@@ -260,14 +267,42 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 	}
 	bootstrapToken := req.BootstrapToken
 
+	if req.Slot.SlotID == "" || req.SandboxID == "" || req.ExecutionID <= 0 {
+		return nil, fmt.Errorf("hydrate requires slot, sandbox and execution IDs")
+	}
+	st := &activeSlotState{ownership: ownership{
+		Version: 1, Phase: preparing, Slot: req.Slot, SandboxID: req.SandboxID,
+		ExecutionID: req.ExecutionID, LifecycleID: req.LifecycleID, ContainerID: "kt-" + rand.Text(),
+	}}
 	if req.SnapshotID != "" && restoreMode == protocol.RestoreModeMemory {
-		viewID := "view-" + rand.Text()
+		st.ViewID = "view-" + rand.Text()
+	}
+	st.releaseMu.Lock()
+	defer st.releaseMu.Unlock()
+	s.mu.Lock()
+	if s.activeSlots[req.Slot.SlotID] != nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("slot %s is already claimed", req.Slot.SlotID)
+	}
+	if err := s.journal.write(st.ownership, true); err != nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("claim slot %s: %w", req.Slot.SlotID, err)
+	}
+	s.activeSlots[req.Slot.SlotID] = st
+	s.mu.Unlock()
+	if req.SnapshotID != "" && restoreMode == protocol.RestoreModeMemory {
+		viewID := st.ViewID
 		var mf *protocol.SnapshotManifest
 		var err error
 		viewDir, arenaTier, mf, err = s.cfg.Arena.PrepareRestoreView(ctx, req.SnapshotID, viewID)
 		if err != nil {
 			retErr = fmt.Errorf("prepare restore view: %w", err)
 			return nil, retErr
+		}
+		st.ViewPath = viewDir
+		st.View, err = s.cfg.Arena.DescribeView(viewDir)
+		if err != nil {
+			return nil, err
 		}
 		if bootstrapToken == "" && mf.BootstrapToken != "" {
 			bootstrapToken = mf.BootstrapToken
@@ -280,7 +315,15 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		bootstrapToken = "kontinue-default-bootstrap-token"
 	}
 
+	st.BootstrapToken = bootstrapToken
+	if err := s.journal.write(st.ownership, false); err != nil {
+		return nil, err
+	}
+
 	newCID, ktdEndpoint, err := s.cfg.Driver.SwapAndStartSandboxContainer(ctx, SwapContainerOptions{
+		ContainerID:    st.ContainerID,
+		ExecutionID:    req.ExecutionID,
+		LifecycleID:    req.LifecycleID,
 		Slot:           req.Slot,
 		SandboxID:      req.SandboxID,
 		BaseImage:      req.BaseImage,
@@ -292,26 +335,21 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		MemoryBytes:    req.MemoryBytes,
 	})
 	if err != nil {
-		if viewDir != "" {
-			_ = s.cfg.Arena.ReleaseView(viewDir)
-		}
 		retErr = fmt.Errorf("swap carrier container: %w", err)
 		return nil, retErr
 	}
 
-	// Notify kontinue-cri-shim so Kubelet PLEG sees expected io.kubernetes.container.hash!
-	s.notifyShimSlotMapping(ctx, crishim.SlotMapping{
-		PodSandboxID:          req.Slot.PodSandboxID,
-		PodNamespace:          req.Slot.PodNamespace,
-		PodName:               req.Slot.PodName,
-		PlaceholderID:         req.Slot.PlaceholderID,
-		ActiveContainerID:     newCID,
-		ExpectedContainerHash: req.Slot.ExpectedContainerHash,
-		LogPath:               req.Slot.LogPath,
-	})
-
+	st.ContainerID = newCID
 	if ktdEndpoint == "" && req.Slot.PodIP != "" {
-		ktdEndpoint = fmt.Sprintf("%s:%d", req.Slot.PodIP, protocol.DefaultKtdPort)
+		ktdEndpoint = net.JoinHostPort(req.Slot.PodIP, fmt.Sprint(protocol.DefaultKtdPort))
+	}
+	st.KtdEndpoint = ktdEndpoint
+	if err := s.journal.write(st.ownership, false); err != nil {
+		return nil, err
+	}
+	// Notify kontinue-cri-shim so Kubelet PLEG sees expected io.kubernetes.container.hash!
+	if err := s.mapSlot(ctx, st); err != nil {
+		return nil, err
 	}
 
 	// Perform E2B-style Expect: 100-continue HeldInit to scrub identity, rotate token, inject tenant secrets, and thaw!
@@ -328,25 +366,15 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		WallClockUnixN: time.Now().UnixNano(),
 		SkipThaw:       req.SkipThaw,
 	}); err != nil {
-		_ = s.cfg.Driver.StopSandboxContainer(ctx, req.Slot, newCID)
-		if viewDir != "" {
-			_ = s.cfg.Arena.ReleaseView(viewDir)
-		}
 		retErr = fmt.Errorf("post-restore HeldInit failed: %w", err)
 		return nil, retErr
 	}
 
-	st := &activeSlotState{
-		slot:           req.Slot,
-		sandboxID:      req.SandboxID,
-		executionID:    req.ExecutionID,
-		containerID:    newCID,
-		ktdEndpoint:    ktdEndpoint,
-		viewPath:       viewDir,
-		bootstrapToken: bootstrapToken,
+	st.Phase = activeExecution
+	if err := s.journal.write(st.ownership, false); err != nil {
+		return nil, err
 	}
 	s.mu.Lock()
-	s.activeSlots[req.Slot.SlotID] = st
 	s.byContainer[newCID] = st
 	s.mu.Unlock()
 
@@ -400,7 +428,7 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	}
 	s.mu.Lock()
 	st := s.activeSlots[req.SlotID]
-	if st == nil || st.sandboxID != req.SandboxID || st.executionID != req.ExecutionID {
+	if st == nil || st.SandboxID != req.SandboxID || st.ExecutionID != req.ExecutionID {
 		s.mu.Unlock()
 		return &protocol.ReleaseSlotResponse{}, nil
 	}
@@ -414,20 +442,42 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	if !current {
 		return &protocol.ReleaseSlotResponse{}, nil
 	}
-	if err := s.cfg.Driver.StopSandboxContainer(ctx, st.slot, st.containerID); err != nil {
-		return nil, err
-	}
-	if st.viewPath != "" {
-		if err := s.cfg.Arena.ReleaseView(st.viewPath); err != nil {
+	if st.restored {
+		inspector, ok := s.cfg.Driver.(runtimeInspector)
+		if !ok {
+			return nil, fmt.Errorf("cannot confirm runtime ownership")
+		}
+		if err := inspector.inspectInstance(ctx, st.ownership); err != nil && !errors.Is(err, errInstanceLost) {
 			return nil, err
 		}
+		if st.ViewID != "" {
+			if err := s.cfg.Arena.AdoptView(st.ViewID, st.ViewPath, st.View); err != nil {
+				return nil, err
+			}
+		}
+	}
+	st.Phase = releasing
+	if err := s.journal.write(st.ownership, false); err != nil {
+		return nil, err
+	}
+	if err := s.cfg.Driver.StopSandboxContainer(ctx, st.Slot, st.ContainerID); err != nil {
+		return nil, err
+	}
+	if st.ViewPath != "" {
+		if err := s.cfg.Arena.ReleaseView(st.ViewPath); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.journal.remove(st.Slot.SlotID); err != nil {
+		return nil, err
 	}
 	s.mu.Lock()
 	if s.activeSlots[req.SlotID] == st {
 		delete(s.activeSlots, req.SlotID)
 	}
-	if s.byContainer[st.containerID] == st {
-		delete(s.byContainer, st.containerID)
+	if s.byContainer[st.ContainerID] == st {
+		delete(s.byContainer, st.ContainerID)
+		delete(s.pendingCkpt, st.ContainerID)
 	}
 	s.mu.Unlock()
 	return &protocol.ReleaseSlotResponse{
@@ -467,6 +517,7 @@ func (s *Service) GetLatestSnapshotResult(_ context.Context, req *protocol.GetLa
 }
 
 func (s *Service) SetCarrierWatcher(w *CarrierPodWatcher) {
+	w.cfg.IsClaimed = func(slotID string) bool { s.mu.Lock(); defer s.mu.Unlock(); return s.activeSlots[slotID] != nil }
 	s.cfg.CarrierWatcher = w
 }
 
@@ -494,11 +545,12 @@ func (s *Service) waitAndHeldInit(ctx context.Context, ktdEndpoint, bootstrapTok
 	return lastErr
 }
 
-func (s *Service) notifyShimSlotMapping(ctx context.Context, sm crishim.SlotMapping) {
+func (s *Service) mapSlot(ctx context.Context, st *activeSlotState) error {
 	if s.cfg.ShimAdminURL == "" {
-		return
+		return nil
 	}
-	raw, _ := json.Marshal(sm)
+	slot := st.Slot
+	raw, _ := json.Marshal(crishim.SlotMapping{PodSandboxID: slot.PodSandboxID, PodNamespace: slot.PodNamespace, PodName: slot.PodName, PlaceholderID: slot.PlaceholderID, ActiveContainerID: st.ContainerID, ExpectedContainerHash: slot.ExpectedContainerHash, LogPath: slot.LogPath})
 	var client *http.Client
 	urlStr := s.cfg.ShimAdminURL + "/v1/shim/map-slot"
 	if filepath.IsAbs(s.cfg.ShimAdminURL) {
@@ -517,12 +569,19 @@ func (s *Service) notifyShimSlotMapping(ctx context.Context, sm crishim.SlotMapp
 		client = &http.Client{Timeout: 2 * time.Second}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, bytes.NewReader(raw))
-	if err == nil {
-		req.Header.Set("Content-Type", "application/json")
-		if resp, doErr := client.Do(req); doErr == nil {
-			_ = resp.Body.Close()
-		}
+	if err != nil {
+		return err
 	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("map carrier with CRI shim: HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func ktdEndpointHost(endpoint, fallbackIP string) string {

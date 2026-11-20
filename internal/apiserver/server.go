@@ -326,6 +326,7 @@ func (s *Server) BuildGoldenTemplate(ctx context.Context, req CreateTemplateRequ
 
 	builderID := "builder-" + tpl.TemplateID
 	bootTok := "boot-" + randHex(12)
+	builderLife := "life-" + randHex(6)
 	warmupTok := "warmup-" + randHex(12)
 
 	hydrateResp, err := nodeClient.HydrateSlot(ctx, &protocol.HydrateSlotRequest{
@@ -333,7 +334,7 @@ func (s *Server) BuildGoldenTemplate(ctx context.Context, req CreateTemplateRequ
 		SandboxID:      builderID,
 		TemplateID:     tpl.TemplateID,
 		ExecutionID:    1,
-		LifecycleID:    "life-" + randHex(6),
+		LifecycleID:    builderLife,
 		BaseImage:      tpl.BaseImage,
 		RestoreMode:    protocol.RestoreModeCold,
 		BootstrapToken: bootTok,
@@ -379,6 +380,8 @@ func (s *Server) BuildGoldenTemplate(ctx context.Context, req CreateTemplateRequ
 	goldenSnapID := "snap-golden-" + randHex(6)
 	if _, err := nodeClient.PrepareCheckpoint(ctx, &protocol.PrepareCheckpointRequest{
 		SandboxID:        builderID,
+		ExecutionID:      1,
+		LifecycleID:      builderLife,
 		TemplateID:       tpl.TemplateID,
 		BaseImage:        tpl.BaseImage,
 		SlotID:           dec.Slot.SlotID,
@@ -719,6 +722,8 @@ func (s *Server) captureSuspend(ctx context.Context, sbx *store.SandboxRecord, r
 	newSnapID := sbx.PendingSnapshotID
 	if _, err := nodeClient.PrepareCheckpoint(ctx, &protocol.PrepareCheckpointRequest{
 		SandboxID:        sandboxID,
+		ExecutionID:      sbx.ExecutionID,
+		LifecycleID:      sbx.LifecycleID,
 		TemplateID:       sbx.TemplateID,
 		BaseImage:        sbx.BaseImage,
 		SlotID:           sbx.CurrentSlotID,
@@ -1003,6 +1008,8 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 		snapID := fmt.Sprintf("snap-fork-%s-%s", sourceSandboxID, randHex(4))
 		if _, err := nodeClient.PrepareCheckpoint(ctx, &protocol.PrepareCheckpointRequest{
 			SandboxID:        sourceSandboxID,
+			ExecutionID:      src.ExecutionID,
+			LifecycleID:      src.LifecycleID,
 			TemplateID:       src.TemplateID,
 			BaseImage:        src.BaseImage,
 			SlotID:           src.CurrentSlotID,

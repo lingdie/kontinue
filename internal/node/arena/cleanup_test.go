@@ -1,7 +1,6 @@
 package arena
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -32,51 +31,41 @@ func TestLazyReaderCloseRemovesStagingDir(t *testing.T) {
 	}
 }
 
-func TestHealOrphansRemovesUntrackedViewsOnly(t *testing.T) {
-	root := t.TempDir()
-	views := filepath.Join(root, "views")
-	cas := filepath.Join(root, "cas")
-	live := filepath.Join(views, "sbx-live-exec-1")
-	stale := filepath.Join(views, "sbx-stale-exec-2")
-	if err := os.MkdirAll(live, 0o700); err != nil {
+func TestRestartAdoptsOnlyOriginalMaterializedView(t *testing.T) {
+	views := t.TempDir()
+	path := filepath.Join(views, "view-one")
+	if err := os.Mkdir(path, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(stale, 0o700); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{protocol.GVisorCheckpointImg, protocol.GVisorPagesMetaImg, protocol.GVisorPagesImg} {
+		if err := os.WriteFile(filepath.Join(path, name), []byte("data"), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.WriteFile(filepath.Join(stale, "checkpoint.img"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
+	newManager := func() *Manager {
+		return &Manager{cfg: ManagerConfig{ViewsDir: views}, activeViews: map[string]ViewCloser{}}
 	}
-	if err := os.MkdirAll(filepath.Join(cas, "staging", "sbx-stale-exec-2"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(cas, "staging", "sbx-live-exec-1"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	m := &Manager{
-		cfg:         ManagerConfig{ViewsDir: views, L2CASDir: cas},
-		activeViews: map[string]ViewCloser{},
-	}
-	m.trackView(live, &plainDirHandle{dir: live})
-
-	n, err := m.HealOrphans(context.Background(), "missing-runsc")
+	m := newManager()
+	m.trackView(path, &plainDirHandle{dir: path})
+	id, err := m.DescribeView(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n < 2 {
-		t.Fatalf("cleaned %d, want view and staging", n)
+	m.Shutdown()
+	next := newManager()
+	if err := next.AdoptView("view-one", path, id); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Fatalf("stale view remains: %v", err)
+	fuse := *id
+	fuse.ArenaFS = true
+	if err := next.AdoptView("view-one", path, &fuse); !errors.Is(err, ErrViewLost) {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(cas, "staging", "sbx-stale-exec-2")); !os.IsNotExist(err) {
-		t.Fatalf("stale staging remains: %v", err)
+	if err := os.Truncate(filepath.Join(path, protocol.GVisorPagesImg), 0); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(live); err != nil {
-		t.Fatalf("live view removed: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(cas, "staging", "sbx-live-exec-1")); err != nil {
-		t.Fatalf("live staging removed: %v", err)
+	if err := newManager().AdoptView("view-one", path, id); !errors.Is(err, ErrViewLost) {
+		t.Fatal(err)
 	}
 }
 

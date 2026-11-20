@@ -630,11 +630,15 @@ func sameU32(a, b []uint32) bool {
 	return true
 }
 
-func (m *Manager) Close() error {
+func (m *Manager) Shutdown() {
 	if m.hookSrv != nil {
 		_ = m.hookSrv.Close()
 	}
 	m.uploadWG.Wait()
+}
+
+func (m *Manager) Close() error {
+	m.Shutdown()
 	m.mu.RLock()
 	paths := make([]string, 0, len(m.activeViews))
 	for path := range m.activeViews {
@@ -646,83 +650,6 @@ func (m *Manager) Close() error {
 		err = errors.Join(err, m.ReleaseView(path))
 	}
 	return err
-}
-
-// HealOrphans removes leftover ArenaFS view directories and best-effort kills stale
-// kontinue-runsc / runsc sandboxes under the default state root after a crash/restart.
-// Views still registered in this process are left mounted.
-// Returns the number of cleaned artifacts.
-func (m *Manager) HealOrphans(ctx context.Context, runscWrapper string) (int, error) {
-	cleaned := 0
-	live := map[string]struct{}{}
-	m.mu.RLock()
-	for path := range m.activeViews {
-		live[path] = struct{}{}
-		live[filepath.Base(path)] = struct{}{}
-	}
-	m.mu.RUnlock()
-
-	if m.cfg.ViewsDir != "" {
-		entries, err := os.ReadDir(m.cfg.ViewsDir)
-		if err == nil {
-			for _, e := range entries {
-				if !e.IsDir() {
-					continue
-				}
-				viewPath := filepath.Join(m.cfg.ViewsDir, e.Name())
-				if _, ok := live[viewPath]; ok {
-					continue
-				}
-				if m.forceRemoveView(ctx, viewPath) {
-					cleaned++
-				}
-			}
-		}
-	}
-	staging := filepath.Join(m.cfg.L2CASDir, "staging")
-	if m.cfg.L2CASDir != "" {
-		entries, err := os.ReadDir(staging)
-		if err == nil {
-			for _, e := range entries {
-				if !e.IsDir() {
-					continue
-				}
-				if _, ok := live[e.Name()]; ok {
-					continue
-				}
-				if os.RemoveAll(filepath.Join(staging, e.Name())) == nil {
-					cleaned++
-				}
-			}
-		}
-	}
-	stateRoot := "/run/kontinue/runsc"
-	if entries, err := os.ReadDir(stateRoot); err == nil {
-		bin := runscWrapper
-		if bin == "" {
-			bin = "kontinue-runsc"
-		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			id := e.Name()
-			_ = exec.CommandContext(ctx, bin, "--root", stateRoot, "kill", id, "9").Run()
-			_ = exec.CommandContext(ctx, bin, "--root", stateRoot, "delete", "--force", id).Run()
-			_ = os.RemoveAll(filepath.Join(stateRoot, id))
-			cleaned++
-		}
-	}
-	return cleaned, nil
-}
-
-func (m *Manager) forceRemoveView(ctx context.Context, viewPath string) bool {
-	_ = exec.CommandContext(ctx, "fusermount", "-uz", viewPath).Run()
-	_ = exec.CommandContext(ctx, "umount", "-l", viewPath).Run()
-	if err := os.RemoveAll(viewPath); err != nil {
-		return false
-	}
-	return true
 }
 
 func (m *Manager) trackView(path string, closer ViewCloser) {
