@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kontinue-minio
+  namespace: kontinue-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kontinue-minio
+  template:
+    metadata:
+      labels:
+        app: kontinue-minio
+    spec:
+      containers:
+        - name: minio
+          image: docker.io/bitnamilegacy/minio:2025.4.22
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MINIO_ROOT_USER
+              value: kontinue
+            - name: MINIO_ROOT_PASSWORD
+              value: kontinue-secret
+            - name: MINIO_DEFAULT_BUCKETS
+              value: kontinue
+          ports:
+            - name: s3
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            initialDelaySeconds: 3
+            periodSeconds: 3
+        - name: bootstrap
+          image: docker.io/bitnamilegacy/minio:2025.4.22
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              until /opt/bitnami/minio-client/bin/mc alias set local http://127.0.0.1:9000 kontinue kontinue-secret; do sleep 1; done
+              /opt/bitnami/minio-client/bin/mc mb -p local/kontinue || true
+              /opt/bitnami/minio-client/bin/mc anonymous set public local/kontinue
+              sleep infinity
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kontinue-minio
+  namespace: kontinue-system
+spec:
+  selector:
+    app: kontinue-minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3

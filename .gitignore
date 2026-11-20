@@ -1,0 +1,26 @@
+# Binaries and build artifacts
+bin/
+dist/
+target/
+*.exe
+*.so
+*.dylib
+
+# Workspace toolchains & caches
+.toolchain/
+.gopath/
+.gocache/
+*.test
+*.out
+coverage.txt
+
+# Local development & runtime sockets/mounts
+.env
+.env.local
+*.sock
+tmp/
+
+# IDE & OS metadata
+.DS_Store
+.idea/
+.vscode/

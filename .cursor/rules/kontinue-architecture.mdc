@@ -1,0 +1,21 @@
+---
+description: Kontinue polyglot architecture invariants, Rust/Go boundaries, and mandatory tracing
+alwaysApply: true
+---
+
+# Kontinue Core Architecture Rules
+
+## Language Split & Zero-FFI Boundary
+- **Rust (`crates/`)** is used strictly for memory-safety, low-RSS, and latency-critical hot-path binaries:
+  - `crates/kt-protocol`: shared wire schemas and W3C `traceparent` flight recorder.
+  - `crates/ktd`: in-sandbox PID 1 daemon (<2MB RSS, zero GC threads inside `pages.img`).
+  - `crates/kontinue-runsc`: sub-millisecond OCI `runsc` wrapper (`RuntimeClass: kontinue-gvisor`).
+  - `crates/kontinue-arena`: SIMD 2MiB zero-page & Blake3 diff chunker (`kontinue-arena-helper`).
+- **Go (`cmd/`, `internal/`, `pkg/`)** is used for control plane, K8s CRI/API integration, DB/Redis, and proxying (`kontinue-apiserver`, `kontinue-gateway`, `kontinued`, `kontinue-cri-shim`, `ktctl`).
+- **NO CGo FFI**: All Go binaries compile with `CGO_ENABLED=0`. Rust and Go components communicate strictly via explicit JSON/HTTP/Unix-Socket/CLI contracts and `TRACEPARENT` env/headers.
+
+## Mandatory Observability & Safety Invariants
+- Every RPC, HTTP handler, and CLI boundary MUST extract/inject W3C `traceparent` and expose `/debug/traces`.
+- Never bake tenant secrets into template `pages.img`; secrets enter only via post-restore `POST /internal/init`.
+- Guard all route mutations and re-initializations with monotonic `ExecutionID` fencing.
+- GPU snapshotting (`cuda-checkpoint`) is deferred to post-MVP; keep hardware fingerprints extensible without coupling core paths to NVIDIA drivers.

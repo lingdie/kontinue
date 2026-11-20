@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kontinue-redis
+  namespace: kontinue-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kontinue-redis
+  template:
+    metadata:
+      labels:
+        app: kontinue-redis
+    spec:
+      containers:
+        - name: redis
+          image: kontinue/redis:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kontinue-redis
+  namespace: kontinue-system
+spec:
+  selector:
+    app: kontinue-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kontinue-postgres
+  namespace: kontinue-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kontinue-postgres
+  template:
+    metadata:
+      labels:
+        app: kontinue-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: kontinue/postgres:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kontinue-postgres
+  namespace: kontinue-system
+spec:
+  selector:
+    app: kontinue-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

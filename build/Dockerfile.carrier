@@ -1,0 +1,12 @@
+# Scratch image with a single statically-linked pause binary for Carrier Pods.
+FROM rust:1.85-alpine AS builder
+RUN apk add --no-cache musl-dev gcc
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p kontinue-carrier
+
+FROM scratch
+COPY --from=builder /workspace/target/release/kontinue-carrier /kontinue-carrier
+USER 65535:65535
+ENTRYPOINT ["/kontinue-carrier"]

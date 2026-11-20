@@ -1,0 +1,15 @@
+FROM alpine:latest
+RUN apk add --no-cache postgresql16 postgresql16-contrib su-exec && \
+    mkdir -p /run/postgresql /var/lib/postgresql/data && \
+    chown -R postgres:postgres /run/postgresql /var/lib/postgresql
+EXPOSE 5432
+CMD ["/bin/sh", "-c", "\
+  if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then \
+    su-exec postgres initdb -D /var/lib/postgresql/data --username=kontinue --pwfile=<(echo kontinue) >/dev/null 2>&1 || su-exec postgres initdb -D /var/lib/postgresql/data -U kontinue; \
+    echo \"host all all 0.0.0.0/0 trust\" >> /var/lib/postgresql/data/pg_hba.conf; \
+    echo \"listen_addresses='*'\" >> /var/lib/postgresql/data/postgresql.conf; \
+    su-exec postgres pg_ctl -D /var/lib/postgresql/data -w start && \
+    su-exec postgres createdb -U kontinue kontinue || true; \
+    su-exec postgres pg_ctl -D /var/lib/postgresql/data -m fast -w stop; \
+  fi && \
+  exec su-exec postgres postgres -D /var/lib/postgresql/data"]

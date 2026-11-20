@@ -1,0 +1,16 @@
+[package]
+name = "ktd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ktd"
+path = "src/main.rs"
+
+[dependencies]
+kt-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

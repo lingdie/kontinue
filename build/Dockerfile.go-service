@@ -1,0 +1,9 @@
+FROM alpine:3.20
+
+ARG BINARY_PATH
+RUN apk add --no-cache ca-certificates util-linux fuse3 iproute2
+
+COPY ${BINARY_PATH} /usr/local/bin/service
+RUN chmod +x /usr/local/bin/service
+
+ENTRYPOINT ["/usr/local/bin/service"]

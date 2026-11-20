@@ -1,0 +1,13 @@
+---
+description: Rust coding, memory safety, and syscall conventions for Kontinue data-plane crates
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Kontinue Rust Standards
+
+- **No Runtime Panics**: Never call `.unwrap()` or `.expect()` on I/O, network, JSON, or user inputs. Propagate typed errors (`Result<T, E>`) with clear context.
+- **Minimal `unsafe`**: Disallow `unsafe` except for audited POSIX/Linux syscalls (`libc::sync`, `libc::sethostname`, `libc::waitpid`). Every `unsafe` block MUST carry a `// SAFETY:` justification comment.
+- **Constant-Time Auth**: Compare `X-Bootstrap-Token` and `X-Kontinue-Token` in constant time; never log token values.
+- **Bounded Memory**: Stream large files (`pages.img`) in fixed 2MiB buffers (`2 * 1024 * 1024` bytes); never read multi-GB files wholly into heap memory.
+- **Cross-Platform Buildability**: Gate Linux-only `/proc`, `cgroup.freeze`, or `sethostname` logic behind `#[cfg(target_os = "linux")]` with clean `#[cfg(not(target_os = "linux"))]` fallbacks so `cargo test` passes on macOS (`aarch64-apple-darwin`) and Linux alike.

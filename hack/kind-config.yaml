@@ -1,0 +1,32 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kontinue-dev
+networking:
+  # Replace kindnet with Cilium (installed by hack/setup-kind-cilium.sh).
+  disableDefaultCNI: true
+  kubeProxyMode: "none"
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 18080
+        protocol: TCP
+      - containerPort: 30081
+        hostPort: 18081
+        protocol: TCP
+  - role: worker
+    labels:
+      kontinue.sh/memory-ckpt-ready: "true"
+    extraMounts:
+      - hostPath: /dev/fuse
+        containerPath: /dev/fuse
+      - hostPath: /tmp/kontinue-kind-shared-cas
+        containerPath: /var/lib/kontinue-arena/remote-cas
+  - role: worker
+    labels:
+      kontinue.sh/memory-ckpt-ready: "true"
+    extraMounts:
+      - hostPath: /dev/fuse
+        containerPath: /dev/fuse
+      - hostPath: /tmp/kontinue-kind-shared-cas
+        containerPath: /var/lib/kontinue-arena/remote-cas

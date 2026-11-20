@@ -1,0 +1,8 @@
+.git
+.gopath
+.gocache
+.toolchain
+target
+bin/*
+!bin/linux-arm64
+!bin/linux-amd64

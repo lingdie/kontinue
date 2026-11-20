@@ -1,0 +1,13 @@
+[package]
+name = "kontinue-runsc"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kontinue-runsc"
+path = "src/main.rs"
+
+[dependencies]
+kt-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kontinued
+  namespace: kontinue-system
+spec:
+  selector:
+    matchLabels:
+      app: kontinued
+  template:
+    metadata:
+      labels:
+        app: kontinued
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kontinue.sh/memory-ckpt-ready: "true"
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kontinue-sandbox
+          effect: NoSchedule
+      containers:
+        - name: kontinued
+          image: kontinue/kontinued:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--grpc-listen=:9090"
+            - "--http-listen=:8082"
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: REDIS_ADDR
+              value: "kontinue-redis.kontinue-system.svc.cluster.local:6379"
+            - name: KONTINUE_HOST_NSENTER
+              value: "true"
+            - name: CAS_HTTP_URL
+              value: "http://kontinue-minio.kontinue-system.svc.cluster.local:9000/kontinue"
+          ports:
+            - name: grpc
+              containerPort: 9090
+            - name: debug-http
+              containerPort: 8082
+          volumeMounts:
+            - name: containerd-sock
+              mountPath: /run/containerd/containerd.sock
+            - name: kontinue-run
+              mountPath: /run/kontinue
+            - name: l1-tmpfs
+              mountPath: /run/kontinue-arena/l1-tmpfs
+            - name: l2-nvme
+              mountPath: /var/lib/kontinue-arena
+              mountPropagation: Bidirectional
+            - name: kubelet-checkpoints
+              mountPath: /var/lib/kubelet/checkpoints
+            - name: host-bin
+              mountPath: /usr/local/bin/kontinue-arena-helper
+            - name: host-runsc
+              mountPath: /usr/local/bin/kontinue-runsc
+            - name: dev-fuse
+              mountPath: /dev/fuse
+      volumes:
+        - name: containerd-sock
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket
+        - name: kontinue-run
+          hostPath:
+            path: /run/kontinue
+            type: DirectoryOrCreate
+        - name: l1-tmpfs
+          hostPath:
+            path: /run/kontinue-arena/l1-tmpfs
+            type: DirectoryOrCreate
+        - name: l2-nvme
+          hostPath:
+            path: /var/lib/kontinue-arena
+            type: DirectoryOrCreate
+        - name: kubelet-checkpoints
+          hostPath:
+            path: /var/lib/kubelet/checkpoints
+            type: DirectoryOrCreate
+        - name: host-bin
+          hostPath:
+            path: /usr/local/bin/kontinue-arena-helper
+            type: File
+        - name: host-runsc
+          hostPath:
+            path: /usr/local/bin/kontinue-runsc
+            type: File
+        - name: dev-fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice

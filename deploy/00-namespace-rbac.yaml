@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kontinue-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kontinue-sandboxes
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kontinue-apiserver
+  namespace: kontinue-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kontinue-apiserver-role
+rules:
+  # Required to invoke native Kubelet POST https://<node>:10250/checkpoint/{ns}/{pod}/{ctr}
+  # (v1.30+ uses nodes/proxy; v1.32+/v1.37 fine-grained Kubelet authZ checks nodes/checkpoint)
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "nodes/checkpoint"]
+    verbs: ["get", "list", "watch", "create"]
+  # Required for background async CarrierPoolReplenisher
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kontinue-apiserver-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kontinue-apiserver-role
+subjects:
+  - kind: ServiceAccount
+    name: kontinue-apiserver
+    namespace: kontinue-system

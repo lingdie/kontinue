@@ -1,0 +1,12 @@
+[package]
+name = "kontinue-carrier"
+version.workspace = true
+edition.workspace = true
+description = "Ultra-low-RSS pause PID 1 for Kontinue Carrier Pods (no shell, no sleep loop)"
+
+[[bin]]
+name = "kontinue-carrier"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }

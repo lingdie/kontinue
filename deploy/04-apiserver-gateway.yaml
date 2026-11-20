@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kontinue-apiserver
+  namespace: kontinue-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kontinue-apiserver
+  template:
+    metadata:
+      labels:
+        app: kontinue-apiserver
+    spec:
+      serviceAccountName: kontinue-apiserver
+      containers:
+        - name: apiserver
+          image: kontinue/kontinue-apiserver:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--listen=:8081"
+            - "--carrier-namespace=kontinue-sandboxes"
+            - "--carrier-image=kontinue/carrier:dev"
+            - "--min-idle-slots=6"
+            - "--idle-burst-buffer=4"
+            - "--cold-burst-extra=0"
+            - "--local-cas-fallback=/var/lib/kontinue-arena/remote-cas"
+          env:
+            - name: POSTGRES_DSN
+              value: "postgres://kontinue:kontinue@kontinue-postgres.kontinue-system.svc.cluster.local:5432/kontinue?sslmode=disable"
+            - name: REDIS_ADDR
+              value: "kontinue-redis.kontinue-system.svc.cluster.local:6379"
+            - name: CAS_HTTP_URL
+              value: "http://kontinue-minio.kontinue-system.svc.cluster.local:9000/kontinue"
+          ports:
+            - containerPort: 8081
+          volumeMounts:
+            - name: shared-cas
+              mountPath: /var/lib/kontinue-arena/remote-cas
+      volumes:
+        - name: shared-cas
+          hostPath:
+            path: /tmp/kontinue-kind-shared-cas
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kontinue-apiserver
+  namespace: kontinue-system
+spec:
+  type: NodePort
+  selector:
+    app: kontinue-apiserver
+  ports:
+    - port: 8081
+      targetPort: 8081
+      nodePort: 30081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kontinue-gateway
+  namespace: kontinue-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kontinue-gateway
+  template:
+    metadata:
+      labels:
+        app: kontinue-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: kontinue/kontinue-gateway:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: KONTINUE_APISERVER_URL
+              value: "http://kontinue-apiserver.kontinue-system.svc.cluster.local:8081"
+            - name: REDIS_ADDR
+              value: "kontinue-redis.kontinue-system.svc.cluster.local:6379"
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kontinue-gateway
+  namespace: kontinue-system
+spec:
+  type: NodePort
+  selector:
+    app: kontinue-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080

@@ -1,0 +1,12 @@
+---
+description: Go coding, concurrency, and tracing conventions for Kontinue services
+globs: **/*.go
+alwaysApply: false
+---
+
+# Kontinue Go Standards
+
+- **Pure Static Builds**: Keep all packages compatible with `CGO_ENABLED=0`. Isolate Linux-specific syscalls (`go-fuse`, `FICLONE`) in `*_linux.go` with portable `*_other.go` counterparts.
+- **Context & Trace First**: First parameter of every I/O or RPC method is `ctx context.Context`. Always start child spans via `telemetry.StartSpan(ctx, component, op, attrs...)` and close with `defer telemetry.EndSpan(span, err)`.
+- **Fenced Concurrency**: Use Redis Lua scripts for Carrier Slot claiming and `ExecutionID`-fenced route updates; use `singleflight.Group` to coalesce duplicate wakeups and chunk fetches.
+- **Error Hygiene**: Wrap errors with `fmt.Errorf("context: %w", err)` and never leak credentials or raw secret env maps into logs or span attributes.
