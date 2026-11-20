@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/kontinue-sh/kontinue/internal/store"
@@ -139,6 +140,7 @@ func (s *Server) advanceActivation(ctx context.Context, sb *store.SandboxRecord,
 		if status.Code(err) == codes.FailedPrecondition {
 			sb.State = store.SandboxStateFailed
 			sb.FailureReason = status.Convert(err).Message()
+			log.Printf("sandbox activation failed sandbox=%q execution=%d detail=%q", sb.SandboxID, sb.ExecutionID, err)
 			if saveErr := s.cfg.Meta.SaveSandbox(ctx, sb); saveErr != nil {
 				return nil, errors.Join(err, saveErr)
 			}

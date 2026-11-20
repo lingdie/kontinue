@@ -31,13 +31,14 @@ type sandboxResponse struct {
 	CPUMillis                   int64              `json:"cpuMillis,omitempty"`
 	MemoryBytes                 int64              `json:"memoryBytes,omitempty"`
 	AllowFilesystemOnlyFallback bool               `json:"allowFilesystemOnlyFallback"`
+	FailureCode                 string             `json:"failureCode,omitempty"`
 	FailureReason               string             `json:"failureReason,omitempty"`
 	CreatedAt                   time.Time          `json:"createdAt"`
 	UpdatedAt                   time.Time          `json:"updatedAt"`
 }
 
 func publicSandbox(r *store.SandboxRecord) sandboxResponse {
-	return sandboxResponse{ArenaTier: r.ArenaTier, RestoreViewCopiedBytes: r.RestoreViewCopiedBytes,
+	response := sandboxResponse{ArenaTier: r.ArenaTier, RestoreViewCopiedBytes: r.RestoreViewCopiedBytes,
 		SandboxID:                   r.SandboxID,
 		TemplateID:                  r.TemplateID,
 		BaseImage:                   r.BaseImage,
@@ -57,10 +58,14 @@ func publicSandbox(r *store.SandboxRecord) sandboxResponse {
 		CPUMillis:                   r.CPUMillis,
 		MemoryBytes:                 r.MemoryBytes,
 		AllowFilesystemOnlyFallback: r.AllowFilesystemOnlyFallback,
-		FailureReason:               r.FailureReason,
 		CreatedAt:                   r.CreatedAt,
 		UpdatedAt:                   r.UpdatedAt,
 	}
+	if r.State == store.SandboxStateFailed || r.FailureReason != "" {
+		response.FailureCode = "sandbox_failed"
+		response.FailureReason = "sandbox execution failed"
+	}
+	return response
 }
 
 type snapshotResponse struct {

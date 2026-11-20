@@ -137,7 +137,7 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		list, err := s.cfg.Meta.ListTemplates(r.Context())
 		if err != nil {
-			writeLifecycleError(w, err)
+			writeLifecycleError(w, r, err)
 			return
 		}
 		public := make([]templateResponse, 0, len(list))
@@ -150,17 +150,17 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var req CreateTemplateRequest
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
+			writeProblem(w, r, invalidJSON, err)
 			return
 		}
 		tpl, err := s.BuildGoldenTemplate(r.Context(), req)
 		if err != nil {
-			writeLifecycleError(w, err)
+			writeLifecycleError(w, r, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, publicTemplate(tpl))
 	default:
-		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeProblem(w, r, methodNotAllowed, nil)
 	}
 }
 
@@ -168,11 +168,11 @@ func (s *Server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/v1/templates/")
 	tpl, err := s.template(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "template not found")
+		writeProblem(w, r, templateNotFound, err)
 		return
 	}
 	if err != nil {
-		writeLifecycleError(w, err)
+		writeLifecycleError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, publicTemplate(tpl))
@@ -180,18 +180,18 @@ func (s *Server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeProblem(w, r, methodNotAllowed, nil)
 		return
 	}
 	var req CreateSandboxRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeProblem(w, r, invalidJSON, err)
 		return
 	}
 	req.RequestKey = r.Header.Get(protocol.HeaderIdempotencyKey)
 	sbx, err := s.CreateSandbox(r.Context(), req)
 	if err != nil {
-		writeLifecycleError(w, err)
+		writeLifecycleError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, issueSandbox(sbx))
@@ -201,7 +201,7 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 	trimmed := strings.TrimPrefix(r.URL.Path, "/v1/sandboxes/")
 	parts := strings.Split(strings.Trim(trimmed, "/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
-		writeErr(w, http.StatusBadRequest, "missing sandbox id")
+		writeProblem(w, r, missingSandboxID, nil)
 		return
 	}
 	sandboxID := parts[0]
@@ -211,28 +211,28 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			sbx, err := s.sandbox(r.Context(), sandboxID)
 			if errors.Is(err, store.ErrNotFound) {
-				writeErr(w, http.StatusNotFound, "sandbox not found")
+				writeProblem(w, r, sandboxNotFound, err)
 				return
 			}
 			if err != nil {
-				writeLifecycleError(w, err)
+				writeLifecycleError(w, r, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, publicSandbox(sbx))
 		case http.MethodDelete:
 			if err := s.DeleteSandbox(r.Context(), sandboxID); err != nil {
-				writeLifecycleError(w, err)
+				writeLifecycleError(w, r, err)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			writeProblem(w, r, methodNotAllowed, nil)
 		}
 		return
 	}
 
 	if r.Method != http.MethodPost {
-		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeProblem(w, r, methodNotAllowed, nil)
 		return
 	}
 	switch parts[1] {
@@ -240,17 +240,17 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 		snap, err := s.SuspendSandbox(r.Context(), sandboxID)
 		if err != nil {
 			if errors.Is(err, store.ErrTransitionLocked) {
-				writeErr(w, http.StatusConflict, err.Error())
+				writeProblem(w, r, transitionInProgress, err)
 				return
 			}
-			writeLifecycleError(w, err)
+			writeLifecycleError(w, r, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, publicSnapshot(snap))
 	case "resume":
 		sbx, err := s.ResumeSandbox(r.Context(), sandboxID)
 		if err != nil {
-			writeLifecycleError(w, err)
+			writeLifecycleError(w, r, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, publicSandbox(sbx))
@@ -258,18 +258,21 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 		var fReq ForkSandboxRequest
 		if r.Body != nil && r.ContentLength != 0 {
 			if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&fReq); err != nil {
-				writeErr(w, http.StatusBadRequest, err.Error())
+				writeProblem(w, r, invalidJSON, err)
 				return
 			}
 		}
 		fReq.RequestKey = r.Header.Get(protocol.HeaderIdempotencyKey)
 		forks, err := s.ForkSandbox(r.Context(), sandboxID, fReq)
 		if err != nil {
-			if errors.Is(err, store.ErrTransitionLocked) || errors.Is(err, store.ErrStaleExecutionFence) {
-				writeErr(w, http.StatusConflict, err.Error())
-				return
+			switch {
+			case errors.Is(err, store.ErrTransitionLocked):
+				writeProblem(w, r, transitionInProgress, err)
+			case errors.Is(err, store.ErrStaleExecutionFence):
+				writeProblem(w, r, staleExecution, err)
+			default:
+				writeLifecycleError(w, r, err)
 			}
-			writeLifecycleError(w, err)
 			return
 		}
 		pub := make([]issuedSandbox, 0, len(forks))
@@ -278,7 +281,7 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusCreated, pub)
 	default:
-		writeErr(w, http.StatusNotFound, "unknown sandbox action")
+		writeProblem(w, r, unknownSandboxAction, nil)
 	}
 }
 
@@ -868,6 +871,8 @@ func (s *Server) reconcileSandbox(ctx context.Context, observed *store.SandboxRe
 	sb.State, sb.FailureReason = store.SandboxStateFailed, report.Reason
 	if err := s.cfg.Meta.SaveSandbox(ctx, sb); err != nil {
 		log.Printf("persist recovery failure for %s: %v", sb.SandboxID, err)
+	} else {
+		log.Printf("sandbox recovery failed sandbox=%q execution=%d detail=%q", sb.SandboxID, sb.ExecutionID, report.Reason)
 	}
 	return true
 }
@@ -1065,8 +1070,4 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func writeErr(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
 }

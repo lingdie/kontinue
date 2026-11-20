@@ -13,8 +13,6 @@ import (
 
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 type TenantKeys map[[32]byte]string
@@ -110,7 +108,7 @@ func (s *Server) tenantHandler(next http.Handler) http.Handler {
 			tenant, exists = s.cfg.TenantKeys[sha256.Sum256([]byte(token))]
 			if !ok || !strings.EqualFold(scheme, "Bearer") || !exists {
 				w.Header().Set("WWW-Authenticate", "Bearer")
-				writeErr(w, http.StatusUnauthorized, "tenant credential required")
+				writeProblem(w, r, tenantCredentialRequired, nil)
 				return
 			}
 		}
@@ -123,7 +121,7 @@ func (s *Server) gatewayAction(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := principal{sandboxID: id, token: r.Header.Get(protocol.HeaderKontinueToken)}
 	if p.token == "" {
-		writeErr(w, http.StatusUnauthorized, errCredential.Error())
+		writeProblem(w, r, invalidSandboxCredential, nil)
 		return
 	}
 	ctx := context.WithValue(r.Context(), principalKey{}, p)
@@ -134,29 +132,14 @@ func (s *Server) gatewayAction(w http.ResponseWriter, r *http.Request) {
 	case "resume":
 		_, err = s.ResumeSandbox(ctx, id)
 	default:
-		http.NotFound(w, r)
+		writeProblem(w, r, unknownSandboxAction, nil)
 		return
 	}
 	if err != nil {
-		writeLifecycleError(w, err)
+		writeLifecycleError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func writeLifecycleError(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, errOtherTenant), errors.Is(err, store.ErrNotFound):
-		writeErr(w, http.StatusNotFound, "resource not found")
-	case errors.Is(err, errCredential):
-		writeErr(w, http.StatusUnauthorized, errCredential.Error())
-	case errors.Is(err, store.ErrSandboxExists), errors.Is(err, store.ErrTransitionLocked), errors.Is(err, store.ErrStaleExecutionFence):
-		writeErr(w, http.StatusConflict, err.Error())
-	case errors.Is(err, store.ErrNoIdleCarrierSlot), status.Code(err) == codes.Unavailable:
-		writeErr(w, http.StatusServiceUnavailable, err.Error())
-	default:
-		writeErr(w, http.StatusInternalServerError, err.Error())
-	}
 }
 
 func createKeyDigest(ctx context.Context, key string) string {
