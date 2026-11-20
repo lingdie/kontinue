@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
-
 	"strings"
 	"time"
 
@@ -21,9 +21,11 @@ import (
 )
 
 const lost ownershipPhase = "lost"
+const interruptedActivationRecoveryTimeout = 30 * time.Second
 
 var errInstanceLost = errors.New("runsc instance is unavailable")
 var errWrongOwner = errors.New("runsc instance identity does not match")
+var errInitUnconfirmed = errors.New("interrupted HeldInit could not be confirmed")
 
 func validInstanceID(id string) bool {
 	return strings.HasPrefix(id, "kt-") && filepath.Base(id) == id
@@ -112,6 +114,9 @@ func (s *Service) Recover(ctx context.Context) error {
 	var pending []*activeSlotState
 	for _, o := range claims {
 		st := &activeSlotState{ownership: o, restored: true}
+		if o.Phase == preparing {
+			st.recoveryDeadline = time.Now().Add(interruptedActivationRecoveryTimeout)
+		}
 		s.activeSlots[o.Slot.SlotID] = st
 		if r := o.LastCheckpoint; r != nil {
 			s.results[r.Result.Manifest.SnapshotID] = r
@@ -170,31 +175,12 @@ func (s *Service) reconcile(ctx context.Context, st *activeSlotState) error {
 	if st.Phase == releasing {
 		return s.report(ctx, st, store.OwnerChecking)
 	}
-	inspector, ok := s.cfg.Driver.(runtimeInspector)
-	if !ok {
-		return errors.New("driver does not support ownership inspection")
-	}
-	err := inspector.inspectInstance(ctx, st.ownership)
-	if err == nil && s.cfg.Carriers != nil {
-		err = s.confirmCarrier(ctx, st.Slot)
-	}
-	if err == nil && st.ViewID != "" {
-		err = s.cfg.Arena.AdoptView(st.ViewID, st.ViewPath, st.View)
-	}
-	if err == nil && st.Phase != activeExecution {
-		err = errors.New("incomplete hydration")
-	}
+	err := s.checkRecoveredGuest(ctx, st)
 	if err == nil {
-		var h *protocol.HealthResponse
-		h, err = s.cfg.KtdClient.Health(ctx, st.KtdEndpoint, "")
-		if err == nil && (h.SandboxID != st.SandboxID || h.ExecutionID != st.ExecutionID) {
-			err = errWrongOwner
-		}
-		if err == nil && (!h.Initialized || !h.Healthy) {
-			err = errors.New("guest is not ready")
-		}
+		err = s.mapSlot(ctx, st)
 	}
-	if errors.Is(err, errInstanceLost) || errors.Is(err, errWrongOwner) || errors.Is(err, arena.ErrViewLost) {
+	if errors.Is(err, errInstanceLost) || errors.Is(err, errWrongOwner) || errors.Is(err, arena.ErrViewLost) || errors.Is(err, errInitUnconfirmed) ||
+		(err != nil && st.Phase == preparing && !time.Now().Before(st.recoveryDeadline)) {
 		next := st.ownership
 		next.Phase = lost
 		next.FailureReason = err.Error()
@@ -207,8 +193,15 @@ func (s *Service) reconcile(ctx context.Context, st *activeSlotState) error {
 	if err != nil {
 		return err
 	}
-	if err = s.mapSlot(ctx, st); err != nil {
-		return err
+	if st.Phase == preparing {
+		result := st.Activation
+		if result == nil {
+			// Older journals recorded identity, but not the reply diagnostics.
+			result = &protocol.HydrateSlotResponse{SandboxID: st.SandboxID, ExecutionID: st.ExecutionID, ContainerID: st.ContainerID, PodIP: st.KtdEndpoint}
+		}
+		if err := s.commitActivation(st, result); err != nil {
+			return err
+		}
 	}
 	s.mu.Lock()
 	s.byContainer[st.ContainerID] = st
@@ -220,9 +213,59 @@ func (s *Service) reconcile(ctx context.Context, st *activeSlotState) error {
 	return nil
 }
 
+func (s *Service) checkRecoveredGuest(ctx context.Context, st *activeSlotState) error {
+	if st.Phase == preparing {
+		host, _, err := net.SplitHostPort(st.KtdEndpoint)
+		ip := net.ParseIP(st.Slot.PodIP)
+		if s.cfg.Carriers == nil || st.Slot.PodUID == "" || st.Slot.PodSandboxID == "" || err != nil || ip == nil || !ip.Equal(net.ParseIP(host)) {
+			return fmt.Errorf("%w: missing or mismatched Carrier identity", errInitUnconfirmed)
+		}
+	} else if st.Phase != activeExecution {
+		return fmt.Errorf("cannot recover ownership phase %q", st.Phase)
+	}
+	inspector, ok := s.cfg.Driver.(runtimeInspector)
+	if !ok {
+		return errors.New("driver does not support ownership inspection")
+	}
+	if err := inspector.inspectInstance(ctx, st.ownership); err != nil {
+		return err
+	}
+	if s.cfg.Carriers != nil {
+		if err := s.confirmCarrier(ctx, st.Slot); err != nil {
+			return err
+		}
+	}
+	if st.ViewID != "" {
+		if err := s.cfg.Arena.AdoptView(st.ViewID, st.ViewPath, st.View); err != nil {
+			return err
+		}
+	}
+	h, err := s.cfg.KtdClient.Health(ctx, st.KtdEndpoint, "")
+	if err != nil {
+		return err
+	}
+	if !h.Healthy {
+		return errors.New("guest is not healthy")
+	}
+	sameExecution := h.SandboxID == st.SandboxID && h.ExecutionID == st.ExecutionID && (h.LifecycleID == "" || h.LifecycleID == st.LifecycleID)
+	if st.Phase == preparing && (!sameExecution || !h.Initialized || h.LifecycleID == "") {
+		return fmt.Errorf("%w: guest does not report the initialized execution", errInitUnconfirmed)
+	}
+	if !sameExecution {
+		return errWrongOwner
+	}
+	if !h.Initialized {
+		return errors.New("guest is not ready")
+	}
+	return nil
+}
+
 // The guest health probe uses a routable Pod IP. Verify its CRI sandbox
 // before probing so IP reuse cannot turn a different guest into the owner.
 func (s *Service) confirmCarrier(ctx context.Context, slot protocol.CarrierSlot) error {
+	if s.cfg.Carriers == nil {
+		return errors.New("CRI Carrier status is unavailable")
+	}
 	resp, err := s.cfg.Carriers.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{PodSandboxId: slot.PodSandboxID, Verbose: true})
 	if status.Code(err) == codes.NotFound {
 		return fmt.Errorf("%w: carrier disappeared", errInstanceLost)

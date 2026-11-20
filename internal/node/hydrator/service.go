@@ -59,8 +59,9 @@ type RoutePublisher interface {
 }
 
 type activeSlotState struct {
-	restored  bool
-	releaseMu sync.Mutex
+	restored         bool
+	releaseMu        sync.Mutex
+	recoveryDeadline time.Time
 	ownership
 }
 
@@ -369,7 +370,19 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 	if req.Slot.SlotID == "" || req.SandboxID == "" || req.ExecutionID <= 0 {
 		return nil, fmt.Errorf("hydrate requires slot, sandbox and execution IDs")
 	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	requestHash := fmt.Sprintf("%x", sha256.Sum256(raw))
 	if req.Slot.NetworkReadyOnly {
+		// A replay can already have a terminal result, including loss of this Carrier.
+		s.mu.Lock()
+		previous := s.activeSlots[req.Slot.SlotID]
+		s.mu.Unlock()
+		if previous != nil {
+			return s.replayHydration(ctx, previous, requestHash)
+		}
 		if _, ok := s.cfg.Driver.(*GVisorSandboxDriver); !ok || s.cfg.Carriers == nil {
 			return nil, status.Error(codes.FailedPrecondition, "network-only Carrier requires the standalone driver and CRI")
 		}
@@ -377,11 +390,6 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 			return nil, fmt.Errorf("confirm cold Carrier network: %w", err)
 		}
 	}
-	raw, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	requestHash := fmt.Sprintf("%x", sha256.Sum256(raw))
 	st := &activeSlotState{ownership: ownership{RequestHash: requestHash,
 		Version: 1, Phase: preparing, Slot: req.Slot, SandboxID: req.SandboxID,
 		ExecutionID: req.ExecutionID, LifecycleID: req.LifecycleID, ContainerID: "kt-" + rand.Text(),
@@ -464,6 +472,12 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		ktdEndpoint = net.JoinHostPort(req.Slot.PodIP, fmt.Sprint(protocol.DefaultKtdPort))
 	}
 	st.KtdEndpoint = ktdEndpoint
+	// Persist the reply fields before HeldInit can complete. The preparing phase
+	// keeps this reply provisional until the guest confirms its new identity.
+	st.Activation = &protocol.HydrateSlotResponse{RestoreViewCopiedBytes: &copiedBytes,
+		SandboxID: req.SandboxID, ExecutionID: req.ExecutionID, PodIP: ktdEndpoint,
+		ContainerID: newCID, ArenaTier: arenaTier, RestoreMode: restoreMode,
+	}
 	if err := s.journal.write(st.ownership, false); err != nil {
 		return nil, err
 	}
@@ -490,17 +504,9 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		return nil, retErr
 	}
 
-	st.Activation = &protocol.HydrateSlotResponse{RestoreViewCopiedBytes: &copiedBytes,
-		SandboxID:   req.SandboxID,
-		ExecutionID: req.ExecutionID,
-		PodIP:       ktdEndpoint,
-		ContainerID: newCID,
-		ArenaTier:   arenaTier,
-		RestoreMode: restoreMode,
-		DurationMs:  time.Since(start).Milliseconds(),
-	}
-	st.Phase = activeExecution
-	if err := s.journal.write(st.ownership, false); err != nil {
+	result := *st.Activation
+	result.DurationMs = time.Since(start).Milliseconds()
+	if err := s.commitActivation(st, &result); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
@@ -525,19 +531,37 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 	return st.Activation, nil
 }
 
+func (s *Service) commitActivation(st *activeSlotState, result *protocol.HydrateSlotResponse) error {
+	next := st.ownership
+	next.Phase, next.Activation = activeExecution, result
+	if err := s.journal.write(next, false); err != nil {
+		return err
+	}
+	st.Phase, st.Activation = next.Phase, next.Activation
+	return nil
+}
+
 // An ambiguous RPC reply must carry the original result on retry. A replay
 // never thaws the guest or reopens a route that suspend may have drained.
 func (s *Service) replayHydration(ctx context.Context, st *activeSlotState, requestHash string) (*protocol.HydrateSlotResponse, error) {
 	st.releaseMu.Lock()
 	defer st.releaseMu.Unlock()
-	if st.RequestHash != requestHash || st.Phase == lost || st.Phase == releasing {
+	if st.RequestHash != requestHash || st.Phase == releasing {
 		return nil, status.Error(codes.FailedPrecondition, "slot ownership conflicts with activation")
+	}
+	if st.Phase == lost {
+		return nil, status.Errorf(codes.FailedPrecondition, "activation failed: %s", st.FailureReason)
 	}
 	s.mu.Lock()
 	verified := s.activeSlots[st.Slot.SlotID] == st && s.byContainer[st.ContainerID] == st
 	s.mu.Unlock()
 	if !verified || st.Phase != activeExecution || st.Activation == nil {
 		return nil, status.Error(codes.Unavailable, "activation awaits reconciliation")
+	}
+	if st.Slot.NetworkReadyOnly {
+		if err := s.confirmCarrier(ctx, st.Slot); err != nil {
+			return nil, fmt.Errorf("confirm cold Carrier network: %w", err)
+		}
 	}
 	if err := s.report(ctx, st, store.OwnerReady); err != nil {
 		return nil, err

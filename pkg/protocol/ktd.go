@@ -53,6 +53,7 @@ type FreezeResponse struct {
 }
 
 type HealthResponse struct {
+	LifecycleID   string `json:"lifecycleId,omitempty"`
 	Healthy       bool   `json:"healthy"`
 	Version       string `json:"version"`
 	SandboxID     string `json:"sandboxId"`

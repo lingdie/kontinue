@@ -214,6 +214,8 @@ pub struct HealthResponse {
     pub version: String,
     pub sandbox_id: String,
     pub execution_id: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lifecycle_id: String,
     pub frozen: bool,
     pub initialized: bool,
     pub uptime_millis: i64,

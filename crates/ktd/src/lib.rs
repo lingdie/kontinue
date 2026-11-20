@@ -152,6 +152,7 @@ impl KtdService {
                 version: self.cfg.version.clone(),
                 sandbox_id: String::new(),
                 execution_id: 0,
+                lifecycle_id: String::new(),
                 frozen: false,
                 initialized: false,
                 uptime_millis: 0,
@@ -163,6 +164,7 @@ impl KtdService {
             version: self.cfg.version.clone(),
             sandbox_id: g.sandbox_id.clone(),
             execution_id: g.execution_id,
+            lifecycle_id: g.lifecycle_id.clone(),
             frozen: g.frozen,
             initialized: g.initialized,
             uptime_millis: self.started_at.elapsed().as_millis() as i64,
@@ -226,42 +228,37 @@ impl KtdService {
 
     pub fn apply_init(&self, payload: InitPayload) -> Result<InitResponse, (u16, String)> {
         let local_now = now_unix_nanos();
-        {
-            let mut g = self
-                .state
-                .lock()
-                .map_err(|_| (500u16, "poisoned state lock".to_string()))?;
-            if payload.execution_id > 0 && payload.execution_id < g.execution_id {
-                return Err((
-                    409,
-                    format!(
-                        "stale executionId {} < current {}",
-                        payload.execution_id, g.execution_id
-                    ),
-                ));
-            }
-            if !payload.sandbox_id.is_empty() {
-                g.sandbox_id = payload.sandbox_id.clone();
-            }
-            if payload.execution_id > 0 {
-                g.execution_id = payload.execution_id;
-            }
-            if !payload.lifecycle_id.is_empty() {
-                g.lifecycle_id = payload.lifecycle_id.clone();
-            }
-            if !payload.access_token.is_empty() {
-                g.access_token = payload.access_token.clone();
-            }
-            for (k, v) in payload.env_vars {
-                g.env_vars.insert(k, v);
-            }
-            if payload.wall_clock_unix_n > 0 {
-                g.clock_skew_nano = payload.wall_clock_unix_n - local_now;
-            }
-            g.initialized = true;
-            if !payload.skip_thaw {
-                g.frozen = false;
-            }
+        // Keep health from observing the new identity before HeldInit finishes.
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|_| (500u16, "poisoned state lock".to_string()))?;
+        if payload.execution_id > 0 && payload.execution_id < g.execution_id {
+            return Err((
+                409,
+                format!(
+                    "stale executionId {} < current {}",
+                    payload.execution_id, g.execution_id
+                ),
+            ));
+        }
+        if !payload.sandbox_id.is_empty() {
+            g.sandbox_id = payload.sandbox_id.clone();
+        }
+        if payload.execution_id > 0 {
+            g.execution_id = payload.execution_id;
+        }
+        if !payload.lifecycle_id.is_empty() {
+            g.lifecycle_id = payload.lifecycle_id.clone();
+        }
+        if !payload.access_token.is_empty() {
+            g.access_token = payload.access_token.clone();
+        }
+        for (k, v) in payload.env_vars {
+            g.env_vars.insert(k, v);
+        }
+        if payload.wall_clock_unix_n > 0 {
+            g.clock_skew_nano = payload.wall_clock_unix_n - local_now;
         }
 
         let seed = if payload.entropy_seed.is_empty() {
@@ -298,6 +295,10 @@ impl KtdService {
         } else {
             false
         };
+        g.initialized = true;
+        if !payload.skip_thaw {
+            g.frozen = false;
+        }
 
         let delta_ms = if payload.wall_clock_unix_n > 0 {
             (payload.wall_clock_unix_n - local_now) / 1_000_000
@@ -1017,6 +1018,10 @@ mod tests {
             .expect("apply_init");
         assert!(init_res.thawed);
         assert!(init_res.machine_id_updated);
+        let health = svc.health();
+        assert!(health.initialized);
+        assert_eq!(health.execution_id, 3);
+        assert_eq!(health.lifecycle_id, "life-1");
         assert!(!svc.verify_access("warmup-temp-token"));
         assert!(svc.verify_access("tenant-token-v3"));
 
