@@ -485,7 +485,9 @@ func (s *Server) releaseExecution(ctx context.Context, sbx *store.SandboxRecord)
 	if err != nil {
 		return err
 	}
-	released, err := nc.ReleaseSlot(ctx, &protocol.ReleaseSlotRequest{SlotID: sbx.CurrentSlotID, SandboxID: sbx.SandboxID, ExecutionID: sbx.ExecutionID, LifecycleID: sbx.LifecycleID, ReuseSlot: s.cfg.ReuseSlots})
+	releaseCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	released, err := nc.ReleaseSlot(releaseCtx, &protocol.ReleaseSlotRequest{SlotID: sbx.CurrentSlotID, SandboxID: sbx.SandboxID, ExecutionID: sbx.ExecutionID, LifecycleID: sbx.LifecycleID, ReuseSlot: s.cfg.ReuseSlots}, grpc.WaitForReady(true))
 	if err != nil {
 		return err
 	}
@@ -702,22 +704,40 @@ func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
 	if sbx.PendingFork != nil && sbx.State != store.SandboxStateFailed {
 		return store.ErrTransitionLocked
 	}
-	if sbx.State == store.SandboxStateCreating || sbx.State == store.SandboxStateResuming {
-		if err := s.cfg.Catalog.FinishReservation(ctx, sbx.LifecycleID, sbx.PendingPlacement == nil); err != nil {
+	if sbx.State != store.SandboxStateDeleting {
+		sbx.State = store.SandboxStateDeleting
+		if err := s.cfg.Meta.SaveSandbox(ctx, sbx); err != nil {
 			return err
 		}
 	}
+	return s.finishDelete(ctx, sbx)
+}
+
+// finishDelete runs with the lifecycle lock and can replay a node release receipt.
+func (s *Server) finishDelete(ctx context.Context, sbx *store.SandboxRecord) error {
+	if err := s.cfg.Catalog.FinishReservation(ctx, sbx.LifecycleID, sbx.CurrentSlotID == ""); err != nil {
+		return err
+	}
 	if sbx.CurrentSlotID != "" {
+		if err := s.cfg.Catalog.DrainRoute(ctx, protocol.RouteRecord{SandboxID: sbx.SandboxID, SlotID: sbx.CurrentSlotID, ExecutionID: sbx.ExecutionID}); err != nil {
+			return err
+		}
 		if err := s.releaseExecution(ctx, sbx); err != nil {
 			return err
 		}
 	}
 	if sbx.ActiveSnapshotID != "" {
-		if snap, sErr := s.cfg.Meta.GetSnapshot(ctx, sbx.ActiveSnapshotID); sErr == nil && snap.Kind == protocol.SnapshotKindSessionSuspend {
-			_ = s.cfg.Meta.MarkSnapshotSuperseded(ctx, snap.SnapshotID)
+		snap, err := s.cfg.Meta.GetSnapshot(ctx, sbx.ActiveSnapshotID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		if err == nil && snap.Kind == protocol.SnapshotKindSessionSuspend {
+			if err := s.cfg.Meta.MarkSnapshotSuperseded(ctx, snap.SnapshotID); err != nil {
+				return err
+			}
 		}
 	}
-	return s.cfg.Meta.DeleteSandbox(ctx, sandboxID)
+	return s.cfg.Meta.DeleteSandbox(ctx, sbx.SandboxID)
 }
 
 // StartBackgroundWorkers launches the Idle Auto-Suspend Evictor and Reference-Counted Snapshot GC loops.
@@ -751,6 +771,10 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 	running, err := s.cfg.Meta.ListSandboxesToSweep(ctx)
 	if err == nil {
 		for _, sbx := range running {
+			if sbx.State == store.SandboxStateDeleting {
+				s.reconcileDelete(ctx, &sbx)
+				continue
+			}
 			if sbx.State == store.SandboxStateResuming || sbx.State == store.SandboxStateCreating {
 				_, _ = s.resumePending(ctx, &sbx)
 				continue
@@ -784,6 +808,20 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 
 	if err := s.collectSnapshots(ctx); err != nil {
 		log.Printf("snapshot GC: %v", err)
+	}
+}
+
+func (s *Server) reconcileDelete(ctx context.Context, observed *store.SandboxRecord) {
+	unlock, err := s.lockExecution(ctx, observed.SandboxID)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	current, err := s.cfg.Meta.GetSandbox(ctx, observed.SandboxID)
+	if err == nil && current.State == store.SandboxStateDeleting && current.LifecycleID == observed.LifecycleID && current.ExecutionID == observed.ExecutionID {
+		if err := s.finishDelete(ctx, current); err != nil {
+			log.Printf("reconcile delete %s: %v", current.SandboxID, err)
+		}
 	}
 }
 

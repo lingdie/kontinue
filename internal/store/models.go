@@ -26,6 +26,7 @@ const (
 	SandboxStateSuspending SandboxState = "SUSPENDING"
 	SandboxStateSuspended  SandboxState = "SUSPENDED"
 	SandboxStateResuming   SandboxState = "RESUMING"
+	SandboxStateDeleting   SandboxState = "DELETING"
 	SandboxStateTerminated SandboxState = "TERMINATED"
 	SandboxStateFailed     SandboxState = "FAILED"
 )
