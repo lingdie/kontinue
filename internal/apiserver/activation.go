@@ -49,7 +49,7 @@ func (s *Server) advanceActivation(ctx context.Context, sb *store.SandboxRecord)
 		return nil, err
 	}
 	p := sb.PendingPlacement
-	node, err := s.nodeClient(p.Slot.NodeGRPCAddr)
+	node, err := s.nodeClient(ctx, p.Slot.NodeGRPCAddr)
 	if err != nil {
 		return nil, err
 	}

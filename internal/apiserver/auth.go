@@ -13,6 +13,8 @@ import (
 
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type TenantKeys map[[32]byte]string
@@ -150,7 +152,7 @@ func writeLifecycleError(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusUnauthorized, errCredential.Error())
 	case errors.Is(err, store.ErrSandboxExists), errors.Is(err, store.ErrTransitionLocked), errors.Is(err, store.ErrStaleExecutionFence):
 		writeErr(w, http.StatusConflict, err.Error())
-	case errors.Is(err, store.ErrNoIdleCarrierSlot):
+	case errors.Is(err, store.ErrNoIdleCarrierSlot), status.Code(err) == codes.Unavailable:
 		writeErr(w, http.StatusServiceUnavailable, err.Error())
 	default:
 		writeErr(w, http.StatusInternalServerError, err.Error())

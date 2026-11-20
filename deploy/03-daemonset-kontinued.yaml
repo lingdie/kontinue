@@ -51,6 +51,11 @@ spec:
               containerPort: 9090
             - name: debug-http
               containerPort: 8082
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: debug-http
+            periodSeconds: 2
           volumeMounts:
             - name: containerd-sock
               mountPath: /run/containerd/containerd.sock

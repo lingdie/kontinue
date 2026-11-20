@@ -5,16 +5,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 
+	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
 	"github.com/kontinue-sh/kontinue/pkg/telemetry"
+	"golang.org/x/sync/singleflight"
 )
 
 type GVisorDriverConfig struct {
@@ -29,8 +31,8 @@ type GVisorDriverConfig struct {
 // GVisorSandboxDriver runs standalone single-root gVisor sandboxes via Rust `kontinue-runsc`
 // attached directly to each pre-warmed Carrier Pod's CNI network namespace (`--network=sandbox`).
 type GVisorSandboxDriver struct {
-	cfg      GVisorDriverConfig
-	rootfsMu sync.Mutex
+	cfg         GVisorDriverConfig
+	rootfsLoads singleflight.Group
 }
 
 func NewGVisorSandboxDriver(cfg GVisorDriverConfig) *GVisorSandboxDriver {
@@ -270,33 +272,62 @@ func (d *GVisorSandboxDriver) StopSandboxContainer(ctx context.Context, _ protoc
 	return os.RemoveAll(filepath.Join(d.cfg.BundlesDir, activeContainerID))
 }
 
-func (d *GVisorSandboxDriver) imageIdentity(ctx context.Context, imageRef string) string {
-	out, err := d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "ls").Output()
+// An empty identity means the exact reference is missing from the local image store.
+func (d *GVisorSandboxDriver) imageIdentity(ctx context.Context, imageRef string) (string, error) {
+	out, err := d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "ls", "name=="+strconv.Quote(imageRef)).Output()
 	if err != nil {
-		return imageRef
+		return "", fmt.Errorf("resolve image %s: %w", imageRef, err)
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[0] == imageRef && strings.HasPrefix(fields[2], "sha256:") {
-			return imageRef + "@" + fields[2]
+		if len(fields) > 0 && fields[0] == imageRef {
+			if len(fields) < 3 || !strings.HasPrefix(fields[2], "sha256:") {
+				return "", fmt.Errorf("missing digest for %s", imageRef)
+			}
+			return imageRef + "@" + fields[2], nil
 		}
 	}
-	return imageRef
+	return "", nil
 }
 
 func (d *GVisorSandboxDriver) ensureBaseRootfs(ctx context.Context, imageRef string) (string, error) {
 	if imageRef == "" {
 		return "", fmt.Errorf("baseImage is empty")
 	}
-	d.rootfsMu.Lock()
-	defer d.rootfsMu.Unlock()
+	value, err, _ := d.rootfsLoads.Do(imageRef, func() (any, error) { return d.stageBaseRootfs(ctx, imageRef) })
+	if err != nil {
+		return "", err
+	}
+	return value.(string), nil
+}
 
-	sum := sha256.Sum256([]byte(d.imageIdentity(ctx, imageRef)))
+func (d *GVisorSandboxDriver) stageBaseRootfs(ctx context.Context, imageRef string) (root string, err error) {
+	ctx, span := telemetry.StartSpan(ctx, "kontinued", "hydrator.prepare_base_rootfs")
+	defer func() { telemetry.EndSpan(span, err) }()
+	identity, err := d.imageIdentity(ctx, imageRef)
+	if err != nil {
+		return "", err
+	}
+	if identity == "" {
+		if out, err := d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "pull", imageRef).CombinedOutput(); err != nil {
+			return "", fmt.Errorf("ctr pull %s: %w (%s)", imageRef, err, out)
+		}
+		identity, err = d.imageIdentity(ctx, imageRef)
+		if err != nil {
+			return "", err
+		}
+		if identity == "" {
+			return "", fmt.Errorf("pulled image %s has no local digest", imageRef)
+		}
+	}
+	sum := sha256.Sum256([]byte(identity))
 	imgKey := hex.EncodeToString(sum[:10])
 	targetRootfs := filepath.Join(d.cfg.BaseRootfsCache, imgKey, "rootfs")
 	readyMarker := filepath.Join(d.cfg.BaseRootfsCache, imgKey, ".ready")
 	if _, err := os.Stat(readyMarker); err == nil {
 		return targetRootfs, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
 	}
 
 	mntDir := filepath.Join(d.cfg.BaseRootfsCache, imgKey, "mnt")
@@ -306,13 +337,6 @@ func (d *GVisorSandboxDriver) ensureBaseRootfs(ctx context.Context, imageRef str
 	}
 	if err := os.MkdirAll(targetRootfs, 0o755); err != nil {
 		return "", err
-	}
-
-	checkOut, _ := d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "ls", "-q").Output()
-	if !containsLine(string(checkOut), imageRef) {
-		if pullOut, pErr := d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "pull", imageRef).CombinedOutput(); pErr != nil {
-			return "", fmt.Errorf("ctr pull %s: %w (%s)", imageRef, pErr, string(pullOut))
-		}
 	}
 
 	mntOut, err := d.hostCommand(ctx, d.cfg.CtrBinary, "-n", "k8s.io", "images", "mount", "--rw", imageRef, mntDir).CombinedOutput()
@@ -334,36 +358,18 @@ func (d *GVisorSandboxDriver) ensureBaseRootfs(ctx context.Context, imageRef str
 	}
 	_ = os.MkdirAll(filepath.Join(targetRootfs, "root"), 0o755)
 	_ = os.MkdirAll(filepath.Join(targetRootfs, "etc"), 0o755)
-	_ = os.WriteFile(readyMarker, []byte(imageRef+"\n"), 0o644)
+	// A mutable tag can move while ctr mounts it. Publish only a verified cache entry.
+	current, err := d.imageIdentity(ctx, imageRef)
+	if err != nil {
+		return "", err
+	}
+	if current != identity {
+		return "", fmt.Errorf("image %s changed while staging rootfs", imageRef)
+	}
+	if err := os.WriteFile(readyMarker, []byte(imageRef+"\n"), 0o644); err != nil {
+		return "", err
+	}
 	return targetRootfs, nil
-}
-
-func containsLine(lines, target string) bool {
-	for _, l := range filepathSplitLines(lines) {
-		if l == target {
-			return true
-		}
-	}
-	return false
-}
-
-func filepathSplitLines(s string) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			line := s[start:i]
-			if len(line) > 0 && line[len(line)-1] == '\r' {
-				line = line[:len(line)-1]
-			}
-			out = append(out, line)
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		out = append(out, s[start:])
-	}
-	return out
 }
 
 func defaultCaps() []string {

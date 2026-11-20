@@ -83,7 +83,7 @@ func (s *Server) advanceTemplateBuild(ctx context.Context, t *store.TemplateReco
 			if err := s.cfg.Catalog.FinishReservation(ctx, b.LifecycleID, false); err != nil {
 				return nil, err
 			}
-			nc, err := s.nodeClient(b.Slot.NodeGRPCAddr)
+			nc, err := s.nodeClient(ctx, b.Slot.NodeGRPCAddr)
 			if err != nil {
 				return nil, err
 			}
@@ -120,7 +120,7 @@ func (s *Server) advanceTemplateBuild(ctx context.Context, t *store.TemplateReco
 			t.GoldenSnapshotID = b.SnapshotID
 			t.Phase = "Releasing"
 		case "Releasing":
-			nc, err := s.nodeClient(b.Slot.NodeGRPCAddr)
+			nc, err := s.nodeClient(ctx, b.Slot.NodeGRPCAddr)
 			if err != nil {
 				return nil, err
 			}

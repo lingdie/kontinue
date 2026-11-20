@@ -21,7 +21,11 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 type ServerConfig struct {
@@ -278,8 +282,8 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// CreateSandbox clones a new 1-to-N sandbox from a Golden Template in ~100ms with 0 K8s etcd writes!
-func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*store.SandboxRecord, error) {
+// CreateSandbox persists an execution and activates its assigned Carrier.
+func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (_ *store.SandboxRecord, retErr error) {
 	var createKey, requestHash string
 	if req.RequestKey != "" {
 		createKey = createKeyDigest(ctx, req.RequestKey)
@@ -299,7 +303,6 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 		attribute.String(telemetry.AttrSandboxID, req.SandboxID),
 		attribute.String(telemetry.AttrTemplateID, req.TemplateID),
 	)
-	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
 	unlock, err := s.lockExecution(ctx, req.SandboxID)
@@ -481,7 +484,7 @@ func (s *Server) releaseExecution(ctx context.Context, sbx *store.SandboxRecord)
 	if err != nil {
 		return err
 	}
-	nc, err := s.nodeClient(route.NodeGRPCAddr)
+	nc, err := s.nodeClient(ctx, route.NodeGRPCAddr)
 	if err != nil {
 		return err
 	}
@@ -526,7 +529,7 @@ func (s *Server) publishCheckpoint(ctx context.Context, prep *protocol.PrepareCh
 		return nil, err
 	}
 	defer releaseSnapshots()
-	nodeClient, err := s.nodeClient(grpcAddr)
+	nodeClient, err := s.nodeClient(ctx, grpcAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -984,7 +987,7 @@ func (s *Server) broadcastL1Prewarm(ctx context.Context, snapshotID string) {
 		return
 	}
 	for _, n := range nodes {
-		if nc, cErr := s.nodeClient(n.GRPCAddr); cErr == nil {
+		if nc, cErr := s.nodeClient(ctx, n.GRPCAddr); cErr == nil {
 			_, _ = nc.PrewarmTemplate(ctx, &protocol.PrewarmTemplateRequest{
 				SnapshotID: snapshotID,
 				PinInTmpfs: true,
@@ -1003,13 +1006,45 @@ func (s *Server) lookupNodeKubeletPort(ctx context.Context, nodeID string) int {
 	return 10250
 }
 
-func (s *Server) nodeClient(addr string) (*protocol.NodeControlClient, error) {
+func (s *Server) nodeClient(ctx context.Context, addr string) (*protocol.NodeControlClient, error) {
+	cc, err := s.nodeConnection(addr)
+	if err != nil {
+		return nil, err
+	}
+	if cc.GetState() != connectivity.Ready {
+		// A heartbeat may outlive a daemon. Bound the reconnect wait independently
+		// of the subsequent hydrate or checkpoint, which can legitimately run longer.
+		wait, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		for {
+			state := cc.GetState()
+			if state == connectivity.Ready {
+				break
+			}
+			if state == connectivity.Idle {
+				cc.Connect()
+			}
+			if state == connectivity.Shutdown || !cc.WaitForStateChange(wait, state) {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return nil, status.Error(codes.Unavailable, "worker RPC is unavailable")
+			}
+		}
+	}
+	return protocol.NewNodeControlClient(cc), nil
+}
+
+func (s *Server) nodeConnection(addr string) (*grpc.ClientConn, error) {
 	s.nodeConnMu.Lock()
 	defer s.nodeConnMu.Unlock()
 	if cc, ok := s.nodeConns[addr]; ok {
-		return protocol.NewNodeControlClient(cc), nil
+		return cc, nil
 	}
+	retry := backoff.DefaultConfig
+	retry.MaxDelay = 2 * time.Second
 	cc, err := grpc.NewClient(addr,
+		grpc.WithConnectParams(grpc.ConnectParams{Backoff: retry, MinConnectTimeout: 5 * time.Second}),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithUnaryInterceptor(telemetry.UnaryClientInterceptor("kontinue-apiserver")),
 	)
@@ -1017,7 +1052,7 @@ func (s *Server) nodeClient(addr string) (*protocol.NodeControlClient, error) {
 		return nil, err
 	}
 	s.nodeConns[addr] = cc
-	return protocol.NewNodeControlClient(cc), nil
+	return cc, nil
 }
 
 func randHex(nBytes int) string {

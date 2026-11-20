@@ -15,6 +15,18 @@ fi
 export KONTINUE_TRACE_TOKEN
 api_curl() { curl -H "Authorization: Bearer ${KONTINUE_TENANT_TOKEN}" "$@"; }
 
+TEST_DIR="$(mktemp -d)"
+declare -a TEST_SANDBOXES=()
+cleanup() {
+  for sandbox_id in "${TEST_SANDBOXES[@]:-}"; do
+    if [[ -n "$sandbox_id" ]]; then
+      api_curl -fsS -X DELETE "${API_URL}/v1/sandboxes/$sandbox_id" >/dev/null
+    fi
+  done
+  rm -rf "$TEST_DIR"
+}
+trap cleanup EXIT
+
 echo "==> [Step 0] Waiting for Carrier Pod pool to warm up in kontinue-sandboxes..."
 for i in $(seq 1 45); do
   READY_COUNT="$(kubectl -n kontinue-sandboxes get pods --no-headers 2>/dev/null | grep -c Running || true)"
@@ -35,7 +47,7 @@ TPL_JSON="$(api_curl -fsS -X POST "${API_URL}/v1/templates" \
 {
   "name": "python-agent-golden",
   "baseImage": "${BASE_IMAGE}",
-  "warmupScript": "python3 -c 'import json; open(\"/root/baked_state.json\", \"w\").write(json.dumps({\"baked\": True, \"python\": True}))'",
+  "warmupScript": "python3 -c 'import json; open(\"/tmp/baked_state.json\", \"w\").write(json.dumps({\"baked\": True, \"python\": True}))'",
   "pinInL1Tmpfs": true,
   "traceHotPages": true
 }
@@ -60,21 +72,23 @@ T1="$(python3 -c 'import time; print(int(time.time()*1000))')"
 echo "  -> Cloned Sandbox in $((T1 - T0)) ms! sandbox ready"
 
 SBX_ID="$(echo "${SBX_JSON}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["sandboxId"])')"
+TEST_SANDBOXES+=("$SBX_ID")
 TOKEN="$(echo "${SBX_JSON}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["accessToken"])')"
 
 echo ""
 echo "==> [Step 3] Executing Python inside gVisor Sandbox via kontinue-gateway..."
-EXEC1="$(curl -fsS -D /tmp/kt_hdrs -X POST "${GW_URL}/v1/process/exec" \
+EXEC1="$(curl -fsS -D "${TEST_DIR}/headers" -X POST "${GW_URL}/v1/process/exec" \
   -H "Content-Type: application/json" \
   -H "X-Kontinue-Sandbox-ID: ${SBX_ID}" \
   -H "X-Kontinue-Token: ${TOKEN}" \
   --data-binary @- <<'JSON'
 {
-  "command": ["/bin/sh", "-c", "python3 -c 'import json, os; d=json.load(open(\"/root/baked_state.json\")); d[\"secret\"]=os.environ[\"AGENT_TENANT_SECRET\"]; print(json.dumps(d)); open(\"/root/turn1.txt\",\"w\").write(\"turn-1-survived-suspend\")'"]
+  "command": ["/bin/sh", "-c", "python3 -c 'import json, os; d=json.load(open(\"/tmp/baked_state.json\")); d[\"secret\"]=os.environ[\"AGENT_TENANT_SECRET\"]; print(json.dumps(d)); open(\"/tmp/turn1.txt\",\"w\").write(\"turn-1-survived-suspend\")'"]
 }
 JSON
 )"
-TRACE_ID="$(grep -i '^X-Trace-ID:' /tmp/kt_hdrs | awk '{print $2}' | tr -d '\r')"
+python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["exitCode"] == 0; assert json.loads(r["stdout"]) == {"baked": True, "python": True, "secret":"sk-live-kind-verified-999"}' <<<"$EXEC1"
+TRACE_ID="$(grep -i '^X-Trace-ID:' "${TEST_DIR}/headers" | awk '{print $2}' | tr -d '\r')"
 echo "  Exec completed (X-Trace-ID=${TRACE_ID})"
 
 echo ""
@@ -82,13 +96,15 @@ echo "==> [Step 4] Live 1-to-K Stateful Fork (spawning 2 parallel branch sandbox
 FORK_JSON="$(api_curl -fsS -X POST "${API_URL}/v1/sandboxes/${SBX_ID}/fork" \
   -H "Content-Type: application/json" \
   -d '{"count": 2}')"
+while IFS= read -r child; do TEST_SANDBOXES+=("$child"); done < <(python3 -c 'import json,sys; rows=json.load(sys.stdin); assert len(rows)==2; print(*(r["sandboxId"] for r in rows),sep="\n")' <<<"$FORK_JSON")
 FORK1_ID="$(echo "${FORK_JSON}" | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["sandboxId"])')"
 FORK1_TOK="$(echo "${FORK_JSON}" | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["accessToken"])')"
 FORK_EXEC="$(curl -fsS -X POST "${GW_URL}/v1/process/exec" \
   -H "Content-Type: application/json" \
   -H "X-Kontinue-Sandbox-ID: ${FORK1_ID}" \
   -H "X-Kontinue-Token: ${FORK1_TOK}" \
-  -d '{"command": ["/bin/sh", "-c", "cat /root/turn1.txt"]}')"
+  -d '{"command": ["/bin/sh", "-c", "cat /tmp/turn1.txt"]}')"
+python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["exitCode"] == 0 and r["stdout"] == "turn-1-survived-suspend"' <<<"$FORK_EXEC"
 echo "  -> Forked Sandbox (${FORK1_ID}) inherited pre-fork state: ${FORK_EXEC}"
 
 echo ""
@@ -107,7 +123,7 @@ t0 = time.time()
 def call(idx):
     req = urllib.request.Request(
         f"{gw}/v1/process/exec",
-        data=json.dumps({"command": ["/bin/sh", "-c", "cat /root/turn1.txt"]}).encode(),
+        data=json.dumps({"command": ["/bin/sh", "-c", "cat /tmp/turn1.txt"]}).encode(),
         headers={
             "Content-Type": "application/json",
             "X-Kontinue-Sandbox-ID": sbx_id,
@@ -131,7 +147,8 @@ echo ""
 echo "==> [Step 7] Inspecting End-to-End Trace Waterfall via ktctl trace..."
 "${ROOT_DIR}/bin/ktctl" trace \
   --sandbox-id "${SBX_ID}" \
-  --endpoints "${GW_URL},${API_URL}"
+  --endpoints "${GW_URL},${API_URL}" | tee "${TEST_DIR}/traces"
+grep -F "sandbox.id=${SBX_ID}" "${TEST_DIR}/traces" >/dev/null
 
 echo ""
 echo "ALL LIVE KIND + GVISOR E2E CHECKS PASSED!"

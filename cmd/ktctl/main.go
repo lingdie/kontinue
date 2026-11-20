@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -66,6 +67,8 @@ func CollectAndMergeTraces(ctx context.Context, endpoints []string, traceID, san
 	client := &http.Client{Timeout: 5 * time.Second}
 	seen := make(map[string]telemetry.RecordedSpan)
 
+	var failures []error
+	reachable := 0
 	for _, ep := range endpoints {
 		ep = strings.TrimSpace(strings.TrimRight(ep, "/"))
 		if ep == "" {
@@ -83,6 +86,7 @@ func CollectAndMergeTraces(ctx context.Context, endpoints []string, traceID, san
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep+protocol.PathDebugTraces+"?"+q.Encode(), nil)
 		if err != nil {
+			failures = append(failures, err)
 			continue
 		}
 		if key := os.Getenv("KONTINUE_TRACE_TOKEN"); key != "" {
@@ -90,16 +94,25 @@ func CollectAndMergeTraces(ctx context.Context, endpoints []string, traceID, san
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			failures = append(failures, err)
 			continue
 		}
 		var out telemetry.DebugTraceResponse
-		if resp.StatusCode == http.StatusOK {
-			_ = json.NewDecoder(resp.Body).Decode(&out)
+		if resp.StatusCode != http.StatusOK {
+			failures = append(failures, fmt.Errorf("%s: HTTP %d", ep, resp.StatusCode))
+		} else if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", ep, err))
+		} else {
+			reachable++
 			for _, sp := range out.Spans {
 				seen[sp.TraceID+":"+sp.SpanID] = sp
 			}
 		}
 		_ = resp.Body.Close()
+	}
+
+	if reachable == 0 {
+		return nil, fmt.Errorf("no trace endpoint available: %v", errors.Join(failures...))
 	}
 
 	merged := make([]telemetry.RecordedSpan, 0, len(seen))
