@@ -2,8 +2,6 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -46,18 +44,33 @@ if not cur then
     return 1
 end
 local parsed = cjson.decode(cur)
-if parsed["executionId"] and tonumber(parsed["executionId"]) > tonumber(ARGV[1]) then
+if tonumber(parsed["executionId"]) ~= tonumber(ARGV[1]) or (parsed["slotId"] or "") ~= ARGV[2] then
     return 0
 end
 redis.call("DEL", KEYS[1])
 return 1
 `)
 
-var luaReleaseLockIfOwner = redis.NewScript(`
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("DEL", KEYS[1])
+var luaAdmitRoute = redis.NewScript(`
+local route = redis.call("GET", KEYS[1])
+if not route then return nil end
+local now = tonumber(redis.call("TIME")[1])
+redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", now)
+redis.call("ZADD", KEYS[2], now+tonumber(ARGV[2]), ARGV[1])
+redis.call("EXPIRE", KEYS[2], ARGV[2])
+return route
+`)
+
+var luaDrainRoute = redis.NewScript(`
+local raw = redis.call("GET", KEYS[1])
+if raw then
+    local route = cjson.decode(raw)
+    if tonumber(route.executionId) ~= tonumber(ARGV[1]) or route.slotId ~= ARGV[2] then return -1 end
 end
-return 0
+redis.call("ZREMRANGEBYSCORE", KEYS[3], "-inf", redis.call("TIME")[1])
+if redis.call("ZCARD", KEYS[3]) > 0 or tonumber(redis.call("GET", KEYS[2]) or "0") > 0 then return 0 end
+redis.call("DEL", KEYS[1])
+return 1
 `)
 
 // RedisRuntimeCatalog implements RuntimeCatalog over Redis with atomic Lua ExecutionID fencing.
@@ -167,8 +180,8 @@ func (c *RedisRuntimeCatalog) GetRoute(ctx context.Context, sandboxID string) (*
 	return &rec, nil
 }
 
-func (c *RedisRuntimeCatalog) DeleteRouteFenced(ctx context.Context, sandboxID string, maxExecutionID int64) error {
-	res, err := luaDeleteRouteFenced.Run(ctx, c.rdb, []string{protocol.RouteKey(sandboxID)}, maxExecutionID).Int()
+func (c *RedisRuntimeCatalog) DeleteRouteFenced(ctx context.Context, sandboxID string, executionID int64, slotID string) error {
+	res, err := luaDeleteRouteFenced.Run(ctx, c.rdb, []string{protocol.RouteKey(sandboxID)}, executionID, slotID).Int()
 	if err != nil {
 		return err
 	}
@@ -178,47 +191,79 @@ func (c *RedisRuntimeCatalog) DeleteRouteFenced(ctx context.Context, sandboxID s
 	return nil
 }
 
-func (c *RedisRuntimeCatalog) AcquireTransitionLock(ctx context.Context, sandboxID string, ttl time.Duration) (func(), error) {
-	tokBytes := make([]byte, 16)
-	_, _ = rand.Read(tokBytes)
-	tok := hex.EncodeToString(tokBytes)
-	key := protocol.LockKey(sandboxID)
-	ok, err := c.rdb.SetNX(ctx, key, tok, ttl).Result()
+func (c *RedisRuntimeCatalog) AdmitRoute(ctx context.Context, id, requestID string) (*protocol.RouteRecord, error) {
+	raw, err := luaAdmitRoute.Run(ctx, c.rdb, []string{protocol.RouteKey(id), admissionsKey(id)}, requestID, int(AdmissionTTL.Seconds())).Text()
+	if errors.Is(err, redis.Nil) {
+		return nil, ErrNotFound
+	}
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
-		return nil, ErrTransitionLocked
+	var r protocol.RouteRecord
+	if err = json.Unmarshal([]byte(raw), &r); err != nil {
+		_ = c.FinishAdmission(context.WithoutCancel(ctx), id, requestID)
+		return nil, err
 	}
-	return func() {
-		_, _ = luaReleaseLockIfOwner.Run(context.Background(), c.rdb, []string{key}, tok).Result()
-	}, nil
+	return &r, nil
+}
+
+func admissionsKey(id string) string { return "kt:admissions:" + id }
+
+var luaRenewAdmission = redis.NewScript(`
+local now = tonumber(redis.call("TIME")[1])
+local expires = redis.call("ZSCORE", KEYS[1], ARGV[1])
+if not expires or tonumber(expires) <= now then return 0 end
+redis.call("ZADD", KEYS[1], now+tonumber(ARGV[2]), ARGV[1])
+redis.call("EXPIRE", KEYS[1], ARGV[2])
+return 1
+`)
+
+func (c *RedisRuntimeCatalog) RenewAdmission(ctx context.Context, id, requestID string) error {
+	n, err := luaRenewAdmission.Run(ctx, c.rdb, []string{admissionsKey(id)}, requestID, int(AdmissionTTL.Seconds())).Int()
+	if err == nil && n == 0 {
+		return ErrNotFound
+	}
+	return err
+}
+func (c *RedisRuntimeCatalog) FinishAdmission(ctx context.Context, id, requestID string) error {
+	return c.rdb.ZRem(ctx, admissionsKey(id), requestID).Err()
+}
+
+func (c *RedisRuntimeCatalog) DrainRoute(ctx context.Context, r protocol.RouteRecord) error {
+	result, err := luaDrainRoute.Run(ctx, c.rdb, []string{protocol.RouteKey(r.SandboxID), protocol.InflightKey(r.SandboxID), admissionsKey(r.SandboxID)}, r.ExecutionID, r.SlotID).Int()
+	if err != nil {
+		return err
+	}
+	switch result {
+	case -1:
+		return ErrStaleExecutionFence
+	case 0:
+		return ErrTransitionLocked
+	}
+	return nil
 }
 
 func (c *RedisRuntimeCatalog) TouchSandboxActive(ctx context.Context, sandboxID string, at time.Time) error {
 	return c.rdb.Set(ctx, protocol.ActiveAtKey(sandboxID), strconv.FormatInt(at.UnixNano(), 10), 24*time.Hour).Err()
 }
 
-func (c *RedisRuntimeCatalog) AdjustInflight(ctx context.Context, sandboxID string, delta int64) (int64, error) {
-	key := protocol.InflightKey(sandboxID)
-	n, err := c.rdb.IncrBy(ctx, key, delta).Result()
-	if err != nil {
-		return 0, err
-	}
-	if n <= 0 {
-		_ = c.rdb.Del(ctx, key).Err()
-		return 0, nil
-	}
-	_ = c.rdb.Expire(ctx, key, 2*time.Hour).Err()
-	return n, nil
+var luaAdjustInflight = redis.NewScript(`
+local count = redis.call("INCRBY", KEYS[1], ARGV[1])
+if count <= 0 then redis.call("DEL", KEYS[1]); return 0 end
+return count
+`)
+
+func (c *RedisRuntimeCatalog) AdjustInflight(ctx context.Context, id string, delta int64) (int64, error) {
+	return luaAdjustInflight.Run(ctx, c.rdb, []string{protocol.InflightKey(id)}, delta).Int64()
 }
 
+var luaCountInflight = redis.NewScript(`
+redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", redis.call("TIME")[1])
+return tonumber(redis.call("GET", KEYS[1]) or "0") + redis.call("ZCARD", KEYS[2])
+`)
+
 func (c *RedisRuntimeCatalog) Inflight(ctx context.Context, sandboxID string) (int64, error) {
-	n, err := c.rdb.Get(ctx, protocol.InflightKey(sandboxID)).Int64()
-	if errors.Is(err, redis.Nil) {
-		return 0, nil
-	}
-	return n, err
+	return luaCountInflight.Run(ctx, c.rdb, []string{protocol.InflightKey(sandboxID), admissionsKey(sandboxID)}).Int64()
 }
 
 func (c *RedisRuntimeCatalog) GetLastActive(ctx context.Context, sandboxID string) (time.Time, bool, error) {

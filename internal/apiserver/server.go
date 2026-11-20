@@ -558,16 +558,32 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 	return sbx, nil
 }
 
+// A session-scoped lock covers checkpoint, upload and commit, regardless of their duration.
+func (s *Server) lockExecution(ctx context.Context, id string) (func(), error) {
+	release, ok, err := s.cfg.Meta.TryLeader(ctx, "sandbox/"+id)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, store.ErrTransitionLocked
+	}
+	return release, nil
+}
+
 // SuspendSandbox checkpoints a running sandbox via Kubelet's native /checkpoint API,
 // diffs 2MiB chunks against its parent template, releases 100% of container RAM, and marks it SUSPENDED.
 func (s *Server) SuspendSandbox(ctx context.Context, sandboxID string) (*store.SnapshotRecord, error) {
+	return s.suspendSandbox(ctx, sandboxID, nil)
+}
+
+func (s *Server) suspendSandbox(ctx context.Context, sandboxID string, observed *store.SandboxRecord) (_ *store.SnapshotRecord, retErr error) {
 	ctx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "apiserver.suspend_sandbox",
 		attribute.String(telemetry.AttrSandboxID, sandboxID),
 	)
-	var retErr error
+
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
-	unlock, err := s.cfg.Catalog.AcquireTransitionLock(ctx, sandboxID, 60*time.Second)
+	unlock, err := s.lockExecution(ctx, sandboxID)
 	if err != nil {
 		retErr = err
 		return nil, err
@@ -579,32 +595,96 @@ func (s *Server) SuspendSandbox(ctx context.Context, sandboxID string) (*store.S
 		retErr = err
 		return nil, err
 	}
+	if observed != nil && (sbx.ExecutionID != observed.ExecutionID || sbx.State != observed.State || sbx.LifecycleID != observed.LifecycleID) {
+		return nil, store.ErrStaleExecutionFence
+	}
 	if sbx.State == store.SandboxStateSuspended && sbx.ActiveSnapshotID != "" {
-		s.releaseLeftoverRoute(ctx, sandboxID, sbx.ExecutionID)
+		if err := s.finishSuspendRelease(ctx, sbx); err != nil {
+			return nil, err
+		}
 		return s.cfg.Meta.GetSnapshot(ctx, sbx.ActiveSnapshotID)
 	}
-	if sbx.State != store.SandboxStateRunning {
-		retErr = fmt.Errorf("sandbox %s in state %s cannot suspend", sandboxID, sbx.State)
-		return nil, retErr
+	if sbx.State != store.SandboxStateRunning && sbx.State != store.SandboxStateSuspending {
+		return nil, fmt.Errorf("cannot suspend sandbox in state %s", sbx.State)
 	}
-
-	route, err := s.cfg.Catalog.GetRoute(ctx, sandboxID)
+	route, err := s.routeForExecution(ctx, sbx)
 	if err != nil {
-		if healed, hErr := s.republishRouteFromSandbox(ctx, sbx); hErr == nil {
-			route = healed
-		} else {
-			retErr = fmt.Errorf("lookup live route for %s: %w", sandboxID, err)
-			return nil, retErr
-		}
+		return nil, err
 	}
-
-	nodeClient, err := s.nodeClient(route.NodeGRPCAddr)
-	if err != nil {
-		retErr = err
+	if err := s.cfg.Catalog.DrainRoute(ctx, *route); err != nil {
 		return nil, err
 	}
 
-	newSnapID := fmt.Sprintf("snap-susp-%s-%d", sandboxID, sbx.ExecutionID)
+	if sbx.State == store.SandboxStateRunning {
+		sbx.State = store.SandboxStateSuspending
+		sbx.PendingSnapshotID = "snap-susp-" + randHex(12)
+		if err := s.cfg.Meta.SaveSandbox(ctx, sbx); err != nil {
+			return nil, err
+		}
+	}
+	if sbx.PendingSnapshotID == "" {
+		return nil, fmt.Errorf("suspending sandbox has no pending snapshot")
+	}
+	snapRec, err := s.cfg.Meta.GetSnapshot(ctx, sbx.PendingSnapshotID)
+	if errors.Is(err, store.ErrNotFound) {
+		snapRec, err = s.captureSuspend(ctx, sbx, route)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	previous := sbx.ActiveSnapshotID
+	sbx.State = store.SandboxStateSuspended
+	sbx.ActiveSnapshotID = snapRec.SnapshotID
+	sbx.PendingSnapshotID = ""
+	sbx.OriginNodeID = route.NodeID
+	// Preserve the old allocation until node cleanup is acknowledged.
+	if err := s.cfg.Meta.SaveSandbox(ctx, sbx); err != nil {
+		return nil, err
+	}
+	if previous != "" {
+		if snap, err := s.cfg.Meta.GetSnapshot(ctx, previous); err == nil && snap.Kind == protocol.SnapshotKindSessionSuspend {
+			_ = s.cfg.Meta.MarkSnapshotSuperseded(ctx, previous)
+		}
+	}
+	if err := s.finishSuspendRelease(ctx, sbx); err != nil {
+		return nil, err
+	}
+	return snapRec, nil
+}
+
+func (s *Server) finishSuspendRelease(ctx context.Context, sbx *store.SandboxRecord) error {
+	if sbx.CurrentSlotID == "" {
+		return nil
+	}
+	route, err := s.routeForExecution(ctx, sbx)
+	if err != nil {
+		return err
+	}
+	nc, err := s.nodeClient(route.NodeGRPCAddr)
+	if err != nil {
+		return err
+	}
+	_, err = nc.ReleaseSlot(ctx, &protocol.ReleaseSlotRequest{SlotID: sbx.CurrentSlotID, SandboxID: sbx.SandboxID, ExecutionID: sbx.ExecutionID, ReuseSlot: s.cfg.ReuseSlots})
+	if err != nil {
+		return err
+	}
+	if !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
+		s.cfg.Replenisher.EnqueueTaintedPod(sbx.CarrierPodNamespace, sbx.CarrierPodName)
+	}
+	sbx.CurrentNodeID = ""
+	sbx.CurrentSlotID = ""
+	sbx.PodIP = ""
+	return s.cfg.Meta.SaveSandbox(ctx, sbx)
+}
+
+func (s *Server) captureSuspend(ctx context.Context, sbx *store.SandboxRecord, route *protocol.RouteRecord) (*store.SnapshotRecord, error) {
+	nodeClient, err := s.nodeClient(route.NodeGRPCAddr)
+	if err != nil {
+		return nil, err
+	}
+	sandboxID := sbx.SandboxID
+	newSnapID := sbx.PendingSnapshotID
 	if _, err := nodeClient.PrepareCheckpoint(ctx, &protocol.PrepareCheckpointRequest{
 		SandboxID:        sandboxID,
 		TemplateID:       sbx.TemplateID,
@@ -619,21 +699,21 @@ func (s *Server) SuspendSandbox(ctx context.Context, sandboxID string) (*store.S
 		LeaveRunning:     true,
 		BootstrapToken:   sbx.BootstrapToken,
 	}); err != nil {
-		retErr = err
 		return nil, err
 	}
 
 	kubeletPort := s.lookupNodeKubeletPort(ctx, route.NodeID)
 	if _, err := s.cfg.Kubelet.CheckpointContainer(ctx, route.NodeIP, kubeletPort,
 		sbx.CarrierPodNamespace, sbx.CarrierPodName, protocol.ContainerNameSandbox, 60); err != nil {
-		retErr = err
 		return nil, err
 	}
 
 	snapRes, err := nodeClient.GetLatestSnapshotResult(ctx, &protocol.GetLatestSnapshotResultRequest{SnapshotID: newSnapID})
-	if err != nil || !snapRes.Found {
-		retErr = fmt.Errorf("fetch suspend snapshot %s result: %w", newSnapID, err)
-		return nil, retErr
+	if err != nil {
+		return nil, fmt.Errorf("fetch suspend snapshot %s: %w", newSnapID, err)
+	}
+	if !snapRes.Found {
+		return nil, fmt.Errorf("suspend snapshot %s is unavailable", newSnapID)
 	}
 
 	prevSnapID := sbx.ActiveSnapshotID
@@ -655,34 +735,9 @@ func (s *Server) SuspendSandbox(ctx context.Context, sandboxID string) (*store.S
 		Fingerprint:      snapRes.Manifest.Fingerprint,
 	}
 	if err := s.cfg.Meta.CreateSnapshot(ctx, snapRec); err != nil {
-		retErr = err
 		return nil, err
 	}
 
-	// Mark prior session snapshot (never GoldenTemplate!) superseded for reference-counted GC.
-	if prevSnapID != "" {
-		if prev, pErr := s.cfg.Meta.GetSnapshot(ctx, prevSnapID); pErr == nil && prev.Kind == protocol.SnapshotKindSessionSuspend {
-			_ = s.cfg.Meta.MarkSnapshotSuperseded(ctx, prevSnapID)
-		}
-	}
-
-	sbx.State = store.SandboxStateSuspended
-	sbx.ActiveSnapshotID = newSnapID
-	sbx.OriginNodeID = route.NodeID
-	releaseSlotID := sbx.CurrentSlotID
-	releaseNodeID := route.NodeID
-	sbx.CurrentNodeID = ""
-	sbx.CurrentSlotID = ""
-	sbx.PodIP = ""
-	if err := s.cfg.Meta.SaveSandbox(ctx, sbx); err != nil {
-		retErr = err
-		return nil, err
-	}
-	// Route and RAM stay until the suspended record is durable. ReleaseSlot drops the route and the restore view.
-	s.releaseSandboxResources(ctx, sandboxID, sbx.ExecutionID, releaseSlotID, releaseNodeID)
-	if !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
-		s.cfg.Replenisher.EnqueueTaintedPod(sbx.CarrierPodNamespace, sbx.CarrierPodName)
-	}
 	return snapRec, nil
 }
 
@@ -695,7 +750,7 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
-	unlock, err := s.cfg.Catalog.AcquireTransitionLock(ctx, sandboxID, 60*time.Second)
+	unlock, err := s.lockExecution(ctx, sandboxID)
 	if err != nil {
 		retErr = err
 		return nil, err
@@ -708,8 +763,32 @@ func (s *Server) ResumeSandbox(ctx context.Context, sandboxID string) (*store.Sa
 		return nil, err
 	}
 	if sbx.State == store.SandboxStateRunning {
-		_, _ = s.republishRouteFromSandbox(ctx, sbx)
+		if _, err := s.cfg.Catalog.GetRoute(ctx, sandboxID); errors.Is(err, store.ErrNotFound) {
+			r, err := s.routeForExecution(ctx, sbx)
+			if err != nil {
+				return nil, err
+			}
+			health, err := s.ktdClient.Health(ctx, sbx.PodIP, sbx.AccessToken)
+			if err != nil {
+				return nil, err
+			}
+			if health.SandboxID != sbx.SandboxID || health.ExecutionID != sbx.ExecutionID || !health.Healthy || health.Frozen {
+				return nil, store.ErrStaleExecutionFence
+			}
+			if err := s.cfg.Catalog.PublishRoute(ctx, *r); err != nil {
+				return nil, err
+			}
+		} else if err != nil {
+			return nil, err
+		}
 		return sbx, nil
+	}
+
+	if sbx.State != store.SandboxStateSuspended {
+		return nil, store.ErrTransitionLocked
+	}
+	if err := s.finishSuspendRelease(ctx, sbx); err != nil {
+		return nil, err
 	}
 
 	snap, err := s.cfg.Meta.GetSnapshot(ctx, sbx.ActiveSnapshotID)
@@ -805,19 +884,16 @@ func (s *Server) abandonHydratedSlot(ctx context.Context, dec *PlacementDecision
 	}
 }
 
-func (s *Server) releaseLeftoverRoute(ctx context.Context, sandboxID string, executionID int64) {
-	s.releaseSandboxResources(ctx, sandboxID, executionID, "", "")
-}
-
 // releaseSandboxResources stops the gVisor process and unmounts its restore view.
 // A missing route still uses the slot and node recorded on the sandbox.
 func (s *Server) releaseSandboxResources(ctx context.Context, sandboxID string, executionID int64, slotID, nodeID string) {
 	if route, err := s.cfg.Catalog.GetRoute(ctx, sandboxID); err == nil {
-		if route.SlotID != "" {
-			slotID = route.SlotID
+		if route.ExecutionID != executionID || (slotID != "" && slotID != route.SlotID) {
+			return
 		}
+		slotID = route.SlotID
 		s.releaseOnNode(ctx, route.NodeGRPCAddr, slotID, sandboxID, executionID)
-		_ = s.cfg.Catalog.DeleteRouteFenced(ctx, sandboxID, executionID)
+		_ = s.cfg.Catalog.DeleteRouteFenced(ctx, sandboxID, executionID, slotID)
 		return
 	}
 	if nodeID == "" {
@@ -851,11 +927,16 @@ func (s *Server) releaseOnNode(ctx context.Context, grpcAddr, slotID, sandboxID 
 	})
 }
 
-func (s *Server) republishRouteFromSandbox(ctx context.Context, sbx *store.SandboxRecord) (*protocol.RouteRecord, error) {
+func (s *Server) routeForExecution(ctx context.Context, sbx *store.SandboxRecord) (*protocol.RouteRecord, error) {
 	if existing, err := s.cfg.Catalog.GetRoute(ctx, sbx.SandboxID); err == nil {
+		if existing.ExecutionID != sbx.ExecutionID || existing.SlotID != sbx.CurrentSlotID {
+			return nil, store.ErrStaleExecutionFence
+		}
 		return existing, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
 	}
-	if sbx.State != store.SandboxStateRunning || sbx.PodIP == "" || sbx.CurrentNodeID == "" {
+	if sbx.PodIP == "" || sbx.CurrentNodeID == "" {
 		return nil, store.ErrNotFound
 	}
 	nodes, err := s.cfg.Catalog.ListHealthyNodes(ctx)
@@ -886,9 +967,6 @@ func (s *Server) republishRouteFromSandbox(ctx context.Context, sbx *store.Sandb
 		PodIP:          sbx.PodIP,
 		StartedAt:      time.Now().UTC(),
 	}
-	if err := s.cfg.Catalog.PublishRoute(ctx, *route); err != nil {
-		return nil, err
-	}
 	return route, nil
 }
 
@@ -904,6 +982,12 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 	)
 	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
+
+	unlock, err := s.lockExecution(ctx, sourceSandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	src, err := s.cfg.Meta.GetSandbox(ctx, sourceSandboxID)
 	if err != nil {
@@ -972,7 +1056,7 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 			retErr = err
 			return nil, err
 		}
-	} else if src.ActiveSnapshotID != "" {
+	} else if src.State == store.SandboxStateSuspended && src.ActiveSnapshotID != "" {
 		forkSnap, err = s.cfg.Meta.GetSnapshot(ctx, src.ActiveSnapshotID)
 		if err != nil {
 			retErr = err
@@ -1068,6 +1152,11 @@ func (s *Server) ForkSandbox(ctx context.Context, sourceSandboxID string, req Fo
 }
 
 func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
+	unlock, err := s.lockExecution(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	sbx, err := s.cfg.Meta.GetSandbox(ctx, sandboxID)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil
@@ -1079,6 +1168,9 @@ func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
 	nodeID := sbx.CurrentNodeID
 	var podNS, podName string
 	if route, rErr := s.cfg.Catalog.GetRoute(ctx, sandboxID); rErr == nil {
+		if route.ExecutionID != sbx.ExecutionID || (slotID != "" && slotID != route.SlotID) {
+			return store.ErrStaleExecutionFence
+		}
 		podNS = route.PodNamespace
 		podName = route.CarrierPodName
 		if route.SlotID != "" {
@@ -1127,9 +1219,13 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 	defer release()
 
 	now := time.Now().UTC()
-	running, err := s.cfg.Meta.ListRunningSandboxes(ctx)
+	running, err := s.cfg.Meta.ListSandboxesToSweep(ctx)
 	if err == nil {
 		for _, sbx := range running {
+			if sbx.State == store.SandboxStateSuspending || sbx.State == store.SandboxStateSuspended {
+				_, _ = s.suspendSandbox(ctx, sbx.SandboxID, &sbx)
+				continue
+			}
 			if sbx.IdleTimeoutSeconds <= 0 {
 				continue
 			}
@@ -1141,7 +1237,7 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 				lastActive = sbx.UpdatedAt
 			}
 			if now.Sub(lastActive) >= time.Duration(sbx.IdleTimeoutSeconds)*time.Second {
-				_, _ = s.SuspendSandbox(ctx, sbx.SandboxID)
+				_, _ = s.suspendSandbox(ctx, sbx.SandboxID, &sbx)
 			}
 		}
 	}

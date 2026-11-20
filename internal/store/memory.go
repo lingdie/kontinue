@@ -202,12 +202,12 @@ func (m *MemoryMetadataStore) SaveSandbox(_ context.Context, sbx *SandboxRecord)
 	return nil
 }
 
-func (m *MemoryMetadataStore) ListRunningSandboxes(_ context.Context) ([]SandboxRecord, error) {
+func (m *MemoryMetadataStore) ListSandboxesToSweep(_ context.Context) ([]SandboxRecord, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var out []SandboxRecord
 	for _, s := range m.sandboxes {
-		if s.State == SandboxStateRunning {
+		if s.State == SandboxStateRunning || s.State == SandboxStateSuspending || (s.State == SandboxStateSuspended && s.CurrentSlotID != "") {
 			out = append(out, cloneSandbox(s))
 		}
 	}
@@ -237,9 +237,9 @@ type MemoryRuntimeCatalog struct {
 	mu          sync.Mutex
 	idlePools   map[string][]protocol.CarrierSlot
 	routes      map[string]protocol.RouteRecord
-	locks       map[string]time.Time
 	activeAt    map[string]time.Time
 	inflight    map[string]int64
+	admissions  map[string]map[string]time.Time
 	nodes       map[string]nodeEntry
 	idempotency map[string]idempEntry
 }
@@ -259,9 +259,9 @@ func NewMemoryRuntimeCatalog() *MemoryRuntimeCatalog {
 	return &MemoryRuntimeCatalog{
 		idlePools:   make(map[string][]protocol.CarrierSlot),
 		routes:      make(map[string]protocol.RouteRecord),
-		locks:       make(map[string]time.Time),
 		activeAt:    make(map[string]time.Time),
 		inflight:    make(map[string]int64),
+		admissions:  make(map[string]map[string]time.Time),
 		nodes:       make(map[string]nodeEntry),
 		idempotency: make(map[string]idempEntry),
 	}
@@ -342,34 +342,69 @@ func (c *MemoryRuntimeCatalog) GetRoute(_ context.Context, sandboxID string) (*p
 	return &cp, nil
 }
 
-func (c *MemoryRuntimeCatalog) DeleteRouteFenced(_ context.Context, sandboxID string, maxExecutionID int64) error {
+func (c *MemoryRuntimeCatalog) DeleteRouteFenced(_ context.Context, sandboxID string, executionID int64, slotID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if cur, ok := c.routes[sandboxID]; ok && cur.ExecutionID > maxExecutionID {
+	if cur, ok := c.routes[sandboxID]; ok && (cur.ExecutionID != executionID || cur.SlotID != slotID) {
 		return ErrStaleExecutionFence
 	}
 	delete(c.routes, sandboxID)
 	return nil
 }
 
-func (c *MemoryRuntimeCatalog) AcquireTransitionLock(_ context.Context, sandboxID string, ttl time.Duration) (func(), error) {
+func (c *MemoryRuntimeCatalog) AdmitRoute(_ context.Context, id, requestID string) (*protocol.RouteRecord, error) {
 	c.mu.Lock()
-	now := time.Now()
-	if exp, ok := c.locks[sandboxID]; ok && now.Before(exp) {
-		c.mu.Unlock()
-		return nil, ErrTransitionLocked
+	defer c.mu.Unlock()
+	r, ok := c.routes[id]
+	if !ok {
+		return nil, ErrNotFound
 	}
-	exp := now.Add(ttl)
-	c.locks[sandboxID] = exp
-	c.mu.Unlock()
+	if c.admissions[id] == nil {
+		c.admissions[id] = make(map[string]time.Time)
+	}
+	c.admissions[id][requestID] = time.Now().Add(AdmissionTTL)
+	return &r, nil
+}
 
-	return func() {
-		c.mu.Lock()
-		if curExp, ok := c.locks[sandboxID]; ok && curExp.Equal(exp) {
-			delete(c.locks, sandboxID)
+func (c *MemoryRuntimeCatalog) RenewAdmission(_ context.Context, id, requestID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !time.Now().Before(c.admissions[id][requestID]) {
+		return ErrNotFound
+	}
+	c.admissions[id][requestID] = time.Now().Add(AdmissionTTL)
+	return nil
+}
+func (c *MemoryRuntimeCatalog) FinishAdmission(_ context.Context, id, requestID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.admissions[id], requestID)
+	if len(c.admissions[id]) == 0 {
+		delete(c.admissions, id)
+	}
+	return nil
+}
+func (c *MemoryRuntimeCatalog) inflightLocked(id string) int64 {
+	now := time.Now()
+	for key, expires := range c.admissions[id] {
+		if !now.Before(expires) {
+			delete(c.admissions[id], key)
 		}
-		c.mu.Unlock()
-	}, nil
+	}
+	return c.inflight[id] + int64(len(c.admissions[id]))
+}
+
+func (c *MemoryRuntimeCatalog) DrainRoute(_ context.Context, r protocol.RouteRecord) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cur, ok := c.routes[r.SandboxID]; ok && (cur.SlotID != r.SlotID || cur.ExecutionID != r.ExecutionID) {
+		return ErrStaleExecutionFence
+	}
+	if c.inflightLocked(r.SandboxID) > 0 {
+		return ErrTransitionLocked
+	}
+	delete(c.routes, r.SandboxID)
+	return nil
 }
 
 func (c *MemoryRuntimeCatalog) TouchSandboxActive(_ context.Context, sandboxID string, at time.Time) error {
@@ -394,7 +429,7 @@ func (c *MemoryRuntimeCatalog) AdjustInflight(_ context.Context, sandboxID strin
 func (c *MemoryRuntimeCatalog) Inflight(_ context.Context, sandboxID string) (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.inflight[sandboxID], nil
+	return c.inflightLocked(sandboxID), nil
 }
 
 func (c *MemoryRuntimeCatalog) GetLastActive(_ context.Context, sandboxID string) (time.Time, bool, error) {

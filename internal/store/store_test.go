@@ -39,7 +39,7 @@ func TestExecutionIDFencingAndSnapshotGC(t *testing.T) {
 	if err := cat.PublishRoute(ctx, protocol.RouteRecord{SandboxID: "sbx-1", ExecutionID: 1, PodIP: "10.244.1.9"}); !errors.Is(err, store.ErrStaleExecutionFence) {
 		t.Fatalf("expected stale PublishRoute v1 to fail with ErrStaleExecutionFence, got %v", err)
 	}
-	if err := cat.DeleteRouteFenced(ctx, "sbx-1", 1); !errors.Is(err, store.ErrStaleExecutionFence) {
+	if err := cat.DeleteRouteFenced(ctx, "sbx-1", 1, ""); !errors.Is(err, store.ErrStaleExecutionFence) {
 		t.Fatalf("expected stale DeleteRouteFenced v1 to fail, got %v", err)
 	}
 	r, err := cat.GetRoute(ctx, "sbx-1")

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/kontinue-sh/kontinue/internal/crishim"
 	"github.com/kontinue-sh/kontinue/internal/node/arena"
+	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
 	"github.com/kontinue-sh/kontinue/pkg/telemetry"
 	"go.opentelemetry.io/otel/attribute"
@@ -46,10 +48,11 @@ type SwapContainerOptions struct {
 // RoutePublisher updates Redis route records with ExecutionID Lua fencing when a slot goes live.
 type RoutePublisher interface {
 	PublishRoute(ctx context.Context, route protocol.RouteRecord) error
-	DeleteRouteFenced(ctx context.Context, sandboxID string, executionID int64) error
+	DeleteRouteFenced(ctx context.Context, sandboxID string, executionID int64, slotID string) error
 }
 
 type activeSlotState struct {
+	releaseMu      sync.Mutex
 	slot           protocol.CarrierSlot
 	sandboxID      string
 	executionID    int64
@@ -198,7 +201,7 @@ func (s *Service) ExecuteCheckpoint(ctx context.Context, req *protocol.ExecuteCh
 	}
 
 	// If LeaveRunning (e.g. LiveFork or non-destructive template capture), thaw ktd immediately!
-	if prep.LeaveRunning && ktdAddr != "" && bootstrapTok != "" {
+	if prep.LeaveRunning && prep.Kind != protocol.SnapshotKindSessionSuspend && ktdAddr != "" && bootstrapTok != "" {
 		_ = s.cfg.KtdClient.Thaw(ctx, ktdAddr, bootstrapTok)
 	}
 
@@ -258,7 +261,7 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 	bootstrapToken := req.BootstrapToken
 
 	if req.SnapshotID != "" && restoreMode == protocol.RestoreModeMemory {
-		viewID := fmt.Sprintf("%s-exec-%d", req.SandboxID, req.ExecutionID)
+		viewID := "view-" + rand.Text()
 		var mf *protocol.SnapshotManifest
 		var err error
 		viewDir, arenaTier, mf, err = s.cfg.Arena.PrepareRestoreView(ctx, req.SnapshotID, viewID)
@@ -385,41 +388,48 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	)
 	defer telemetry.EndSpan(span, nil)
 
-	if s.cfg.Routes != nil && req.SandboxID != "" {
-		_ = s.cfg.Routes.DeleteRouteFenced(ctx, req.SandboxID, req.ExecutionID)
+	if req.SlotID == "" || req.SandboxID == "" || req.ExecutionID <= 0 {
+		return nil, fmt.Errorf("release requires slot, sandbox and execution IDs")
 	}
-
+	if s.cfg.Routes != nil {
+		err := s.cfg.Routes.DeleteRouteFenced(ctx, req.SandboxID, req.ExecutionID, req.SlotID)
+		// An obsolete instance can still own resources after its route has moved.
+		if err != nil && !errors.Is(err, store.ErrStaleExecutionFence) {
+			return nil, err
+		}
+	}
 	s.mu.Lock()
-	found := map[string]*activeSlotState{}
-	take := func(id string, st *activeSlotState) {
-		if st == nil {
-			return
-		}
-		if _, ok := found[id]; ok {
-			return
-		}
-		found[id] = st
-		delete(s.activeSlots, id)
-		delete(s.byContainer, st.containerID)
-	}
-	if req.SlotID != "" {
-		take(req.SlotID, s.activeSlots[req.SlotID])
-	}
-	if req.SandboxID != "" {
-		for id, st := range s.activeSlots {
-			if st.sandboxID == req.SandboxID {
-				take(id, st)
-			}
-		}
+	st := s.activeSlots[req.SlotID]
+	if st == nil || st.sandboxID != req.SandboxID || st.executionID != req.ExecutionID {
+		s.mu.Unlock()
+		return &protocol.ReleaseSlotResponse{}, nil
 	}
 	s.mu.Unlock()
 
-	for _, st := range found {
-		_ = s.cfg.Driver.StopSandboxContainer(ctx, st.slot, st.containerID)
-		if st.viewPath != "" {
-			_ = s.cfg.Arena.ReleaseView(st.viewPath)
+	st.releaseMu.Lock()
+	defer st.releaseMu.Unlock()
+	s.mu.Lock()
+	current := s.activeSlots[req.SlotID] == st
+	s.mu.Unlock()
+	if !current {
+		return &protocol.ReleaseSlotResponse{}, nil
+	}
+	if err := s.cfg.Driver.StopSandboxContainer(ctx, st.slot, st.containerID); err != nil {
+		return nil, err
+	}
+	if st.viewPath != "" {
+		if err := s.cfg.Arena.ReleaseView(st.viewPath); err != nil {
+			return nil, err
 		}
 	}
+	s.mu.Lock()
+	if s.activeSlots[req.SlotID] == st {
+		delete(s.activeSlots, req.SlotID)
+	}
+	if s.byContainer[st.containerID] == st {
+		delete(s.byContainer, st.containerID)
+	}
+	s.mu.Unlock()
 	return &protocol.ReleaseSlotResponse{
 		Released: true,
 		Tainted:  !req.ReuseSlot,

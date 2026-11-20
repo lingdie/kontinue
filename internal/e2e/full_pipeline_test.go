@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -225,6 +226,31 @@ func (k *mockKubeletBridge) CheckpointContainer(ctx context.Context, nodeIP stri
 	return []string{tarPath}, nil
 }
 
+// Interrupt the metadata commit after the node has already produced a snapshot.
+type interruptedSuspend struct {
+	store.MetadataStore
+	catalog     store.RuntimeCatalog
+	interrupted atomic.Bool
+}
+
+func (m *interruptedSuspend) SaveSandbox(ctx context.Context, sbx *store.SandboxRecord) error {
+	if sbx.State == store.SandboxStateSuspended && m.interrupted.CompareAndSwap(false, true) {
+		_, err := m.catalog.AdmitRoute(ctx, sbx.SandboxID, "after-capture")
+		if !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("unexpected admission during suspend: %v", err)
+		}
+		health, err := protocol.NewKtdClient(time.Second).Health(ctx, sbx.PodIP, sbx.AccessToken)
+		if err != nil {
+			return err
+		}
+		if !health.Frozen {
+			return errors.New("guest thawed before suspend commit")
+		}
+		return errors.New("injected suspend commit failure")
+	}
+	return m.MetadataStore.SaveSandbox(ctx, sbx)
+}
+
 func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResume_And_Traces(t *testing.T) {
 	ctx := context.Background()
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
@@ -245,8 +271,25 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 	}
 	defer func() { _ = prov.Shutdown(ctx) }()
 
-	meta := store.NewMemoryMetadataStore()
-	catalog := store.NewMemoryRuntimeCatalog()
+	var catalog store.RuntimeCatalog = store.NewMemoryRuntimeCatalog()
+	if addr := os.Getenv("KONTINUE_TEST_REDIS"); addr != "" {
+		redis := store.NewRedisRuntimeCatalog(addr, "", 0)
+		defer redis.Close()
+		catalog = redis
+	}
+	var db store.MetadataStore = store.NewMemoryMetadataStore()
+	if dsn := os.Getenv("KONTINUE_TEST_POSTGRES"); dsn != "" {
+		pg, err := store.NewPostgresMetadataStore(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pg.Close()
+		if err := pg.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		db = pg
+	}
+	meta := &interruptedSuspend{MetadataStore: db, catalog: catalog}
 	sharedCAS, _ := storage.NewLocalFSBackend(t.TempDir())
 	sharedFP := protocol.CompatibilityFingerprint{
 		Architecture:   "arm64",
@@ -402,7 +445,7 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 	// 2. 1-to-N Fast Clone + Idempotency + Dynamic Secret Env Injection
 	// =========================================================================
 	sbxReqBody, _ := json.Marshal(apiserver.CreateSandboxRequest{
-		SandboxID: "sbx-agent-007",
+		SandboxID:  "sbx-agent-007",
 		TemplateID: createdTpl.TemplateID,
 		EnvVars: map[string]string{
 			"OPENAI_API_KEY": "sk-tenant-secret-never-in-template",
@@ -483,6 +526,29 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 	// =========================================================================
 	// 4. 1-to-1 Suspend (Blake3 Diff) + Cross-Node P2P Singleflight Auto-Resume
 	// =========================================================================
+	if _, err := catalog.AdmitRoute(ctx, sbx.SandboxID, "long-request"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := apiSrvImpl.SuspendSandbox(ctx, sbx.SandboxID); !errors.Is(err, store.ErrTransitionLocked) {
+		t.Fatalf("suspend with active request: %v", err)
+	}
+	if err := catalog.FinishAdmission(ctx, sbx.SandboxID, "long-request"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := apiSrvImpl.SuspendSandbox(ctx, sbx.SandboxID); err == nil || err.Error() != "injected suspend commit failure" {
+		t.Fatalf("interrupted suspend: %v", err)
+	}
+	intent, err := meta.GetSandbox(ctx, sbx.SandboxID)
+	if err != nil || intent.State != store.SandboxStateSuspending {
+		t.Fatalf("missing suspend intent: %v", err)
+	}
+	recovered := apiserver.NewServer(apiserver.ServerConfig{Meta: meta, Catalog: catalog, Kubelet: kubeletMock})
+	recovered.RunEvictionAndGCSweep(ctx)
+	recovered.Close()
+	finished, err := meta.GetSandbox(ctx, sbx.SandboxID)
+	if err != nil || finished.State != store.SandboxStateSuspended || finished.CurrentSlotID != "" || finished.ActiveSnapshotID != intent.PendingSnapshotID {
+		t.Fatalf("sweep did not finish interrupted suspend: err=%v", err)
+	}
 	suspResp, err := httpClient.Post(fmt.Sprintf("%s/v1/sandboxes/%s/suspend", apiHTTP.URL, sbx.SandboxID), "application/json", nil)
 	if err != nil || suspResp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(suspResp.Body)

@@ -2,6 +2,7 @@ package hydrator
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -112,10 +113,8 @@ func (d *GVisorSandboxDriver) SwapAndStartSandboxContainer(ctx context.Context, 
 		return "", "", fmt.Errorf("prepare base rootfs for %s: %w", opts.BaseImage, err)
 	}
 
-	cid := fmt.Sprintf("kt-sbx-%s", opts.SandboxID)
-	if opts.Slot.SlotID != "" {
-		cid = fmt.Sprintf("kt-%s-%s", opts.SandboxID, filepath.Base(opts.Slot.SlotID))
-	}
+	// Each attempt owns its own bundle and cgroup, even if a slot is reused.
+	cid := "kt-" + rand.Text()
 	bundleDir := filepath.Join(d.cfg.BundlesDir, cid)
 	_ = os.RemoveAll(bundleDir)
 	if err := os.MkdirAll(bundleDir, 0o700); err != nil {

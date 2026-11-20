@@ -2,7 +2,7 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -99,11 +99,15 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-	route, err := g.cfg.Catalog.GetRoute(ctx, sandboxID)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	requestID := rand.Text()
+	route, err := g.cfg.Catalog.AdmitRoute(ctx, sandboxID, requestID)
 	if errors.Is(err, store.ErrNotFound) {
 		// Auto-Resume path: coalesce concurrent requests for this suspended sandbox into ONE wakeup flight!
-		route, err = g.autoResumeSingleflight(ctx, sandboxID)
+		if err = g.autoResumeSingleflight(ctx, sandboxID); err == nil {
+			route, err = g.cfg.Catalog.AdmitRoute(ctx, sandboxID, requestID)
+		}
 	}
 	if err != nil {
 		w.Header().Set("Retry-After", "2")
@@ -113,10 +117,10 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	counter := g.counterFor(sandboxID)
 	counter.Add(1)
-	_, _ = g.cfg.Catalog.AdjustInflight(ctx, sandboxID, 1)
+	go g.renewAdmission(ctx, cancel, sandboxID, requestID)
 	defer func() {
 		counter.Add(-1)
-		_, _ = g.cfg.Catalog.AdjustInflight(context.Background(), sandboxID, -1)
+		_ = g.cfg.Catalog.FinishAdmission(context.Background(), sandboxID, requestID)
 		_ = g.cfg.Catalog.TouchSandboxActive(context.Background(), sandboxID, time.Now().UTC())
 	}()
 	_ = g.cfg.Catalog.TouchSandboxActive(ctx, sandboxID, time.Now().UTC())
@@ -139,17 +143,37 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(rw, fmt.Sprintf(`{"error":"upstream sandbox unreachable: %v"}`, pErr), http.StatusBadGateway)
 		},
 	}
-	proxy.ServeHTTP(w, r)
+	proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
-func (g *Gateway) autoResumeSingleflight(callerCtx context.Context, sandboxID string) (*protocol.RouteRecord, error) {
+// Stop forwarding a long-lived stream if its gateway loses the admission lease.
+func (g *Gateway) renewAdmission(ctx context.Context, cancel context.CancelFunc, id, requestID string) {
+	ticker := time.NewTicker(store.AdmissionTTL / 3)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewCtx, done := context.WithTimeout(ctx, store.AdmissionTTL/3)
+			err := g.cfg.Catalog.RenewAdmission(renewCtx, id, requestID)
+			done()
+			if err != nil {
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+func (g *Gateway) autoResumeSingleflight(callerCtx context.Context, sandboxID string) error {
 	ctx, span := telemetry.StartSpan(callerCtx, "kontinue-gateway", "gateway.auto_resume_singleflight",
 		attribute.String(telemetry.AttrSandboxID, sandboxID),
 	)
 	var retErr error
 	defer func() { telemetry.EndSpan(span, retErr) }()
 
-	val, err, shared := g.resumeSF.Do(sandboxID, func() (any, error) {
+	_, err, shared := g.resumeSF.Do(sandboxID, func() (any, error) {
 		// Detach from a single impatient caller cancellation so sibling callers in the flight still succeed.
 		detachedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
@@ -168,25 +192,11 @@ func (g *Gateway) autoResumeSingleflight(callerCtx context.Context, sandboxID st
 			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 			return nil, fmt.Errorf("apiserver resume status %d: %s", resp.StatusCode, string(msg))
 		}
-		var resumed store.SandboxRecord
-		if err := json.NewDecoder(resp.Body).Decode(&resumed); err != nil {
-			return nil, err
-		}
-		if r, gErr := g.cfg.Catalog.GetRoute(detachedCtx, sandboxID); gErr == nil {
-			return r, nil
-		}
-		return &protocol.RouteRecord{
-			SandboxID:   resumed.SandboxID,
-			ExecutionID: resumed.ExecutionID,
-			PodIP:       resumed.PodIP,
-		}, nil
+		return nil, nil
 	})
 	span.SetAttributes(attribute.Bool("singleflight.shared", shared))
-	if err != nil {
-		retErr = err
-		return nil, err
-	}
-	return val.(*protocol.RouteRecord), nil
+	retErr = err
+	return err
 }
 
 func (g *Gateway) resolveTarget(r *http.Request) (sandboxID string, port int) {

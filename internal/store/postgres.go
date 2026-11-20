@@ -62,7 +62,8 @@ CREATE INDEX IF NOT EXISTS idx_kt_snapshots_superseded ON kt_snapshots(supersede
 
 // PostgresMetadataStore implements MetadataStore backed by PostgreSQL (pgxpool).
 type PostgresMetadataStore struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	locks *pgxpool.Pool
 }
 
 func NewPostgresMetadataStore(ctx context.Context, connString string) (*PostgresMetadataStore, error) {
@@ -70,10 +71,18 @@ func NewPostgresMetadataStore(ctx context.Context, connString string) (*Postgres
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
-	return &PostgresMetadataStore{pool: pool}, nil
+	// Keep lock holders from exhausting the connections used for metadata writes.
+	cfg := pool.Config()
+	cfg.MaxConns = max(cfg.MaxConns, 4)
+	locks, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &PostgresMetadataStore{pool: pool, locks: locks}, nil
 }
 
-func (s *PostgresMetadataStore) Close() { s.pool.Close() }
+func (s *PostgresMetadataStore) Close() { s.locks.Close(); s.pool.Close() }
 
 func (s *PostgresMetadataStore) Migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, schemaDDL)
@@ -89,12 +98,13 @@ func advisoryKey(name string) int64 {
 // TryLeader holds a session-scoped pg_try_advisory_lock on a dedicated connection
 // so multi-replica apiservers do not double-run replenish / eviction sweeps.
 func (s *PostgresMetadataStore) TryLeader(ctx context.Context, name string) (func(), bool, error) {
-	conn, err := s.pool.Acquire(ctx)
+	conn, err := s.locks.Acquire(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	var ok bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, advisoryKey(name)).Scan(&ok); err != nil {
+		_ = conn.Conn().Close(context.Background())
 		conn.Release()
 		return nil, false, err
 	}
@@ -108,7 +118,9 @@ func (s *PostgresMetadataStore) TryLeader(ctx context.Context, name string) (fun
 			return
 		}
 		released = true
-		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, advisoryKey(name))
+		if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, advisoryKey(name)); err != nil {
+			_ = conn.Conn().Close(context.Background())
+		}
 		conn.Release()
 	}, true, nil
 }
@@ -351,8 +363,8 @@ func (s *PostgresMetadataStore) SaveSandbox(ctx context.Context, sbx *SandboxRec
 	return err
 }
 
-func (s *PostgresMetadataStore) ListRunningSandboxes(ctx context.Context) ([]SandboxRecord, error) {
-	rows, err := s.pool.Query(ctx, `SELECT payload_json FROM kt_sandboxes WHERE state = $1`, string(SandboxStateRunning))
+func (s *PostgresMetadataStore) ListSandboxesToSweep(ctx context.Context) ([]SandboxRecord, error) {
+	rows, err := s.pool.Query(ctx, `SELECT payload_json FROM kt_sandboxes WHERE state IN ($1,$2) OR (state=$3 AND coalesce(payload_json->>'currentSlotId','') <> '')`, string(SandboxStateRunning), string(SandboxStateSuspending), string(SandboxStateSuspended))
 	if err != nil {
 		return nil, err
 	}

@@ -15,6 +15,8 @@ var (
 	ErrTransitionLocked    = errors.New("sandbox state transition already in progress")
 )
 
+const AdmissionTTL = 2 * time.Minute
+
 type SandboxState string
 
 const (
@@ -70,6 +72,7 @@ type SandboxRecord struct {
 	State                       SandboxState      `json:"state"`
 	ExecutionID                 int64             `json:"executionId"`
 	LifecycleID                 string            `json:"lifecycleId"`
+	PendingSnapshotID           string            `json:"pendingSnapshotId,omitempty"`
 	ActiveSnapshotID            string            `json:"activeSnapshotId,omitempty"`
 	CurrentNodeID               string            `json:"currentNodeId,omitempty"`
 	OriginNodeID                string            `json:"originNodeId,omitempty"`
@@ -108,7 +111,7 @@ type MetadataStore interface {
 	CreateSandbox(ctx context.Context, sbx *SandboxRecord) error
 	GetSandbox(ctx context.Context, sandboxID string) (*SandboxRecord, error)
 	SaveSandbox(ctx context.Context, sbx *SandboxRecord) error
-	ListRunningSandboxes(ctx context.Context) ([]SandboxRecord, error)
+	ListSandboxesToSweep(ctx context.Context) ([]SandboxRecord, error)
 	DeleteSandbox(ctx context.Context, sandboxID string) error
 
 	// TryLeader acquires a cluster-wide leader lock for background workers.
@@ -125,9 +128,12 @@ type RuntimeCatalog interface {
 
 	PublishRoute(ctx context.Context, route protocol.RouteRecord) error
 	GetRoute(ctx context.Context, sandboxID string) (*protocol.RouteRecord, error)
-	DeleteRouteFenced(ctx context.Context, sandboxID string, maxExecutionID int64) error
+	DeleteRouteFenced(ctx context.Context, sandboxID string, executionID int64, slotID string) error
 
-	AcquireTransitionLock(ctx context.Context, sandboxID string, ttl time.Duration) (func(), error)
+	AdmitRoute(ctx context.Context, sandboxID, requestID string) (*protocol.RouteRecord, error)
+	RenewAdmission(ctx context.Context, sandboxID, requestID string) error
+	FinishAdmission(ctx context.Context, sandboxID, requestID string) error
+	DrainRoute(ctx context.Context, route protocol.RouteRecord) error
 
 	TouchSandboxActive(ctx context.Context, sandboxID string, at time.Time) error
 	GetLastActive(ctx context.Context, sandboxID string) (time.Time, bool, error)
