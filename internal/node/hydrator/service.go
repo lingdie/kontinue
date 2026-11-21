@@ -853,11 +853,9 @@ func (d *CRIRuntimeDriver) SwapAndStartSandboxContainer(ctx context.Context, opt
 		})
 	}
 	if opts.Slot.PlaceholderID != "" {
-		_ = func() error {
-			_, _ = d.runtimeClient.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: opts.Slot.PlaceholderID, Timeout: 1})
-			_, _ = d.runtimeClient.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: opts.Slot.PlaceholderID})
-			return nil
-		}()
+		if err := stopAndRemoveContainer(ctx, d.runtimeClient, opts.Slot.PlaceholderID, 1); err != nil {
+			return "", "", fmt.Errorf("remove placeholder container %s: %w", opts.Slot.PlaceholderID, err)
+		}
 	}
 
 	labels := map[string]string{
@@ -934,11 +932,15 @@ func (d *CRIRuntimeDriver) StopSandboxContainer(ctx context.Context, _ protocol.
 	if activeContainerID == "" {
 		return nil
 	}
-	if _, err := d.runtimeClient.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: activeContainerID, Timeout: 2}); err != nil && status.Code(err) != codes.NotFound {
-		return fmt.Errorf("stop sandbox container %s: %w", activeContainerID, err)
+	return stopAndRemoveContainer(ctx, d.runtimeClient, activeContainerID, 2)
+}
+
+func stopAndRemoveContainer(ctx context.Context, runtimeClient runtimeapi.RuntimeServiceClient, containerID string, timeout int64) error {
+	if _, err := runtimeClient.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: containerID, Timeout: timeout}); err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("stop container %s: %w", containerID, err)
 	}
-	if _, err := d.runtimeClient.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: activeContainerID}); err != nil && status.Code(err) != codes.NotFound {
-		return fmt.Errorf("remove sandbox container %s: %w", activeContainerID, err)
+	if _, err := runtimeClient.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: containerID}); err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("remove container %s: %w", containerID, err)
 	}
 	return nil
 }

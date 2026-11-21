@@ -30,6 +30,14 @@ func (r *teardownRuntime) RemoveContainer(context.Context, *runtimeapi.RemoveCon
 	return nil, r.removeErr
 }
 
+func (r *teardownRuntime) CreateContainer(context.Context, *runtimeapi.CreateContainerRequest, ...grpc.CallOption) (*runtimeapi.CreateContainerResponse, error) {
+	return &runtimeapi.CreateContainerResponse{ContainerId: "created"}, nil
+}
+
+func (r *teardownRuntime) StartContainer(context.Context, *runtimeapi.StartContainerRequest, ...grpc.CallOption) (*runtimeapi.StartContainerResponse, error) {
+	return &runtimeapi.StartContainerResponse{}, nil
+}
+
 func TestCRIRuntimeDriverPreservesTeardownFailuresForRetry(t *testing.T) {
 	stopErr := status.Error(codes.Unavailable, "runtime is restarting")
 	removeErr := status.Error(codes.Unavailable, "remove is unavailable")
@@ -58,5 +66,19 @@ func TestCRIRuntimeDriverPreservesTeardownFailuresForRetry(t *testing.T) {
 				t.Fatalf("stop calls=%d remove calls=%d, want %d/%d", tc.runtime.stops, tc.runtime.removes, tc.wantStops, tc.wantRemovals)
 			}
 		})
+	}
+}
+
+func TestCRIRuntimeDriverDoesNotStartBesideAnUnremovedPlaceholder(t *testing.T) {
+	runtime := &teardownRuntime{stopErr: status.Error(codes.Unavailable, "runtime is restarting")}
+	d := NewCRIRuntimeDriver(runtime, nil, "", "")
+	_, _, err := d.SwapAndStartSandboxContainer(context.Background(), SwapContainerOptions{
+		ContainerID: "kt-active", SandboxID: "box", Slot: protocol.CarrierSlot{PlaceholderID: "placeholder"},
+	})
+	if err == nil {
+		t.Fatal("started a replacement while the placeholder could not be stopped")
+	}
+	if runtime.removes != 0 {
+		t.Fatalf("removed placeholder after stop failure: %d calls", runtime.removes)
 	}
 }
