@@ -182,10 +182,16 @@ func (m *MemoryMetadataStore) ListGCandidateSnapshots(_ context.Context) ([]Snap
 			referencedAsParent[s.ParentSnapshotID] = true
 		}
 	}
+	referencedByTemplate := make(map[string]bool)
+	for _, t := range m.templates {
+		if t.GoldenSnapshotID != "" {
+			referencedByTemplate[t.GoldenSnapshotID] = true
+		}
+	}
 
 	var out []SnapshotRecord
 	for _, s := range m.snapshots {
-		if s.Superseded && !referencedBySandbox[s.SnapshotID] && !referencedAsParent[s.SnapshotID] {
+		if s.Superseded && !referencedBySandbox[s.SnapshotID] && !referencedAsParent[s.SnapshotID] && !referencedByTemplate[s.SnapshotID] {
 			out = append(out, s)
 		}
 	}

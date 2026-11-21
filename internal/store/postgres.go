@@ -305,7 +305,8 @@ func (s *PostgresMetadataStore) ListGCandidateSnapshots(ctx context.Context) ([]
 		FROM kt_snapshots s
 		WHERE s.superseded = TRUE
 		  AND NOT EXISTS (SELECT 1 FROM kt_sandboxes b WHERE b.active_snapshot_id = s.snapshot_id)
-		  AND NOT EXISTS (SELECT 1 FROM kt_snapshots c WHERE c.parent_snapshot_id = s.snapshot_id)`)
+		  AND NOT EXISTS (SELECT 1 FROM kt_snapshots c WHERE c.parent_snapshot_id = s.snapshot_id)
+		  AND NOT EXISTS (SELECT 1 FROM kt_templates t WHERE t.golden_snapshot_id = s.snapshot_id)`)
 	if err != nil {
 		return nil, err
 	}

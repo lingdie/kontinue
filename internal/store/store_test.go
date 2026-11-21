@@ -54,6 +54,10 @@ func TestExecutionIDFencingAndSnapshotGC(t *testing.T) {
 	_ = meta.CreateSnapshot(ctx, &store.SnapshotRecord{SnapshotID: "snap-v1", Superseded: true, CreatedAt: time.Now()})
 	_ = meta.CreateSnapshot(ctx, &store.SnapshotRecord{SnapshotID: "snap-v2", ParentSnapshotID: "snap-v1", Superseded: false, CreatedAt: time.Now()})
 	_ = meta.CreateSnapshot(ctx, &store.SnapshotRecord{SnapshotID: "snap-orphan", Superseded: true, CreatedAt: time.Now()})
+	_ = meta.CreateSnapshot(ctx, &store.SnapshotRecord{SnapshotID: "snap-template", Superseded: true, CreatedAt: time.Now()})
+	if err := meta.CreateTemplate(ctx, &store.TemplateRecord{TemplateID: "tpl-live", Phase: "Ready", GoldenSnapshotID: "snap-template"}); err != nil {
+		t.Fatal(err)
+	}
 
 	gcList, err := meta.ListGCandidateSnapshots(ctx)
 	if err != nil || len(gcList) != 1 || gcList[0].SnapshotID != "snap-orphan" {
