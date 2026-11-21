@@ -667,19 +667,29 @@ func (s *Service) finishInterruptedRelease(ctx context.Context, st *activeSlotSt
 		if receipt.PodUID != st.Slot.PodUID {
 			return fmt.Errorf("release receipt Pod UID does not match slot %s", st.Slot.SlotID)
 		}
-		if _, err := s.finishRelease(st, receipt); err != nil {
-			return err
-		}
 	} else {
-		if _, err = s.finishReleaseAttempt(ctx, st, s.journal.receipt(req)); err != nil {
+		receipt, err = s.persistReleaseReceipt(ctx, st, s.journal.receipt(req))
+		if err != nil {
 			return err
 		}
 	}
 	st.FailureReason = "node recovered an interrupted release"
-	return s.report(ctx, st, store.OwnerFailed)
+	if err := s.report(ctx, st, store.OwnerFailed); err != nil {
+		return err
+	}
+	_, err = s.finishRelease(st, receipt)
+	return err
 }
 
 func (s *Service) finishReleaseAttempt(ctx context.Context, st *activeSlotState, receiptPath string) (*protocol.ReleaseSlotResponse, error) {
+	response, err := s.persistReleaseReceipt(ctx, st, receiptPath)
+	if err != nil {
+		return nil, err
+	}
+	return s.finishRelease(st, response)
+}
+
+func (s *Service) persistReleaseReceipt(ctx context.Context, st *activeSlotState, receiptPath string) (*protocol.ReleaseSlotResponse, error) {
 	if err := s.cfg.Driver.StopSandboxContainer(ctx, st.Slot, st.ContainerID); err != nil {
 		return nil, err
 	}
@@ -696,7 +706,7 @@ func (s *Service) finishReleaseAttempt(ctx context.Context, st *activeSlotState,
 	if err := s.journal.persist(receiptPath, response, false); err != nil {
 		return nil, err
 	}
-	return s.finishRelease(st, response)
+	return response, nil
 }
 
 // finishRelease runs under st.releaseMu after the release receipt is persisted.
