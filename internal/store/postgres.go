@@ -261,6 +261,10 @@ func (s *PostgresMetadataStore) CreateSnapshot(ctx context.Context, snap *Snapsh
 		snap.TotalMemoryBytes, snap.DirtyMemoryBytes, snap.DirtyChunks, snap.ReusedChunks,
 		snap.Superseded, snap.BootstrapToken, fpRaw, snap.CreatedAt,
 	)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return ErrSnapshotExists
+	}
 	return err
 }
 

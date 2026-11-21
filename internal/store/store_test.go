@@ -76,6 +76,25 @@ func TestExecutionIDFencingAndSnapshotGC(t *testing.T) {
 	}
 }
 
+func TestSnapshotIDsAreImmutableInMemory(t *testing.T) {
+	ctx := context.Background()
+	meta := store.NewMemoryMetadataStore()
+	first := &store.SnapshotRecord{SnapshotID: "immutable", Kind: protocol.SnapshotKindSessionSuspend, ManifestURI: "local://first"}
+	if err := meta.CreateSnapshot(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := meta.CreateSnapshot(ctx, &store.SnapshotRecord{SnapshotID: first.SnapshotID, Kind: protocol.SnapshotKindLiveFork, ManifestURI: "local://replacement"}); !errors.Is(err, store.ErrSnapshotExists) {
+		t.Fatalf("duplicate snapshot ID error=%v, want ErrSnapshotExists", err)
+	}
+	got, err := meta.GetSnapshot(ctx, first.SnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != first.Kind || got.ManifestURI != first.ManifestURI {
+		t.Fatalf("duplicate snapshot replaced original: got=%+v", got)
+	}
+}
+
 func TestLeaderLockAndInflight(t *testing.T) {
 	ctx := context.Background()
 	meta := store.NewMemoryMetadataStore()

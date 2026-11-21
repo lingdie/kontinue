@@ -141,6 +141,9 @@ func (m *MemoryMetadataStore) CreateSnapshot(_ context.Context, snap *SnapshotRe
 	if snap.CreatedAt.IsZero() {
 		snap.CreatedAt = time.Now().UTC()
 	}
+	if _, exists := m.snapshots[snap.SnapshotID]; exists {
+		return ErrSnapshotExists
+	}
 	m.snapshots[snap.SnapshotID] = *snap
 	return nil
 }
