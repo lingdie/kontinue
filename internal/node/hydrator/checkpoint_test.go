@@ -18,6 +18,8 @@ import (
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
 	"github.com/kontinue-sh/kontinue/pkg/storage"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestCompletedCheckpointReplaysAfterDaemonReplacement(t *testing.T) {
@@ -68,6 +70,42 @@ func TestCompletedCheckpointReplaysAfterDaemonReplacement(t *testing.T) {
 	prep.ExecutionID++
 	if _, err := s.GetLatestSnapshotResult(ctx, &query); !errors.Is(err, store.ErrStaleExecutionFence) {
 		t.Fatalf("receipt accepted a different generation: %v", err)
+	}
+}
+
+func TestPrepareCheckpointDoesNotOverwriteAnInFlightRequest(t *testing.T) {
+	ctx := context.Background()
+	s := NewService(ServiceConfig{ScratchDir: t.TempDir()})
+	st := &activeSlotState{ownership: ownership{
+		Phase:       activeExecution,
+		Slot:        protocol.CarrierSlot{SlotID: "slot"},
+		ContainerID: "container",
+		SandboxID:   "box",
+		ExecutionID: 2,
+		LifecycleID: "life",
+	}}
+	s.activeSlots[st.Slot.SlotID] = st
+	s.byContainer[st.ContainerID] = st
+
+	first := &protocol.PrepareCheckpointRequest{
+		SandboxID: "box", ExecutionID: 2, LifecycleID: "life", SlotID: "slot",
+		TargetSnapshotID: "snapshot-one", Kind: protocol.SnapshotKindLiveFork,
+	}
+	if _, err := s.PrepareCheckpoint(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareCheckpoint(ctx, first); err != nil {
+		t.Fatalf("same checkpoint retry was rejected: %v", err)
+	}
+	second := *first
+	second.TargetSnapshotID = "snapshot-two"
+	if _, err := s.PrepareCheckpoint(ctx, &second); status.Code(err) != codes.Aborted {
+		t.Fatalf("in-flight checkpoint was overwritten: %v", err)
+	}
+
+	st.LastCheckpoint = &checkpointReceipt{RequestHash: checkpointRequestHash(first)}
+	if _, err := s.PrepareCheckpoint(ctx, &second); err != nil {
+		t.Fatalf("completed checkpoint blocked the next request: %v", err)
 	}
 }
 

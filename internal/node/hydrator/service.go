@@ -144,7 +144,19 @@ func (s *Service) PrepareCheckpoint(ctx context.Context, req *protocol.PrepareCh
 		}
 	}
 	s.mu.Lock()
-	s.pendingCkpt[st.ContainerID] = req
+	if pending := s.pendingCkpt[st.ContainerID]; pending != nil {
+		pendingHash := checkpointRequestHash(pending)
+		requestHash := checkpointRequestHash(req)
+		if pendingHash != requestHash {
+			completed := st.LastCheckpoint != nil && st.LastCheckpoint.RequestHash == pendingHash
+			if !completed {
+				s.mu.Unlock()
+				return nil, status.Error(codes.Aborted, "another checkpoint is already in progress")
+			}
+		}
+	}
+	requestCopy := *req
+	s.pendingCkpt[st.ContainerID] = &requestCopy
 	s.mu.Unlock()
 	return &protocol.PrepareCheckpointResponse{Accepted: true}, nil
 }
