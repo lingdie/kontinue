@@ -139,8 +139,15 @@ func (m *Manager) ConfirmReleaseView(viewID, path string, expected *ViewIdentity
 	if err != nil {
 		return err
 	}
-	if actual != (FileIdentity{}) && (expected == nil || actual != expected.Staging) {
-		return fmt.Errorf("unconfirmed staging remains for view %s", viewID)
+	if actual != (FileIdentity{}) {
+		switch {
+		case expected == nil:
+			return fmt.Errorf("unconfirmed staging remains for view %s", viewID)
+		case expected.Staging != (FileIdentity{}) && actual != expected.Staging:
+			return fmt.Errorf("unconfirmed staging remains for view %s", viewID)
+		case expected.Staging == (FileIdentity{}) && !hasViewOwnership(expected):
+			return fmt.Errorf("unconfirmed staging remains for view %s", viewID)
+		}
 	}
 	if _, err := os.Lstat(claimed); errors.Is(err, os.ErrNotExist) {
 		// Cleanup of the view completed before the previous process exited.
@@ -162,6 +169,18 @@ func (m *Manager) ConfirmReleaseView(viewID, path string, expected *ViewIdentity
 		return nil
 	}
 	return os.RemoveAll(filepath.Join(m.cfg.L2CASDir, "staging", viewID))
+}
+
+func hasViewOwnership(id *ViewIdentity) bool {
+	if id == nil || id.ArenaFS || id.Directory != (FileIdentity{}) || id.Mountpoint != (FileIdentity{}) {
+		return id != nil
+	}
+	for _, artifact := range id.Artifacts {
+		if artifact != (FileIdentity{}) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) stagingIdentity(viewID string) (FileIdentity, error) {

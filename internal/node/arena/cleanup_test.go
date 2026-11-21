@@ -186,3 +186,36 @@ func TestConfirmReleaseRecognizesStagingAfterViewRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestConfirmReleaseSupportsLegacyViewWithoutStagingIdentity(t *testing.T) {
+	root := t.TempDir()
+	views := filepath.Join(root, "views")
+	path := filepath.Join(views, "view-legacy")
+	if err := os.MkdirAll(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{protocol.GVisorCheckpointImg, protocol.GVisorPagesMetaImg, protocol.GVisorPagesImg} {
+		if err := os.WriteFile(filepath.Join(path, name), []byte("data"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &Manager{cfg: ManagerConfig{ViewsDir: views, L2CASDir: root}, activeViews: map[string]ViewCloser{}}
+	m.trackView(path, &plainDirHandle{dir: path})
+	legacy, err := m.DescribeView(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(root, "staging", "view-legacy")
+	if err := os.MkdirAll(stage, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfirmReleaseView("view-legacy", path, legacy); err != nil {
+		t.Fatalf("legacy view release failed: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("legacy view remained: %v", err)
+	}
+	if _, err := os.Stat(stage); !os.IsNotExist(err) {
+		t.Fatalf("legacy staging remained: %v", err)
+	}
+}
