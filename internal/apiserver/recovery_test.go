@@ -167,6 +167,10 @@ func (n *checkpointReplayNode) PrepareCheckpoint(context.Context, *protocol.Prep
 	return nil, status.Error(codes.FailedPrecondition, "lost execution cannot capture again")
 }
 
+func (n *checkpointReplayNode) ReleaseSlot(context.Context, *protocol.ReleaseSlotRequest) (*protocol.ReleaseSlotResponse, error) {
+	return &protocol.ReleaseSlotResponse{Released: true, PodUID: "pod"}, nil
+}
+
 func TestLostOwnerRecoversPublishedCheckpointBeforeFailing(t *testing.T) {
 	for _, tc := range []struct {
 		name, result string
@@ -217,6 +221,9 @@ func TestLostOwnerRecoversPublishedCheckpointBeforeFailing(t *testing.T) {
 			pending := "pending"
 			if tc.result == "found" {
 				pending = ""
+				if tc.kind == protocol.SnapshotKindSessionSuspend {
+					state = store.SandboxStateSuspended
+				}
 				snapshot, err := meta.GetSnapshot(ctx, "pending")
 				if err != nil || snapshot.Kind != tc.kind || snapshot.ManifestURI != "file://pending" {
 					t.Fatalf("did not publish replayed snapshot: got=%+v err=%v", snapshot, err)
@@ -227,6 +234,9 @@ func TestLostOwnerRecoversPublishedCheckpointBeforeFailing(t *testing.T) {
 			got, err := meta.GetSandbox(ctx, "box")
 			if err != nil || got.State != state {
 				t.Fatalf("unexpected current state: got=%+v err=%v", got, err)
+			}
+			if tc.result == "found" && tc.kind == protocol.SnapshotKindSessionSuspend && (got.PendingSnapshotID != "" || got.CurrentSlotID != "") {
+				t.Fatalf("recovered suspend did not release the old assignment: %+v", got)
 			}
 			if got, err := meta.UnpublishedSnapshot(ctx); err != nil || got != pending {
 				t.Fatalf("unexpected collection barrier: pending=%q err=%v", got, err)

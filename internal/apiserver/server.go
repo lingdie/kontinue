@@ -449,24 +449,28 @@ func (s *Server) suspendSandbox(ctx context.Context, sandboxID string, observed 
 		return nil, err
 	}
 
+	if err := s.commitSuspendedSnapshot(ctx, sbx, snapRec, route.NodeID); err != nil {
+		return nil, err
+	}
+	return snapRec, nil
+}
+
+func (s *Server) commitSuspendedSnapshot(ctx context.Context, sbx *store.SandboxRecord, snapRec *store.SnapshotRecord, originNodeID string) error {
 	previous := sbx.ActiveSnapshotID
 	sbx.State = store.SandboxStateSuspended
 	sbx.ActiveSnapshotID = snapRec.SnapshotID
 	sbx.PendingSnapshotID = ""
-	sbx.OriginNodeID = route.NodeID
+	sbx.OriginNodeID = originNodeID
 	// Preserve the old allocation until node cleanup is acknowledged.
 	if err := s.cfg.Meta.SaveSandbox(ctx, sbx); err != nil {
-		return nil, err
+		return err
 	}
 	if previous != "" {
 		if snap, err := s.cfg.Meta.GetSnapshot(ctx, previous); err == nil && snap.Kind == protocol.SnapshotKindSessionSuspend {
 			_ = s.cfg.Meta.MarkSnapshotSuperseded(ctx, previous)
 		}
 	}
-	if err := s.finishSuspendRelease(ctx, sbx); err != nil {
-		return nil, err
-	}
-	return snapRec, nil
+	return s.finishSuspendRelease(ctx, sbx)
 }
 
 func (s *Server) finishSuspendRelease(ctx context.Context, sbx *store.SandboxRecord) error {
@@ -896,6 +900,17 @@ func (s *Server) reconcileSandbox(ctx context.Context, observed *store.SandboxRe
 			return true
 		}
 		if snapshot != nil {
+			if sb.State == store.SandboxStateSuspending {
+				route, routeErr := s.routeForExecution(ctx, sb)
+				if routeErr != nil {
+					log.Printf("recover route for suspended sandbox %q: %v", sb.SandboxID, routeErr)
+					return true
+				}
+				if commitErr := s.commitSuspendedSnapshot(ctx, sb, snapshot, route.NodeID); commitErr != nil {
+					log.Printf("commit recovered suspend for sandbox %q: %v", sb.SandboxID, commitErr)
+					return true
+				}
+			}
 			return false
 		}
 	}
