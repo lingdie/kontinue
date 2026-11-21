@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestExecutionIDFencingAndSnapshotGC(t *testing.T) {
@@ -363,4 +365,55 @@ func TestIdleCarrierRemovalIsFencedByPodIdentity(t *testing.T) {
 		defer cat.Close()
 		check(t, cat)
 	})
+}
+
+func TestRedisReserveSkipsIdleMembersWithoutMetadata(t *testing.T) {
+	addr := os.Getenv("KONTINUE_TEST_REDIS")
+	if addr == "" {
+		t.Skip("KONTINUE_TEST_REDIS is unset")
+	}
+
+	ctx := context.Background()
+	nodeID := "stale-node-" + rand.Text()
+	tier := "stale-tier-" + rand.Text()
+	valid := protocol.CarrierSlot{SlotID: "valid-" + rand.Text(), NodeID: nodeID, Tier: tier}
+	poolKey := protocol.IdlePoolKey(nodeID, tier)
+	metaKey := protocol.CarrierMetaKey(valid.SlotID)
+	usedKey := "kt:carrier:used:" + valid.SlotID
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	defer rdb.Close()
+	defer rdb.Del(ctx, poolKey, metaKey, usedKey)
+
+	stale := make([]any, 128)
+	for i := range stale {
+		stale[i] = fmt.Sprintf("stale-%d", i)
+	}
+	if err := rdb.SAdd(ctx, poolKey, stale...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	cat := store.NewRedisRuntimeCatalog(addr, "", 0)
+	defer cat.Close()
+	if _, err := cat.ReserveIdleSlot(ctx, nodeID, tier, "", false); !errors.Is(err, store.ErrNoIdleCarrierSlot) {
+		t.Fatalf("stale pool members produced reservation: %v", err)
+	}
+	if count, err := cat.CountIdleSlots(ctx, nodeID, tier); err != nil || count != 0 {
+		t.Fatalf("stale pool members remained after reservation: count=%d err=%v", count, err)
+	}
+	raw, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.Set(ctx, metaKey, raw, time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.SAdd(ctx, poolKey, valid.SlotID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := cat.ReserveIdleSlot(ctx, nodeID, tier, "", false)
+	if err != nil {
+		t.Fatalf("reserve with stale pool members: %v", err)
+	}
+	if reservation.Slot.SlotID != valid.SlotID {
+		t.Fatalf("reserved slot %q, want %q", reservation.Slot.SlotID, valid.SlotID)
+	}
 }

@@ -17,18 +17,21 @@ if ARGV[2] ~= "" then
     local previous = redis.call("GET", KEYS[2])
     if previous then return previous end
 end
-local slotId = redis.call("SPOP", KEYS[1])
-if not slotId then
-    return nil
+while true do
+    local slotId = redis.call("SPOP", KEYS[1])
+    if not slotId then
+        return nil
+    end
+    local metaKey = ARGV[1] .. slotId
+    local meta = redis.call("GET", metaKey)
+    if meta then
+        redis.call("DEL", metaKey)
+        redis.call("SET", "kt:carrier:used:" .. slotId, ARGV[2], "EX", 86400)
+        local reservation = cjson.encode({slot=cjson.decode(meta),cold=ARGV[3]=="1"})
+        if ARGV[2] ~= "" then redis.call("SET", KEYS[2], reservation) end
+        return reservation
+    end
 end
-local metaKey = ARGV[1] .. slotId
-local meta = redis.call("GET", metaKey)
-if not meta then return nil end
-redis.call("DEL", metaKey)
-redis.call("SET", "kt:carrier:used:" .. slotId, ARGV[2], "EX", 86400)
-local reservation = cjson.encode({slot=cjson.decode(meta),cold=ARGV[3]=="1"})
-if ARGV[2] ~= "" then redis.call("SET", KEYS[2], reservation) end
-return reservation
 `)
 
 // Lua Script 2: Monotonic ExecutionID-fenced route upsert (prevents stale starts overwriting newer executions).
