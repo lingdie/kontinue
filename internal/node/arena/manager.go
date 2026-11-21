@@ -500,6 +500,14 @@ func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID str
 		}
 		telemetry.EndSpan(span, err)
 	}()
+	var createdViewPath string
+	var retainedView bool
+	defer func() {
+		if err != nil && createdViewPath != "" && !retainedView {
+			_ = m.ReleaseView(createdViewPath)
+			_ = os.RemoveAll(createdViewPath)
+		}
+	}()
 
 	mf, err = m.ResolveManifest(ctx, snapshotID)
 	if err != nil {
@@ -518,8 +526,10 @@ func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID str
 		if err := os.Mkdir(viewDir, 0700); err != nil {
 			return "", "", nil, 0, err
 		}
+		createdViewPath = viewDir
 		if err := cloneDirHardlinks(pin, viewDir); err == nil {
 			m.trackView(viewDir, &plainDirHandle{dir: viewDir})
+			retainedView = true
 			m.mu.Lock()
 			m.l1Pinned[snapshotID] = pin
 			m.mu.Unlock()
@@ -533,6 +543,7 @@ func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID str
 	if err = os.Mkdir(viewDir, 0700); err != nil {
 		return "", "", nil, 0, err
 	}
+	createdViewPath = viewDir
 
 	// Check Tier 2: Are all non-zero chunks already cached in Local L2 CAS?
 	allLocal := true
@@ -575,6 +586,7 @@ func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID str
 		}
 		_ = reader.Close()
 		m.trackView(viewDir, &plainDirHandle{dir: viewDir})
+		retainedView = true
 		return viewDir, TierL2NVMe, mf, reader.copiedBytes.Load(), nil
 	}
 
@@ -585,6 +597,7 @@ func (m *Manager) PrepareRestoreView(ctx context.Context, snapshotID, viewID str
 		return "", "", nil, 0, mErr
 	}
 	m.trackView(viewDir, closer)
+	retainedView = true
 	if _, plain := closer.(*plainDirHandle); plain {
 		return viewDir, TierL3Materialized, mf, reader.copiedBytes.Load(), nil
 	}

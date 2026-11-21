@@ -1,12 +1,15 @@
 package arena
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
+	"github.com/kontinue-sh/kontinue/pkg/storage"
 )
 
 func TestLazyReaderCloseRemovesStagingDir(t *testing.T) {
@@ -28,6 +31,39 @@ func TestLazyReaderCloseRemovesStagingDir(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "staging")); err != nil {
 		t.Fatalf("staging root removed: %v", err)
+	}
+}
+
+func TestPrepareRestoreViewCleansPartialViewOnFailure(t *testing.T) {
+	root := t.TempDir()
+	m, err := NewManager(ManagerConfig{
+		L2CASDir: root,
+		ViewsDir: filepath.Join(root, "views"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := &protocol.SnapshotManifest{SnapshotID: "snap-1", CheckpointImgSize: 1}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(root, storage.ArtifactKey(manifest.SnapshotID, protocol.ManifestFileName))
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, _, _, err := m.PrepareRestoreView(context.Background(), manifest.SnapshotID, "view-1"); err == nil {
+		t.Fatal("restore unexpectedly succeeded without checkpoint artifact")
+	}
+	if _, err := os.Stat(filepath.Join(root, "views", "view-1")); !os.IsNotExist(err) {
+		t.Fatalf("partial restore view remained after failure: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "staging", "view-1")); !os.IsNotExist(err) {
+		t.Fatalf("partial restore staging remained after failure: %v", err)
 	}
 }
 
