@@ -67,6 +67,40 @@ func TestPrepareRestoreViewCleansPartialViewOnFailure(t *testing.T) {
 	}
 }
 
+func TestManifestLoadRejectsSnapshotIDMismatch(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalFSBackend(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewManager(ManagerConfig{L2CASDir: root, ViewsDir: filepath.Join(root, "views"), RemoteStore: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := &protocol.SnapshotManifest{SnapshotID: "other"}
+	raw, err := json.Marshal(wrong)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localPath := filepath.Join(root, storage.ArtifactKey("requested", protocol.ManifestFileName))
+	if err := os.MkdirAll(filepath.Dir(localPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ResolveManifest(ctx, "requested"); err == nil {
+		t.Fatal("accepted a local manifest for a different snapshot")
+	}
+	if _, err := backend.PutManifest(ctx, "remote-requested", wrong); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ResolveManifest(ctx, "remote-requested"); err == nil {
+		t.Fatal("accepted a remote manifest for a different snapshot")
+	}
+}
+
 func TestRestartAdoptsOnlyOriginalMaterializedView(t *testing.T) {
 	views := t.TempDir()
 	path := filepath.Join(views, "view-one")

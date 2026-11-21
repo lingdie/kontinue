@@ -190,6 +190,9 @@ func (m *Manager) LoadLocalManifest(snapshotID string) (*protocol.SnapshotManife
 	m.mu.RLock()
 	if cached, ok := m.l2Manifests[snapshotID]; ok {
 		m.mu.RUnlock()
+		if err := validateManifestSnapshot(cached, snapshotID); err != nil {
+			return nil, err
+		}
 		return cached, nil
 	}
 	m.mu.RUnlock()
@@ -201,6 +204,9 @@ func (m *Manager) LoadLocalManifest(snapshotID string) (*protocol.SnapshotManife
 	}
 	var mf protocol.SnapshotManifest
 	if err := json.Unmarshal(raw, &mf); err != nil {
+		return nil, err
+	}
+	if err := validateManifestSnapshot(&mf, snapshotID); err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
@@ -425,6 +431,9 @@ func (m *Manager) ResolveManifest(ctx context.Context, snapshotID string) (*prot
 		if err != nil {
 			return nil, err
 		}
+		if err := validateManifestSnapshot(mf, snapshotID); err != nil {
+			return nil, err
+		}
 		raw, _ := json.MarshalIndent(mf, "", "  ")
 		_ = writeAtomicFile(filepath.Join(m.cfg.L2CASDir, storage.ArtifactKey(snapshotID, protocol.ManifestFileName)), raw)
 		m.mu.Lock()
@@ -433,6 +442,13 @@ func (m *Manager) ResolveManifest(ctx context.Context, snapshotID string) (*prot
 		return mf, nil
 	}
 	return nil, fmt.Errorf("snapshot %s manifest not found", snapshotID)
+}
+
+func validateManifestSnapshot(mf *protocol.SnapshotManifest, snapshotID string) error {
+	if mf == nil || mf.SnapshotID != snapshotID {
+		return fmt.Errorf("manifest snapshot ID mismatch: requested %q", snapshotID)
+	}
+	return nil
 }
 
 func (m *Manager) PrewarmToL1Tmpfs(ctx context.Context, mf *protocol.SnapshotManifest) (path string, err error) {
