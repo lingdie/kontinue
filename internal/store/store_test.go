@@ -95,6 +95,14 @@ func TestSnapshotIDsAreImmutableInMemory(t *testing.T) {
 	}
 }
 
+func TestMemorySaveSandboxRequiresExistingRecord(t *testing.T) {
+	meta := store.NewMemoryMetadataStore()
+	sbx := &store.SandboxRecord{SandboxID: "missing"}
+	if err := meta.SaveSandbox(context.Background(), sbx); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("save of missing sandbox error=%v, want ErrNotFound", err)
+	}
+}
+
 func TestLeaderLockAndInflight(t *testing.T) {
 	ctx := context.Background()
 	meta := store.NewMemoryMetadataStore()

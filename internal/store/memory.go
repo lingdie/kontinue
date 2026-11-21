@@ -282,6 +282,9 @@ func (m *MemoryMetadataStore) GetSandbox(_ context.Context, sandboxID string) (*
 func (m *MemoryMetadataStore) SaveSandbox(_ context.Context, sbx *SandboxRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, exists := m.sandboxes[sbx.SandboxID]; !exists {
+		return ErrNotFound
+	}
 	sbx.UpdatedAt = time.Now().UTC()
 	m.sandboxes[sbx.SandboxID] = cloneSandbox(*sbx)
 	return nil
