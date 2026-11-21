@@ -766,18 +766,49 @@ func (s *Server) finishDelete(ctx context.Context, sbx *store.SandboxRecord) err
 			return err
 		}
 	}
-	if sbx.ActiveSnapshotID != "" {
-		snap, err := s.cfg.Meta.GetSnapshot(ctx, sbx.ActiveSnapshotID)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
+	if err := s.supersedeDeleteSnapshots(ctx, sbx); err != nil {
+		return err
+	}
+	return s.cfg.Meta.DeleteSandbox(ctx, sbx.SandboxID)
+}
+
+func (s *Server) supersedeDeleteSnapshots(ctx context.Context, sbx *store.SandboxRecord) error {
+	candidates := []struct {
+		id   string
+		kind protocol.SnapshotKind
+	}{
+		{id: sbx.ActiveSnapshotID, kind: protocol.SnapshotKindSessionSuspend},
+		{id: sbx.PendingSnapshotID, kind: protocol.SnapshotKindSessionSuspend},
+	}
+	if sbx.PendingFork != nil {
+		candidates = append(candidates, struct {
+			id   string
+			kind protocol.SnapshotKind
+		}{id: sbx.PendingFork.SnapshotID, kind: protocol.SnapshotKindLiveFork})
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.id == "" {
+			continue
+		}
+		if _, ok := seen[candidate.id]; ok {
+			continue
+		}
+		seen[candidate.id] = struct{}{}
+		snap, err := s.cfg.Meta.GetSnapshot(ctx, candidate.id)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
 			return err
 		}
-		if err == nil && snap.Kind == protocol.SnapshotKindSessionSuspend {
-			if err := s.cfg.Meta.MarkSnapshotSuperseded(ctx, snap.SnapshotID); err != nil {
+		if snap.Kind == candidate.kind {
+			if err := s.cfg.Meta.MarkSnapshotSuperseded(ctx, candidate.id); err != nil {
 				return err
 			}
 		}
 	}
-	return s.cfg.Meta.DeleteSandbox(ctx, sbx.SandboxID)
+	return nil
 }
 
 func (s *Server) releasePendingPlacement(ctx context.Context, sbx *store.SandboxRecord) error {

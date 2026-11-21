@@ -105,3 +105,42 @@ func TestSnapshotGCRetriesWithoutDeletingSharedPages(t *testing.T) {
 		t.Fatalf("candidate remains: %v", err)
 	}
 }
+
+func TestDeleteSupersedesInterruptedSnapshotIntents(t *testing.T) {
+	ctx := context.Background()
+	meta := store.NewMemoryMetadataStore()
+	server := NewServer(ServerConfig{Meta: meta, Catalog: store.NewMemoryRuntimeCatalog()})
+	defer server.Close()
+
+	for _, snap := range []*store.SnapshotRecord{
+		{SnapshotID: "pending-suspend", Kind: protocol.SnapshotKindSessionSuspend},
+		{SnapshotID: "pending-fork", Kind: protocol.SnapshotKindLiveFork},
+	} {
+		if err := meta.CreateSnapshot(ctx, snap); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := meta.CreateSandbox(ctx, &store.SandboxRecord{
+		SandboxID: "suspending", State: store.SandboxStateSuspending, ExecutionID: 1,
+		LifecycleID: "suspend-life", PendingSnapshotID: "pending-suspend",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := meta.CreateSandbox(ctx, &store.SandboxRecord{
+		SandboxID: "forking", State: store.SandboxStateFailed, ExecutionID: 1,
+		LifecycleID: "fork-life", PendingFork: &store.PendingFork{SnapshotID: "pending-fork"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := server.DeleteSandbox(ctx, "suspending"); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.DeleteSandbox(ctx, "forking"); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := meta.ListGCandidateSnapshots(ctx)
+	if err != nil || len(candidates) != 2 {
+		t.Fatalf("interrupted snapshot intents were not made GC candidates: candidates=%+v err=%v", candidates, err)
+	}
+}
