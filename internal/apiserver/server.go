@@ -759,7 +759,7 @@ func (s *Server) finishDelete(ctx context.Context, sbx *store.SandboxRecord) err
 		return err
 	}
 	if sbx.CurrentSlotID != "" {
-		if err := s.cfg.Catalog.DrainRoute(ctx, protocol.RouteRecord{SandboxID: sbx.SandboxID, SlotID: sbx.CurrentSlotID, ExecutionID: sbx.ExecutionID}); err != nil {
+		if err := s.cfg.Catalog.DrainRoute(ctx, protocol.RouteRecord{SandboxID: sbx.SandboxID, SlotID: sbx.CurrentSlotID, ExecutionID: sbx.ExecutionID, LifecycleID: sbx.LifecycleID}); err != nil {
 			return err
 		}
 		if err := s.releaseExecution(ctx, sbx); err != nil {

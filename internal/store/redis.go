@@ -78,7 +78,8 @@ var luaDrainRoute = redis.NewScript(`
 local raw = redis.call("GET", KEYS[1])
 if raw then
     local route = cjson.decode(raw)
-    if tonumber(route.executionId) ~= tonumber(ARGV[1]) or route.slotId ~= ARGV[2] then return -1 end
+	if tonumber(route.executionId) ~= tonumber(ARGV[1]) or route.slotId ~= ARGV[2] or
+	   (ARGV[3] ~= "" and (route.lifecycleId or "") ~= ARGV[3]) then return -1 end
 end
 redis.call("ZREMRANGEBYSCORE", KEYS[3], "-inf", redis.call("TIME")[1])
 if redis.call("ZCARD", KEYS[3]) > 0 or tonumber(redis.call("GET", KEYS[2]) or "0") > 0 then return 0 end
@@ -310,7 +311,7 @@ func (c *RedisRuntimeCatalog) FinishAdmission(ctx context.Context, id, requestID
 }
 
 func (c *RedisRuntimeCatalog) DrainRoute(ctx context.Context, r protocol.RouteRecord) error {
-	result, err := luaDrainRoute.Run(ctx, c.rdb, []string{protocol.RouteKey(r.SandboxID), protocol.InflightKey(r.SandboxID), admissionsKey(r.SandboxID)}, r.ExecutionID, r.SlotID).Int()
+	result, err := luaDrainRoute.Run(ctx, c.rdb, []string{protocol.RouteKey(r.SandboxID), protocol.InflightKey(r.SandboxID), admissionsKey(r.SandboxID)}, r.ExecutionID, r.SlotID, r.LifecycleID).Int()
 	if err != nil {
 		return err
 	}

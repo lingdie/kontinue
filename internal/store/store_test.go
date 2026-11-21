@@ -49,6 +49,15 @@ func TestExecutionIDFencingAndSnapshotGC(t *testing.T) {
 	if err != nil || r.PodIP != "10.244.1.11" {
 		t.Fatalf("expected v2 route intact, got (%+v, %v)", r, err)
 	}
+	if err := cat.PublishRoute(ctx, protocol.RouteRecord{SandboxID: "sbx-lifecycle", ExecutionID: 2, LifecycleID: "current", SlotID: "slot", PodIP: "10.244.1.12"}); err != nil {
+		t.Fatalf("PublishRoute current lifecycle: %v", err)
+	}
+	if err := cat.DrainRoute(ctx, protocol.RouteRecord{SandboxID: "sbx-lifecycle", ExecutionID: 2, LifecycleID: "old", SlotID: "slot"}); !errors.Is(err, store.ErrStaleExecutionFence) {
+		t.Fatalf("expected stale lifecycle drain to fail, got %v", err)
+	}
+	if _, err := cat.GetRoute(ctx, "sbx-lifecycle"); err != nil {
+		t.Fatalf("stale lifecycle drain removed current route: %v", err)
+	}
 
 	// 3. Reference-Counted Snapshot GC: superseded snapshot referenced by child diff is kept; unreferenced is collected!
 	_ = meta.CreateSnapshot(ctx, &store.SnapshotRecord{SnapshotID: "snap-v1", Superseded: true, CreatedAt: time.Now()})

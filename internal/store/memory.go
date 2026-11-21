@@ -646,7 +646,7 @@ func (c *MemoryRuntimeCatalog) inflightLocked(id string) int64 {
 func (c *MemoryRuntimeCatalog) DrainRoute(_ context.Context, r protocol.RouteRecord) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if cur, ok := c.routes[r.SandboxID]; ok && (cur.SlotID != r.SlotID || cur.ExecutionID != r.ExecutionID) {
+	if cur, ok := c.routes[r.SandboxID]; ok && (cur.SlotID != r.SlotID || cur.ExecutionID != r.ExecutionID || (r.LifecycleID != "" && cur.LifecycleID != r.LifecycleID)) {
 		return ErrStaleExecutionFence
 	}
 	if c.inflightLocked(r.SandboxID) > 0 {
