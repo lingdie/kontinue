@@ -66,3 +66,20 @@ func TestGatewayDependencyFailuresHideInternalDiagnostics(t *testing.T) {
 		})
 	}
 }
+
+func TestGatewayDropsIdleConnectionCounters(t *testing.T) {
+	gateway := NewGateway(Config{})
+	counter := gateway.counterFor("box")
+	counter.Add(1)
+
+	gateway.releaseCounter("box", counter)
+
+	if got := gateway.ActiveConnections("box"); got != 0 {
+		t.Fatalf("idle connection counter remained active: %d", got)
+	}
+	gateway.inFlightMu.Lock()
+	defer gateway.inFlightMu.Unlock()
+	if _, ok := gateway.inFlight["box"]; ok {
+		t.Fatal("idle connection counter was retained")
+	}
+}

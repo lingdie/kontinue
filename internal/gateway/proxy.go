@@ -142,7 +142,7 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	counter.Add(1)
 	go g.renewAdmission(ctx, cancel, sandboxID, requestID)
 	defer func() {
-		counter.Add(-1)
+		g.releaseCounter(sandboxID, counter)
 		_ = g.cfg.Catalog.FinishAdmission(context.Background(), sandboxID, requestID)
 		_ = g.cfg.Catalog.TouchSandboxActive(context.Background(), sandboxID, time.Now().UTC())
 	}()
@@ -269,6 +269,17 @@ func (g *Gateway) counterFor(sandboxID string) *atomic.Int64 {
 		g.inFlight[sandboxID] = c
 	}
 	return c
+}
+
+func (g *Gateway) releaseCounter(sandboxID string, counter *atomic.Int64) {
+	if counter.Add(-1) != 0 {
+		return
+	}
+	g.inFlightMu.Lock()
+	defer g.inFlightMu.Unlock()
+	if current := g.inFlight[sandboxID]; current == counter && current.Load() == 0 {
+		delete(g.inFlight, sandboxID)
+	}
 }
 
 func formatTargetHostPort(podIPOrEndpoint string, targetPort int) string {
