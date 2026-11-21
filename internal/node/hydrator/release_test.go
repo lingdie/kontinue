@@ -163,7 +163,8 @@ func TestReleaseRetryFinishesClaimAfterReceiptWasPersisted(t *testing.T) {
 func TestRecoverFinishesReleaseClaimWithoutReceipt(t *testing.T) {
 	ctx := context.Background()
 	driver := &recordingDriver{}
-	cfg := ServiceConfig{Driver: driver, ScratchDir: t.TempDir(), NodeID: "node"}
+	routes := store.NewMemoryRuntimeCatalog()
+	cfg := ServiceConfig{Driver: driver, Routes: routes, ScratchDir: t.TempDir(), NodeID: "node"}
 	previous := NewService(cfg)
 	claim := ownership{
 		Version: 1, Phase: releasing, ReleaseTainted: true, ContainerID: "kt-original",
@@ -188,5 +189,9 @@ func TestRecoverFinishesReleaseClaimWithoutReceipt(t *testing.T) {
 	receipt, err := restarted.journal.previousRelease(req)
 	if err != nil || !receipt.Released || receipt.PodUID != claim.Slot.PodUID || !receipt.Tainted {
 		t.Fatalf("recovery did not persist release receipt: receipt=%+v err=%v", receipt, err)
+	}
+	report, err := routes.ExecutionReport(ctx, claim.route(cfg))
+	if err != nil || report.State != store.OwnerFailed {
+		t.Fatalf("recovery did not publish terminal release signal: report=%+v err=%v", report, err)
 	}
 }

@@ -667,11 +667,16 @@ func (s *Service) finishInterruptedRelease(ctx context.Context, st *activeSlotSt
 		if receipt.PodUID != st.Slot.PodUID {
 			return fmt.Errorf("release receipt Pod UID does not match slot %s", st.Slot.SlotID)
 		}
-		_, err := s.finishRelease(st, receipt)
-		return err
+		if _, err := s.finishRelease(st, receipt); err != nil {
+			return err
+		}
+	} else {
+		if _, err = s.finishReleaseAttempt(ctx, st, s.journal.receipt(req)); err != nil {
+			return err
+		}
 	}
-	_, err = s.finishReleaseAttempt(ctx, st, s.journal.receipt(req))
-	return err
+	st.FailureReason = "node recovered an interrupted release"
+	return s.report(ctx, st, store.OwnerFailed)
 }
 
 func (s *Service) finishReleaseAttempt(ctx context.Context, st *activeSlotState, receiptPath string) (*protocol.ReleaseSlotResponse, error) {
