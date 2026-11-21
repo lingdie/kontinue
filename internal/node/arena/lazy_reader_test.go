@@ -2,19 +2,65 @@ package arena
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
 	"github.com/kontinue-sh/kontinue/pkg/storage"
+	"lukechampine.com/blake3"
 )
 
 type gatedBlob struct {
 	storage.Backend
 	entered chan struct{}
 	release chan struct{}
+}
+
+type fixedChunkBackend struct {
+	storage.Backend
+	data []byte
+}
+
+func (b fixedChunkBackend) GetBlob(context.Context, string) ([]byte, error) {
+	return append([]byte(nil), b.data...), nil
+}
+
+func TestLazyReaderVerifiesLocalAndRemoteChunkContent(t *testing.T) {
+	good := []byte("valid chunk")
+	sum := blake3.Sum256(good)
+	hash := hex.EncodeToString(sum[:])
+	mf := &protocol.SnapshotManifest{PagesImgTotalSize: int64(len(good)), ChunkSize: int32(len(good)), Chunks: []protocol.ChunkRef{{Offset: 0, Length: int32(len(good)), Blake3Hash: hash}}}
+
+	local := t.TempDir()
+	localPath := filepath.Join(local, storage.ChunkKey(hash))
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, []byte("corrupted local"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewLazyPageReader(LazyReaderOptions{Manifest: mf, LocalCASDir: local, BackingFile: filepath.Join(t.TempDir(), "pages"), RemoteStore: fixedChunkBackend{data: good}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(good))
+	if _, err := r.ReadAt(context.Background(), buf, 0); err != nil || string(buf) != string(good) {
+		t.Fatalf("did not recover from a corrupt local chunk: data=%q err=%v", buf, err)
+	}
+	_ = r.Close()
+
+	badReader, err := NewLazyPageReader(LazyReaderOptions{Manifest: mf, LocalCASDir: t.TempDir(), BackingFile: filepath.Join(t.TempDir(), "pages"), RemoteStore: fixedChunkBackend{data: []byte("corrupt remote")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer badReader.Close()
+	if _, err := badReader.ReadAt(context.Background(), make([]byte, len(good)), 0); err == nil {
+		t.Fatal("accepted a remote chunk with the wrong BLAKE3 hash")
+	}
 }
 
 func (b gatedBlob) GetBlob(ctx context.Context, key string) ([]byte, error) {
@@ -31,8 +77,10 @@ func TestConcurrentFaultsWithRepeatedChunkAtDifferentOffsets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	remote := gatedBlob{entered: make(chan struct{}, 2), release: make(chan struct{})}
+	sum := blake3.Sum256([]byte("same"))
+	hash := hex.EncodeToString(sum[:])
 	mf := &protocol.SnapshotManifest{PagesImgTotalSize: 8, ChunkSize: 4, Chunks: []protocol.ChunkRef{
-		{Offset: 0, Length: 4, Blake3Hash: "repeated"}, {Offset: 4, Length: 4, Blake3Hash: "repeated"},
+		{Offset: 0, Length: 4, Blake3Hash: hash}, {Offset: 4, Length: 4, Blake3Hash: hash},
 	}}
 	r, err := NewLazyPageReader(LazyReaderOptions{Manifest: mf, LocalCASDir: t.TempDir(), BackingFile: filepath.Join(t.TempDir(), "pages"), RemoteStore: remote})
 	if err != nil {

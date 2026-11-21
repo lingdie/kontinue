@@ -2,6 +2,7 @@ package arena
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"lukechampine.com/blake3"
 )
 
 // LazyPageReader backs L3 ArenaFS virtual pages.img files:
@@ -223,13 +225,18 @@ func (r *LazyPageReader) ensureChunk(ctx context.Context, idx int) error {
 func (r *LazyPageReader) fetchChunkBytes(ctx context.Context, hash string) ([]byte, string, error) {
 	localPath := filepath.Join(r.localCASDir, storage.ChunkKey(hash))
 	if data, err := os.ReadFile(localPath); err == nil {
-		return data, "local_cas", nil
+		if validChunkData(data, hash) {
+			return data, "local_cas", nil
+		}
+		_ = os.Remove(localPath)
 	}
 
 	// Priority 1: Stream directly from OriginNode's L1/L2 Arena over gRPC P2P.
 	if r.peerClient != nil {
-		if resp, err := r.peerClient.GetChunk(ctx, &protocol.GetChunkRequest{Blake3Hash: hash}); err == nil && len(resp.Data) > 0 {
-			_ = writeAtomicFile(localPath, resp.Data)
+		if resp, err := r.peerClient.GetChunk(ctx, &protocol.GetChunkRequest{Blake3Hash: hash}); err == nil && validChunkData(resp.Data, hash) {
+			if cacheErr := writeAtomicFile(localPath, resp.Data); cacheErr == nil {
+				return resp.Data, "p2p_peer", nil
+			}
 			return resp.Data, "p2p_peer", nil
 		}
 	}
@@ -238,13 +245,23 @@ func (r *LazyPageReader) fetchChunkBytes(ctx context.Context, hash string) ([]by
 	if r.remoteStore != nil {
 		data, err := r.remoteStore.GetBlob(ctx, storage.ChunkKey(hash))
 		if err == nil {
-			_ = writeAtomicFile(localPath, data)
+			if !validChunkData(data, hash) {
+				return nil, "", fmt.Errorf("chunk %s failed BLAKE3 verification from remote CAS", hash)
+			}
+			if cacheErr := writeAtomicFile(localPath, data); cacheErr == nil {
+				return data, "s3_cas", nil
+			}
 			return data, "s3_cas", nil
 		}
 		return nil, "", fmt.Errorf("fetch chunk %s from remote CAS: %w", hash, err)
 	}
 
 	return nil, "", fmt.Errorf("chunk %s unavailable in local CAS, P2P, or remote store", hash)
+}
+
+func validChunkData(data []byte, expectedHash string) bool {
+	sum := blake3.Sum256(data)
+	return hex.EncodeToString(sum[:]) == expectedHash
 }
 
 // StartHotPagePrefetcher proactively warms known hot pages recorded in manifest.HotPageIndices
