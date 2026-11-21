@@ -741,6 +741,15 @@ func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
 // finishDelete runs with the lifecycle lock and can replay a node release receipt.
 func (s *Server) finishDelete(ctx context.Context, sbx *store.SandboxRecord) error {
 	if sbx.PendingPlacement != nil {
+		if sbx.PendingPlacement.HydrationStarted {
+			if err := s.cfg.Catalog.FinishReservation(ctx, sbx.LifecycleID, false); err != nil {
+				return err
+			}
+			if err := s.releasePendingPlacement(ctx, sbx); err != nil {
+				return err
+			}
+			return s.cfg.Meta.DeleteSandbox(ctx, sbx.SandboxID)
+		}
 		if err := s.cfg.Catalog.FinishReservation(ctx, sbx.LifecycleID, true); err != nil {
 			return err
 		}
@@ -769,6 +778,33 @@ func (s *Server) finishDelete(ctx context.Context, sbx *store.SandboxRecord) err
 		}
 	}
 	return s.cfg.Meta.DeleteSandbox(ctx, sbx.SandboxID)
+}
+
+func (s *Server) releasePendingPlacement(ctx context.Context, sbx *store.SandboxRecord) error {
+	p := sbx.PendingPlacement
+	if p == nil {
+		return nil
+	}
+	node, err := s.nodeClient(ctx, p.Slot.NodeGRPCAddr)
+	if err != nil {
+		return err
+	}
+	releaseCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	released, err := node.ReleaseSlot(releaseCtx, &protocol.ReleaseSlotRequest{
+		SlotID: p.Slot.SlotID, SandboxID: sbx.SandboxID, PodUID: p.Slot.PodUID,
+		ExecutionID: sbx.ExecutionID, LifecycleID: sbx.LifecycleID, ReuseSlot: s.cfg.ReuseSlots,
+	}, grpc.WaitForReady(true))
+	if err != nil {
+		return err
+	}
+	if !released.Released {
+		return fmt.Errorf("slot %s release is unconfirmed", p.Slot.SlotID)
+	}
+	if !s.cfg.ReuseSlots && s.cfg.Replenisher != nil {
+		return s.cfg.Replenisher.DeleteTaintedPod(ctx, p.Slot.PodNamespace, p.Slot.PodName, released.PodUID)
+	}
+	return nil
 }
 
 // StartBackgroundWorkers launches the Idle Auto-Suspend Evictor and Reference-Counted Snapshot GC loops.

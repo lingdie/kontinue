@@ -56,6 +56,16 @@ func TestReleaseOnlyStopsTheClaimedExecution(t *testing.T) {
 	}
 }
 
+func TestReleaseWithoutClaimUsesTheFencedPodIdentity(t *testing.T) {
+	s := NewService(ServiceConfig{ScratchDir: t.TempDir()})
+	response, err := s.ReleaseSlot(context.Background(), &protocol.ReleaseSlotRequest{
+		SlotID: "slot", SandboxID: "box", PodUID: "pod", ExecutionID: 1, LifecycleID: "life",
+	})
+	if err != nil || response == nil || !response.Released || response.PodUID != "pod" {
+		t.Fatalf("unclaimed release was not idempotent: response=%+v err=%v", response, err)
+	}
+}
+
 func TestStopKeepsBundleWhenRuntimeDeleteFails(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "runtime")

@@ -589,7 +589,11 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 	st := s.activeSlots[req.SlotID]
 	if st == nil || st.SandboxID != req.SandboxID || st.ExecutionID != req.ExecutionID || (req.LifecycleID != "" && req.LifecycleID != st.LifecycleID) {
 		s.mu.Unlock()
-		return s.journal.previousRelease(req)
+		receipt, err := s.journal.previousRelease(req)
+		if err != nil || receipt.Released || req.PodUID == "" {
+			return receipt, err
+		}
+		return &protocol.ReleaseSlotResponse{Released: true, Tainted: !req.ReuseSlot, PodUID: req.PodUID}, nil
 	}
 	s.mu.Unlock()
 

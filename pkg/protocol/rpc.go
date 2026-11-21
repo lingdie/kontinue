@@ -144,6 +144,7 @@ type ReleaseSlotRequest struct {
 	LifecycleID string `json:"lifecycleId,omitempty"`
 	SlotID      string `json:"slotId"`
 	SandboxID   string `json:"sandboxId"`
+	PodUID      string `json:"podUid,omitempty"`
 	ExecutionID int64  `json:"executionId"`
 	ReuseSlot   bool   `json:"reuseSlot"`
 }

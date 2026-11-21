@@ -81,8 +81,9 @@ type SnapshotRecord struct {
 }
 
 type ActivationPlacement struct {
-	Slot        protocol.CarrierSlot `json:"slot"`
-	RestoreMode string               `json:"restoreMode"`
+	Slot             protocol.CarrierSlot `json:"slot"`
+	RestoreMode      string               `json:"restoreMode"`
+	HydrationStarted bool                 `json:"hydrationStarted,omitempty"`
 }
 
 // ForkReceipt identifies the branches even after a lost HTTP response.

@@ -65,6 +65,33 @@ type releaseReplayNode struct {
 	calls atomic.Int32
 }
 
+type activationReplayNode struct {
+	protocol.NodeControlServer
+	releases atomic.Int32
+}
+
+func (n *activationReplayNode) HydrateSlot(_ context.Context, req *protocol.HydrateSlotRequest) (*protocol.HydrateSlotResponse, error) {
+	return &protocol.HydrateSlotResponse{SandboxID: req.SandboxID, ExecutionID: req.ExecutionID, PodIP: req.Slot.PodIP, ContainerID: "kt-active"}, nil
+}
+
+func (n *activationReplayNode) ReleaseSlot(_ context.Context, req *protocol.ReleaseSlotRequest) (*protocol.ReleaseSlotResponse, error) {
+	n.releases.Add(1)
+	return &protocol.ReleaseSlotResponse{Released: true, PodUID: req.PodUID}, nil
+}
+
+type failSandboxSaveMetadata struct {
+	store.MetadataStore
+	failOn int32
+	saves  atomic.Int32
+}
+
+func (m *failSandboxSaveMetadata) SaveSandbox(ctx context.Context, sbx *store.SandboxRecord) error {
+	if m.saves.Add(1) == m.failOn {
+		return errors.New("injected sandbox save failure")
+	}
+	return m.MetadataStore.SaveSandbox(ctx, sbx)
+}
+
 func (n *releaseReplayNode) ReleaseSlot(_ context.Context, req *protocol.ReleaseSlotRequest) (*protocol.ReleaseSlotResponse, error) {
 	if req.SandboxID != "box" || req.ExecutionID != 2 || req.LifecycleID != "life" || req.SlotID != "slot" {
 		return nil, errors.New("wrong release identity")
@@ -327,5 +354,59 @@ func TestDeleteCancelsPendingPlacementWithoutReleaseRPC(t *testing.T) {
 	reclaimed, err := catalog.ReserveIdleSlot(ctx, slot.NodeID, slot.Tier, "retry", false)
 	if err != nil || reclaimed.Slot.SlotID != slot.SlotID {
 		t.Fatalf("pending reservation was not returned to the pool: slot=%+v err=%v", reclaimed, err)
+	}
+}
+
+func TestDeleteReleasesPlacementAfterHydrationStarted(t *testing.T) {
+	ctx := context.Background()
+	baseMeta := store.NewMemoryMetadataStore()
+	meta := &failSandboxSaveMetadata{MetadataStore: baseMeta, failOn: 2}
+	catalog := store.NewMemoryRuntimeCatalog()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &activationReplayNode{}
+	worker := grpc.NewServer()
+	defer worker.Stop()
+	protocol.RegisterNodeControlServer(worker, node)
+	go func() { _ = worker.Serve(lis) }()
+	defer lis.Close()
+	server := NewServer(ServerConfig{Meta: meta, Catalog: catalog})
+	defer server.Close()
+	slot := protocol.CarrierSlot{SlotID: "slot", NodeID: "node", NodeGRPCAddr: lis.Addr().String(), PodIP: "10.0.0.2", PodUID: "pod", Tier: protocol.DefaultCarrierTier}
+	if err := catalog.RegisterIdleSlot(ctx, slot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.ReserveIdleSlot(ctx, slot.NodeID, slot.Tier, "life", false); err != nil {
+		t.Fatal(err)
+	}
+	box := &store.SandboxRecord{SandboxID: "active-pending", State: store.SandboxStateCreating, ExecutionID: 1, LifecycleID: "life", CurrentNodeID: slot.NodeID, CurrentSlotID: slot.SlotID,
+		CarrierPodName: slot.PodName, CarrierPodNamespace: slot.PodNamespace, PodIP: slot.PodIP,
+		PendingPlacement: &store.ActivationPlacement{Slot: slot, RestoreMode: protocol.RestoreModeCold}}
+	if err := baseMeta.CreateSandbox(ctx, box); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := server.lockActivation(ctx, box.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = server.advanceActivation(ctx, box, lock)
+	lock.close()
+	if err == nil {
+		t.Fatal("activation unexpectedly completed")
+	}
+	if node.releases.Load() != 0 {
+		t.Fatal("activation failure released a slot before deletion")
+	}
+
+	if err := server.DeleteSandbox(ctx, box.SandboxID); err != nil {
+		t.Fatalf("delete did not release the started placement: %v", err)
+	}
+	if node.releases.Load() != 1 {
+		t.Fatalf("started placement release count=%d", node.releases.Load())
+	}
+	if _, err := catalog.ReserveIdleSlot(ctx, slot.NodeID, slot.Tier, "retry", false); !errors.Is(err, store.ErrNoIdleCarrierSlot) {
+		t.Fatalf("hydrated slot was returned to the idle pool: %v", err)
 	}
 }

@@ -128,6 +128,12 @@ func (s *Server) advanceActivation(ctx context.Context, sb *store.SandboxRecord,
 		return nil, err
 	}
 	p := sb.PendingPlacement
+	if !p.HydrationStarted {
+		p.HydrationStarted = true
+		if err := s.cfg.Meta.SaveSandbox(ctx, sb); err != nil {
+			return nil, err
+		}
+	}
 	node, err := s.nodeClient(ctx, p.Slot.NodeGRPCAddr)
 	if err != nil {
 		return nil, err
