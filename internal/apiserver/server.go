@@ -740,6 +740,12 @@ func (s *Server) DeleteSandbox(ctx context.Context, sandboxID string) error {
 
 // finishDelete runs with the lifecycle lock and can replay a node release receipt.
 func (s *Server) finishDelete(ctx context.Context, sbx *store.SandboxRecord) error {
+	if sbx.PendingPlacement != nil {
+		if err := s.cfg.Catalog.FinishReservation(ctx, sbx.LifecycleID, true); err != nil {
+			return err
+		}
+		return s.cfg.Meta.DeleteSandbox(ctx, sbx.SandboxID)
+	}
 	if err := s.cfg.Catalog.FinishReservation(ctx, sbx.LifecycleID, sbx.CurrentSlotID == ""); err != nil {
 		return err
 	}
