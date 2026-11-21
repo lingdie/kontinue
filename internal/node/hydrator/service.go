@@ -650,9 +650,31 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 
 	}
 	st.Phase = releasing
+	st.ReleaseTainted = !req.ReuseSlot
 	if err := s.journal.write(st.ownership, false); err != nil {
 		return nil, err
 	}
+	return s.finishReleaseAttempt(ctx, st, s.journal.receipt(req))
+}
+
+func (s *Service) finishInterruptedRelease(ctx context.Context, st *activeSlotState) error {
+	req := &protocol.ReleaseSlotRequest{SlotID: st.Slot.SlotID, SandboxID: st.SandboxID, ExecutionID: st.ExecutionID, LifecycleID: st.LifecycleID}
+	receipt, err := s.journal.previousRelease(req)
+	if err != nil {
+		return err
+	}
+	if receipt.Released {
+		if receipt.PodUID != st.Slot.PodUID {
+			return fmt.Errorf("release receipt Pod UID does not match slot %s", st.Slot.SlotID)
+		}
+		_, err := s.finishRelease(st, receipt)
+		return err
+	}
+	_, err = s.finishReleaseAttempt(ctx, st, s.journal.receipt(req))
+	return err
+}
+
+func (s *Service) finishReleaseAttempt(ctx context.Context, st *activeSlotState, receiptPath string) (*protocol.ReleaseSlotResponse, error) {
 	if err := s.cfg.Driver.StopSandboxContainer(ctx, st.Slot, st.ContainerID); err != nil {
 		return nil, err
 	}
@@ -665,8 +687,8 @@ func (s *Service) ReleaseSlot(ctx context.Context, req *protocol.ReleaseSlotRequ
 			return nil, err
 		}
 	}
-	response := &protocol.ReleaseSlotResponse{Released: true, Tainted: !req.ReuseSlot, PodUID: st.Slot.PodUID}
-	if err := s.journal.persist(s.journal.receipt(req), response, false); err != nil {
+	response := &protocol.ReleaseSlotResponse{Released: true, Tainted: st.ReleaseTainted, PodUID: st.Slot.PodUID}
+	if err := s.journal.persist(receiptPath, response, false); err != nil {
 		return nil, err
 	}
 	return s.finishRelease(st, response)

@@ -173,7 +173,10 @@ func (s *Service) reconcile(ctx context.Context, st *activeSlotState) error {
 		return s.report(ctx, st, store.OwnerFailed)
 	}
 	if st.Phase == releasing {
-		return s.report(ctx, st, store.OwnerChecking)
+		if err := s.report(ctx, st, store.OwnerChecking); err != nil {
+			return err
+		}
+		return s.finishInterruptedRelease(ctx, st)
 	}
 	err := s.checkRecoveredGuest(ctx, st)
 	if err == nil {

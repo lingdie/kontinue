@@ -159,3 +159,34 @@ func TestReleaseRetryFinishesClaimAfterReceiptWasPersisted(t *testing.T) {
 		t.Fatalf("replacement claim lost: claims=%v err=%v", claims, err)
 	}
 }
+
+func TestRecoverFinishesReleaseClaimWithoutReceipt(t *testing.T) {
+	ctx := context.Background()
+	driver := &recordingDriver{}
+	cfg := ServiceConfig{Driver: driver, ScratchDir: t.TempDir(), NodeID: "node"}
+	previous := NewService(cfg)
+	claim := ownership{
+		Version: 1, Phase: releasing, ReleaseTainted: true, ContainerID: "kt-original",
+		Slot:      protocol.CarrierSlot{SlotID: "slot", NodeID: cfg.NodeID, PodUID: "pod"},
+		SandboxID: "box", ExecutionID: 1, LifecycleID: "life",
+	}
+	if err := previous.journal.write(claim, true); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := NewService(cfg)
+	if err := restarted.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(driver.stopped) != 1 || driver.stopped[0] != claim.ContainerID {
+		t.Fatalf("recovery did not finish the old release: stops=%v", driver.stopped)
+	}
+	if claims, err := restarted.journal.load(cfg.NodeID); err != nil || len(claims) != 0 {
+		t.Fatalf("release claim remained after recovery: claims=%v err=%v", claims, err)
+	}
+	req := &protocol.ReleaseSlotRequest{SlotID: claim.Slot.SlotID, SandboxID: claim.SandboxID, ExecutionID: claim.ExecutionID, LifecycleID: claim.LifecycleID}
+	receipt, err := restarted.journal.previousRelease(req)
+	if err != nil || !receipt.Released || receipt.PodUID != claim.Slot.PodUID || !receipt.Tainted {
+		t.Fatalf("recovery did not persist release receipt: receipt=%+v err=%v", receipt, err)
+	}
+}

@@ -34,6 +34,7 @@ type ownership struct {
 	RequestHash      string                        `json:"requestHash,omitempty"`
 	Activation       *protocol.HydrateSlotResponse `json:"activation,omitempty"`
 	FailureReason    string                        `json:"failureReason,omitempty"`
+	ReleaseTainted   bool                          `json:"releaseTainted,omitempty"`
 	View             *arena.ViewIdentity           `json:"view,omitempty"`
 	Version          int                           `json:"version"`
 	Phase            ownershipPhase                `json:"phase"`
