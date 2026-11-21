@@ -10,8 +10,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use kt_protocol::{
@@ -390,6 +391,7 @@ impl KtdService {
         #[cfg(unix)]
         unsafe {
             use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
             cmd.pre_exec(move || {
                 platform::finish_spawn_in_child(child_fd)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
@@ -419,11 +421,16 @@ impl KtdService {
         let mut child = spawn_res.map_err(|e| (500, format!("spawn {:?}: {}", req.command[0], e)))?;
         let pid = child.id();
 
-        if !req.stdin.is_empty() {
-            if let Some(mut sin) = child.stdin.take() {
-                let _ = sin.write_all(req.stdin.as_bytes());
-            }
-        }
+        let stdin_writer = if !req.stdin.is_empty() {
+            child.stdin.take().map(|mut sin| {
+                let input = req.stdin.into_bytes();
+                thread::spawn(move || {
+                    let _ = sin.write_all(&input);
+                })
+            })
+        } else {
+            None
+        };
 
         {
             if let Ok(mut g) = self.state.lock() {
@@ -469,14 +476,20 @@ impl KtdService {
             g.active_fg_waits += 1;
         }
 
-        let mut stdout_bytes = Vec::new();
-        let mut stderr_bytes = Vec::new();
-        if let Some(mut out_pipe) = child.stdout.take() {
-            let _ = out_pipe.read_to_end(&mut stdout_bytes);
-        }
-        if let Some(mut err_pipe) = child.stderr.take() {
-            let _ = err_pipe.read_to_end(&mut stderr_bytes);
-        }
+        let stdout_reader = child.stdout.take().map(|mut out_pipe| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = out_pipe.read_to_end(&mut bytes);
+                bytes
+            })
+        });
+        let stderr_reader = child.stderr.take().map(|mut err_pipe| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = err_pipe.read_to_end(&mut bytes);
+                bytes
+            })
+        });
 
         let mut timed_out = false;
         if req.timeout_ms > 0 {
@@ -486,7 +499,7 @@ impl KtdService {
                     Ok(Some(_)) => break,
                     Ok(None) => {
                         if Instant::now() >= deadline {
-                            let _ = child.kill();
+                            terminate_child_group(&mut child);
                             timed_out = true;
                             break;
                         }
@@ -498,6 +511,15 @@ impl KtdService {
         }
 
         let wait_res = child.wait();
+        if let Some(writer) = stdin_writer {
+            let _ = writer.join();
+        }
+        let stdout_bytes = stdout_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        let stderr_bytes = stderr_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
         if let Ok(mut g) = self.state.lock() {
             g.active_fg_waits = g.active_fg_waits.saturating_sub(1);
         }
@@ -529,6 +551,18 @@ impl KtdService {
             timed_out,
         })
     }
+}
+
+fn terminate_child_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // Hydrator commands run in their own process group. Kill descendants
+        // too so inherited stdout/stderr pipes cannot keep the request open.
+        unsafe {
+            let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 /// Starts `ktd`'s multithreaded HTTP/1.1 server on the bound `TcpListener`.
@@ -1047,5 +1081,29 @@ mod tests {
         assert_eq!(stale.expect_err("stale rejected").0, 409);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exec_timeout_does_not_wait_for_child_output() {
+        let svc = KtdService::new(KtdConfig {
+            version: "0.1.0".to_string(),
+            sandbox_id: "timeout-test".to_string(),
+            bootstrap_token: "boot".to_string(),
+            initial_access_token: "access".to_string(),
+            machine_id_path: String::new(),
+            workload_cgroup_dir: String::new(),
+            control_port: 49983,
+        });
+        let started = Instant::now();
+        let result = svc
+            .exec(ExecRequest {
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+                timeout_ms: 50,
+                ..Default::default()
+            })
+            .expect("timed command");
+        assert!(result.timed_out);
+        assert_eq!(result.exit_code, 124);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
