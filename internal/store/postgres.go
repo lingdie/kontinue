@@ -497,7 +497,7 @@ func (s *PostgresMetadataStore) CommitFork(ctx context.Context, source *SandboxR
 }
 
 func (s *PostgresMetadataStore) ListSandboxesToSweep(ctx context.Context) ([]SandboxRecord, error) {
-	rows, err := s.pool.Query(ctx, `SELECT payload_json FROM kt_sandboxes WHERE state IN ($1,$2,$4,$5,$6) OR (state=$3 AND (coalesce(payload_json->>'currentSlotId','') <> '' OR payload_json ? 'pendingFork'))`, string(SandboxStateRunning), string(SandboxStateSuspending), string(SandboxStateSuspended), string(SandboxStateCreating), string(SandboxStateResuming), string(SandboxStateDeleting))
+	rows, err := s.pool.Query(ctx, `SELECT payload_json FROM kt_sandboxes WHERE state IN ($1,$2,$4,$5,$6) OR (state=$3 AND (coalesce(payload_json->>'currentSlotId','') <> '' OR payload_json ? 'pendingFork')) OR (state=$7 AND (coalesce(payload_json->>'currentSlotId','') <> '' OR payload_json ? 'pendingPlacement'))`, string(SandboxStateRunning), string(SandboxStateSuspending), string(SandboxStateSuspended), string(SandboxStateCreating), string(SandboxStateResuming), string(SandboxStateDeleting), string(SandboxStateFailed))
 	if err != nil {
 		return nil, err
 	}

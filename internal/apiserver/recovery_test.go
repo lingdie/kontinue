@@ -410,3 +410,31 @@ func TestDeleteReleasesPlacementAfterHydrationStarted(t *testing.T) {
 		t.Fatalf("hydrated slot was returned to the idle pool: %v", err)
 	}
 }
+
+func TestFailedSandboxSweepReturnsUnstartedPlacement(t *testing.T) {
+	ctx := context.Background()
+	meta := store.NewMemoryMetadataStore()
+	catalog := store.NewMemoryRuntimeCatalog()
+	server := NewServer(ServerConfig{Meta: meta, Catalog: catalog})
+	defer server.Close()
+	slot := protocol.CarrierSlot{SlotID: "failed-slot", NodeID: "node", Tier: protocol.DefaultCarrierTier}
+	if err := catalog.RegisterIdleSlot(ctx, slot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.ReserveIdleSlot(ctx, slot.NodeID, slot.Tier, "failed-life", false); err != nil {
+		t.Fatal(err)
+	}
+	box := &store.SandboxRecord{SandboxID: "failed", State: store.SandboxStateFailed, ExecutionID: 1, LifecycleID: "failed-life", CurrentNodeID: slot.NodeID, CurrentSlotID: slot.SlotID,
+		PendingPlacement: &store.ActivationPlacement{Slot: slot, RestoreMode: protocol.RestoreModeCold}}
+	if err := meta.CreateSandbox(ctx, box); err != nil {
+		t.Fatal(err)
+	}
+	server.RunEvictionAndGCSweep(ctx)
+	got, err := meta.GetSandbox(ctx, box.SandboxID)
+	if err != nil || got.State != store.SandboxStateFailed || got.CurrentSlotID != "" || got.PendingPlacement != nil {
+		t.Fatalf("failed assignment did not converge: got=%+v err=%v", got, err)
+	}
+	if _, err := catalog.ReserveIdleSlot(ctx, slot.NodeID, slot.Tier, "retry", false); err != nil {
+		t.Fatalf("failed placement was not returned to the pool: %v", err)
+	}
+}

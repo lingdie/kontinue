@@ -842,6 +842,10 @@ func (s *Server) RunEvictionAndGCSweep(ctx context.Context) {
 				s.reconcileDelete(ctx, &sbx)
 				continue
 			}
+			if sbx.State == store.SandboxStateFailed {
+				s.reconcileFailed(ctx, &sbx)
+				continue
+			}
 			if sbx.State == store.SandboxStateResuming || sbx.State == store.SandboxStateCreating {
 				_, _ = s.resumePending(ctx, &sbx)
 				continue
@@ -889,6 +893,44 @@ func (s *Server) reconcileDelete(ctx context.Context, observed *store.SandboxRec
 		if err := s.finishDelete(ctx, current); err != nil {
 			log.Printf("reconcile delete %s: %v", current.SandboxID, err)
 		}
+	}
+}
+
+func (s *Server) reconcileFailed(ctx context.Context, observed *store.SandboxRecord) {
+	unlock, err := s.lockExecution(ctx, observed.SandboxID)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	current, err := s.cfg.Meta.GetSandbox(ctx, observed.SandboxID)
+	if err != nil || current.State != store.SandboxStateFailed || current.ExecutionID != observed.ExecutionID || current.LifecycleID != observed.LifecycleID {
+		return
+	}
+	if current.PendingPlacement != nil {
+		if current.PendingPlacement.HydrationStarted {
+			if err := s.releasePendingPlacement(ctx, current); err != nil {
+				log.Printf("reconcile failed placement %s: %v", current.SandboxID, err)
+				return
+			}
+		} else if err := s.cfg.Catalog.FinishReservation(ctx, current.LifecycleID, true); err != nil {
+			log.Printf("return failed reservation %s: %v", current.SandboxID, err)
+			return
+		}
+	} else if current.CurrentSlotID != "" {
+		if err := s.releaseExecution(ctx, current); err != nil {
+			log.Printf("release failed execution %s: %v", current.SandboxID, err)
+			return
+		}
+	}
+	current.PendingPlacement = nil
+	current.CurrentNodeID = ""
+	current.CurrentSlotID = ""
+	current.CarrierPodNamespace = ""
+	current.CarrierPodName = ""
+	current.PodIP = ""
+	current.PoolAllocation = ""
+	if err := s.cfg.Meta.SaveSandbox(ctx, current); err != nil {
+		log.Printf("persist released failed sandbox %s: %v", current.SandboxID, err)
 	}
 }
 

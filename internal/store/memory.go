@@ -327,7 +327,7 @@ func (m *MemoryMetadataStore) ListSandboxesToSweep(_ context.Context) ([]Sandbox
 	defer m.mu.RUnlock()
 	var out []SandboxRecord
 	for _, s := range m.sandboxes {
-		if s.State == SandboxStateDeleting || s.State == SandboxStateCreating || s.State == SandboxStateResuming || s.State == SandboxStateRunning || s.State == SandboxStateSuspending || (s.State == SandboxStateSuspended && (s.CurrentSlotID != "" || s.PendingFork != nil)) {
+		if s.State == SandboxStateDeleting || s.State == SandboxStateCreating || s.State == SandboxStateResuming || s.State == SandboxStateRunning || s.State == SandboxStateSuspending || (s.State == SandboxStateSuspended && (s.CurrentSlotID != "" || s.PendingFork != nil)) || (s.State == SandboxStateFailed && (s.CurrentSlotID != "" || s.PendingPlacement != nil)) {
 			out = append(out, cloneSandbox(s))
 		}
 	}
