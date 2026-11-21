@@ -934,7 +934,11 @@ func (d *CRIRuntimeDriver) StopSandboxContainer(ctx context.Context, _ protocol.
 	if activeContainerID == "" {
 		return nil
 	}
-	_, _ = d.runtimeClient.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: activeContainerID, Timeout: 2})
-	_, _ = d.runtimeClient.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: activeContainerID})
+	if _, err := d.runtimeClient.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: activeContainerID, Timeout: 2}); err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("stop sandbox container %s: %w", activeContainerID, err)
+	}
+	if _, err := d.runtimeClient.RemoveContainer(ctx, &runtimeapi.RemoveContainerRequest{ContainerId: activeContainerID}); err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("remove sandbox container %s: %w", activeContainerID, err)
+	}
 	return nil
 }
