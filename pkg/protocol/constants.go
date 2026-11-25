@@ -74,10 +74,19 @@ const (
 	PathInternalInit   = "/internal/init"
 
 	// Guest Agent (ktd) public SDK endpoints.
-	PathProcessExec = "/v1/process/exec"
-	PathProcessList = "/v1/process/list"
-	PathPTYSession  = "/v1/pty"
-	PathFiles       = "/v1/files"
+	PathProcessExec      = "/v1/process/exec"
+	PathProcessList      = "/v1/process/list"
+	PathProcessKill      = "/v1/process/kill"
+	PathProcessLogs      = "/v1/process/logs"
+	PathProcessLogStream = "/v1/process/logs/stream"
+	PathPTYSession       = "/v1/pty"
+	PathFiles            = "/v1/files"
+	PathFilesStream      = "/v1/files/stream"
+	PathFilesWatch       = "/v1/files/watch"
+	PathFilesInfo        = "/v1/files/info"
+	PathFilesList        = "/v1/files/list"
+	PathFilesMkdir       = "/v1/files/mkdir"
+	PathFilesRename      = "/v1/files/rename"
 
 	// Self-diagnosis flight recorder endpoint exposed on every service.
 	PathDebugTraces = "/debug/traces"

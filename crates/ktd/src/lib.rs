@@ -18,7 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 use kt_protocol::{
     constant_time_eq, format_rfc3339_utc, generate_span_id, now_unix_nanos, ExecRequest,
     ExecResponse, FileWriteRequest, FlightRecorder, FreezeRequest, FreezeResponse, HealthResponse,
-    InitPayload, InitResponse, ProcessInfo, RecordedSpan, TraceContext, HEADER_BOOTSTRAP_TOKEN,
+    InitPayload, InitResponse, ProcessInfo, ProcessLogsResponse, RecordedSpan, TraceContext,
+    HEADER_BOOTSTRAP_TOKEN,
     HEADER_KONTINUE_TOKEN, HEADER_TRACEPARENT, HEADER_TRACE_ID,
 };
 
@@ -46,12 +47,24 @@ struct InnerState {
     active_fg_waits: usize,
     clock_skew_nano: i64,
     procs: HashMap<u32, ProcessInfo>,
+    process_outputs: HashMap<u32, ProcessOutput>,
+    process_children: HashMap<u32, Arc<Mutex<Child>>>,
+}
+
+const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
+
+struct ProcessOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
 }
 
 pub struct KtdService {
     cfg: KtdConfig,
     started_at: Instant,
     state: Mutex<InnerState>,
+    #[cfg(target_os = "linux")]
+    pty_sessions: Mutex<HashMap<u32, Arc<pty::PtyProcess>>>,
     spawn_cv: Condvar,
     recorder: FlightRecorder,
 }
@@ -61,6 +74,8 @@ impl KtdService {
         Arc::new(Self {
             started_at: Instant::now(),
             recorder: FlightRecorder::new("ktd", 2048),
+            #[cfg(target_os = "linux")]
+            pty_sessions: Mutex::new(HashMap::new()),
             state: Mutex::new(InnerState {
                 sandbox_id: cfg.sandbox_id.clone(),
                 execution_id: 0,
@@ -74,6 +89,8 @@ impl KtdService {
                 active_fg_waits: 0,
                 clock_skew_nano: 0,
                 procs: HashMap::new(),
+                process_outputs: HashMap::new(),
+                process_children: HashMap::new(),
             }),
             spawn_cv: Condvar::new(),
             cfg,
@@ -99,6 +116,25 @@ impl KtdService {
 
     pub fn recorder(&self) -> &FlightRecorder {
         &self.recorder
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pty_session(&self, pid: u32) -> Option<Arc<pty::PtyProcess>> {
+        self.pty_sessions.lock().ok()?.get(&pid).cloned()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn insert_pty_session(&self, session: Arc<pty::PtyProcess>) {
+        if let Ok(mut sessions) = self.pty_sessions.lock() {
+            sessions.insert(session.pid(), session);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn remove_pty_session(&self, pid: u32) {
+        if let Ok(mut sessions) = self.pty_sessions.lock() {
+            sessions.remove(&pid);
+        }
     }
 
     pub fn verify_bootstrap(&self, token: &str) -> bool {
@@ -324,6 +360,57 @@ impl KtdService {
             .unwrap_or_default()
     }
 
+    fn append_process_output(&self, pid: u32, stdout: bool, bytes: &[u8]) {
+        let Ok(mut g) = self.state.lock() else { return };
+        let Some(output) = g.process_outputs.get_mut(&pid) else { return };
+        let target = if stdout { &mut output.stdout } else { &mut output.stderr };
+        if target.len() >= MAX_PROCESS_OUTPUT_BYTES {
+            output.truncated = true;
+            return;
+        }
+        let remaining = MAX_PROCESS_OUTPUT_BYTES - target.len();
+        if bytes.len() > remaining {
+            target.extend_from_slice(&bytes[..remaining]);
+            output.truncated = true;
+        } else {
+            target.extend_from_slice(bytes);
+        }
+    }
+
+    pub fn process_logs(&self, pid: u32) -> Result<ProcessLogsResponse, (u16, String)> {
+        let g = self.state.lock().map_err(|_| (500, "poisoned lock".to_string()))?;
+        let info = g
+            .procs
+            .get(&pid)
+            .ok_or_else(|| (404, format!("process {} not found", pid)))?;
+        let output = g.process_outputs.get(&pid);
+        Ok(ProcessLogsResponse {
+            pid,
+            stdout: output
+                .map(|v| String::from_utf8_lossy(&v.stdout).into_owned())
+                .unwrap_or_default(),
+            stderr: output
+                .map(|v| String::from_utf8_lossy(&v.stderr).into_owned())
+                .unwrap_or_default(),
+            output_truncated: output.map(|v| v.truncated).unwrap_or(false),
+            running: info.running,
+            exit_code: info.exit_code,
+        })
+    }
+
+    pub fn kill_process(&self, pid: u32) -> Result<(), (u16, String)> {
+        let child = {
+            let g = self.state.lock().map_err(|_| (500, "poisoned lock".to_string()))?;
+            g.process_children
+                .get(&pid)
+                .cloned()
+                .ok_or_else(|| (404, format!("process {} not found", pid)))?
+        };
+        let mut child = child.lock().map_err(|_| (500, "poisoned process lock".to_string()))?;
+        terminate_child_group(&mut child);
+        Ok(())
+    }
+
     pub fn exec(self: &Arc<Self>, req: ExecRequest) -> Result<ExecResponse, (u16, String)> {
         if req.command.is_empty() {
             return Err((400, "command cannot be empty".to_string()));
@@ -368,11 +455,7 @@ impl KtdService {
         } else {
             cmd.stdin(Stdio::null());
         }
-		if req.background {
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        } else {
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Tenant processes must not inherit CAP_SYS_PTRACE or a user namespace.
         // The drop and seccomp filter run after fork, in the child.
         let mut spawn_guard = match platform::begin_spawn_guard() {
@@ -444,22 +527,66 @@ impl KtdService {
                         exit_code: 0,
                     },
                 );
+                g.process_outputs.insert(
+                    pid,
+                    ProcessOutput {
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        truncated: false,
+                    },
+                );
             }
         }
 
         if req.background {
+            let stdout_reader = child.stdout.take().map(|mut out_pipe| {
+                let svc = Arc::clone(self);
+                thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match out_pipe.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => svc.append_process_output(pid, true, &buf[..n]),
+                        }
+                    }
+                })
+            });
+            let stderr_reader = child.stderr.take().map(|mut err_pipe| {
+                let svc = Arc::clone(self);
+                thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match err_pipe.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => svc.append_process_output(pid, false, &buf[..n]),
+                        }
+                    }
+                })
+            });
+            let child = Arc::new(Mutex::new(child));
+            if let Ok(mut g) = self.state.lock() {
+                g.process_children.insert(pid, Arc::clone(&child));
+            }
             let svc = Arc::clone(self);
             std::thread::spawn(move || {
                 let code = child
-                    .wait()
+                    .lock()
                     .ok()
+                    .and_then(|mut child| child.wait().ok())
                     .and_then(|s| s.code())
                     .unwrap_or(-1);
+                if let Some(reader) = stdout_reader {
+                    let _ = reader.join();
+                }
+                if let Some(reader) = stderr_reader {
+                    let _ = reader.join();
+                }
                 if let Ok(mut g) = svc.state.lock() {
                     if let Some(info) = g.procs.get_mut(&pid) {
                         info.running = false;
                         info.exit_code = code;
                     }
+                    g.process_children.remove(&pid);
                 }
             });
             return Ok(ExecResponse {
@@ -550,6 +677,66 @@ impl KtdService {
             duration_ms: start.elapsed().as_millis() as i64,
             timed_out,
         })
+    }
+}
+
+impl KtdService {
+    pub fn stream_process_logs(&self, pid: u32, stream: &mut TcpStream) -> std::io::Result<()> {
+        let mut stdout_offset = 0usize;
+        let mut stderr_offset = 0usize;
+        loop {
+            let (info, stdout, stderr) = {
+                let g = self
+                    .state
+                    .lock()
+                    .map_err(|_| std::io::Error::other("poisoned state lock"))?;
+                let Some(info) = g.procs.get(&pid).cloned() else {
+                    write_chunked_json(stream, serde_json::json!({"type":"error","error": format!("process {} not found", pid)}))?;
+                    stream.write_all(b"0\r\n\r\n")?;
+                    stream.flush()?;
+                    return Ok(());
+                };
+                let output = g.process_outputs.get(&pid);
+                (
+                    info,
+                    output.map(|v| v.stdout.clone()).unwrap_or_default(),
+                    output.map(|v| v.stderr.clone()).unwrap_or_default(),
+                )
+            };
+            if stdout_offset < stdout.len() {
+                let data = String::from_utf8_lossy(&stdout[stdout_offset..]).into_owned();
+                write_chunked_json(stream, serde_json::json!({"type":"stdout","data":data}))?;
+                stdout_offset = stdout.len();
+            }
+            if stderr_offset < stderr.len() {
+                let data = String::from_utf8_lossy(&stderr[stderr_offset..]).into_owned();
+                write_chunked_json(stream, serde_json::json!({"type":"stderr","data":data}))?;
+                stderr_offset = stderr.len();
+            }
+            if !info.running && stdout_offset >= stdout.len() && stderr_offset >= stderr.len() {
+                write_chunked_json(stream, serde_json::json!({"type":"exit","exitCode":info.exit_code}))?;
+                stream.write_all(b"0\r\n\r\n")?;
+                stream.flush()?;
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub fn stream_file_watch(&self, path: &str, stream: &mut TcpStream) -> std::io::Result<()> {
+        let mut previous = Vec::new();
+        loop {
+            let current = self
+                .file_operation("stat", path, None, None)
+                .map_err(|(_, message)| std::io::Error::other(message))?;
+            if current != previous {
+                let value: serde_json::Value = serde_json::from_slice(&current)
+                    .unwrap_or_else(|_| serde_json::json!({"path": path}));
+                write_chunked_json(stream, serde_json::json!({"type":"change","file":value}))?;
+                previous = current;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
     }
 }
 
@@ -673,6 +860,49 @@ fn handle_connection(mut stream: TcpStream, svc: Arc<KtdService>) -> std::io::Re
             reader.read_exact(&mut body)?;
         }
         drop(reader);
+
+        if method == "GET" && path == "/v1/process/logs/stream" {
+            let tok = headers.get(HEADER_KONTINUE_TOKEN).map(String::as_str).unwrap_or("");
+            if !svc.verify_access(tok) {
+                return write_json_resp(&mut stream, 401, "", br#"{"error":"invalid sandbox access token"}"#, true);
+            }
+            let pid = parse_query(&query).get("pid").and_then(|v| v.parse().ok());
+            let Some(pid) = pid else {
+                return write_json_resp(&mut stream, 400, "", br#"{"error":"missing pid query parameter"}"#, true);
+            };
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
+            stream.flush()?;
+            return svc.stream_process_logs(pid, &mut stream);
+        }
+
+        if method == "GET" && path == "/v1/files/watch" {
+            let tok = headers
+                .get(HEADER_KONTINUE_TOKEN)
+                .map(String::as_str)
+                .unwrap_or("");
+            if !svc.verify_access(tok) {
+                return write_json_resp(
+                    &mut stream,
+                    401,
+                    "",
+                    br#"{"error":"invalid sandbox access token"}"#,
+                    true,
+                );
+            }
+            let file_path = parse_query(&query).get("path").cloned();
+            let Some(file_path) = file_path else {
+                return write_json_resp(
+                    &mut stream,
+                    400,
+                    "",
+                    br#"{"error":"missing path query parameter"}"#,
+                    true,
+                );
+            };
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
+            stream.flush()?;
+            return svc.stream_file_watch(&file_path, &mut stream);
+        }
 
         if path == "/debug/traces" {
             let params = parse_query(&query);
@@ -851,7 +1081,35 @@ fn dispatch_route(
                 String::new(),
             )
         }
-        ("GET", "/v1/files") => {
+        ("POST", "/v1/process/kill") => {
+            let tok = headers.get(HEADER_KONTINUE_TOKEN).map(String::as_str).unwrap_or("");
+            if !svc.verify_access(tok) {
+                return json_err(401, "invalid sandbox access token");
+            }
+            let pid = parse_query(query).get("pid").and_then(|v| v.parse().ok());
+            let Some(pid) = pid else {
+                return json_err(400, "missing pid query parameter");
+            };
+            match svc.kill_process(pid) {
+                Ok(()) => (204, "application/json", Vec::new(), String::new()),
+                Err((code, message)) => json_err(code, &message),
+            }
+        }
+        ("GET", "/v1/process/logs") => {
+            let tok = headers.get(HEADER_KONTINUE_TOKEN).map(String::as_str).unwrap_or("");
+            if !svc.verify_access(tok) {
+                return json_err(401, "invalid sandbox access token");
+            }
+            let pid = parse_query(query).get("pid").and_then(|v| v.parse().ok());
+            let Some(pid) = pid else {
+                return json_err(400, "missing pid query parameter");
+            };
+            match svc.process_logs(pid) {
+                Ok(resp) => (200, "application/json", serde_json::to_vec(&resp).unwrap_or_default(), String::new()),
+                Err((code, message)) => json_err(code, &message),
+            }
+        }
+        ("GET", "/v1/files") | ("GET", "/v1/files/stream") => {
             let tok = headers.get(HEADER_KONTINUE_TOKEN).map(String::as_str).unwrap_or("");
             if !svc.verify_access(tok) {
                 return json_err(401, "invalid sandbox access token");
@@ -865,10 +1123,20 @@ fn dispatch_route(
                 Err((code, message)) => json_err(code, &message),
             }
         }
-        ("PUT", "/v1/files") | ("POST", "/v1/files") => {
+        ("PUT", "/v1/files") | ("POST", "/v1/files") | ("PUT", "/v1/files/stream") => {
             let tok = headers.get(HEADER_KONTINUE_TOKEN).map(String::as_str).unwrap_or("");
             if !svc.verify_access(tok) {
                 return json_err(401, "invalid sandbox access token");
+            }
+            if path == "/v1/files/stream" {
+                let params = parse_query(query);
+                let Some(file_path) = params.get("path") else {
+                    return json_err(400, "missing path query parameter");
+                };
+                return match svc.file_operation("write", file_path, None, Some((body, 0))) {
+                    Ok(_) => (204, "application/json", Vec::new(), String::new()),
+                    Err((code, message)) => json_err(code, &message),
+                };
             }
             let req: FileWriteRequest = match serde_json::from_slice(body) {
                 Ok(v) => v,
@@ -878,6 +1146,53 @@ fn dispatch_route(
                 return json_err(400, "missing path");
             }
             match svc.file_request(&req.path, Some((&req.content, req.mode))) {
+                Ok(_) => (204, "application/json", Vec::new(), String::new()),
+                Err((code, message)) => json_err(code, &message),
+            }
+        }
+        ("GET", "/v1/files/info") | ("GET", "/v1/files/list") => {
+            let tok = headers.get(HEADER_KONTINUE_TOKEN).map(String::as_str).unwrap_or("");
+            if !svc.verify_access(tok) {
+                return json_err(401, "invalid sandbox access token");
+            }
+            let params = parse_query(query);
+            let Some(file_path) = params.get("path") else {
+                return json_err(400, "missing path query parameter");
+            };
+            let operation = if path.ends_with("/info") { "stat" } else { "list" };
+            match svc.file_operation(operation, file_path, None, None) {
+                Ok(bytes) => (200, "application/json", bytes, String::new()),
+                Err((code, message)) => json_err(code, &message),
+            }
+        }
+        ("POST", "/v1/files/mkdir") | ("DELETE", "/v1/files") => {
+            let tok = headers.get(HEADER_KONTINUE_TOKEN).map(String::as_str).unwrap_or("");
+            if !svc.verify_access(tok) {
+                return json_err(401, "invalid sandbox access token");
+            }
+            let params = parse_query(query);
+            let Some(file_path) = params.get("path") else {
+                return json_err(400, "missing path query parameter");
+            };
+            let operation = if path.ends_with("/mkdir") { "mkdir" } else { "remove" };
+            match svc.file_operation(operation, file_path, None, None) {
+                Ok(_) => (204, "application/json", Vec::new(), String::new()),
+                Err((code, message)) => json_err(code, &message),
+            }
+        }
+        ("POST", "/v1/files/rename") => {
+            let tok = headers.get(HEADER_KONTINUE_TOKEN).map(String::as_str).unwrap_or("");
+            if !svc.verify_access(tok) {
+                return json_err(401, "invalid sandbox access token");
+            }
+            let req: kt_protocol::FileRenameRequest = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(e) => return json_err(400, &e.to_string()),
+            };
+            if req.from.is_empty() || req.to.is_empty() {
+                return json_err(400, "missing from or to path");
+            }
+            match svc.file_operation("rename", &req.from, Some(&req.to), None) {
                 Ok(_) => (204, "application/json", Vec::new(), String::new()),
                 Err((code, message)) => json_err(code, &message),
             }
@@ -939,6 +1254,15 @@ fn write_http_resp(
     if !body.is_empty() && code != 204 {
         stream.write_all(body)?;
     }
+    stream.flush()
+}
+
+fn write_chunked_json(stream: &mut TcpStream, value: serde_json::Value) -> std::io::Result<()> {
+    let mut body = serde_json::to_vec(&value).unwrap_or_default();
+    body.push(b'\n');
+    write!(stream, "{:X}\r\n", body.len())?;
+    stream.write_all(&body)?;
+    stream.write_all(b"\r\n")?;
     stream.flush()
 }
 

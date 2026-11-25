@@ -126,7 +126,14 @@ type HydrateSlotRequest struct {
 	CPUMillis             int64             `json:"cpuMillis,omitempty"`
 	MemoryBytes           int64             `json:"memoryBytes,omitempty"`
 	EnvVars               map[string]string `json:"envVars,omitempty"`
+	Volumes               []VolumeMount     `json:"volumes,omitempty"`
 	SkipThaw              bool              `json:"skipThaw,omitempty"`
+}
+
+type VolumeMount struct {
+	VolumeID  string `json:"volumeId"`
+	MountPath string `json:"mountPath"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
 }
 
 type HydrateSlotResponse struct {

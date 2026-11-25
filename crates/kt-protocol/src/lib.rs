@@ -262,6 +262,17 @@ pub struct ProcessInfo {
     pub exit_code: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessLogsResponse {
+    pub pid: u32,
+    pub stdout: String,
+    pub stderr: String,
+    pub output_truncated: bool,
+    pub running: bool,
+    pub exit_code: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FileWriteRequest {
@@ -270,6 +281,13 @@ pub struct FileWriteRequest {
     pub content: Vec<u8>,
     #[serde(default)]
     pub mode: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FileRenameRequest {
+    pub from: String,
+    pub to: String,
 }
 
 // --- W3C TraceContext & FlightRecorder (wire-compatible with Go pkg/telemetry) ---

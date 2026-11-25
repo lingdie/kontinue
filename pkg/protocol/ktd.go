@@ -90,10 +90,40 @@ type ProcessInfo struct {
 	ExitCode  int      `json:"exitCode,omitempty"`
 }
 
+type ProcessLogsResponse struct {
+	PID             int    `json:"pid"`
+	Stdout          string `json:"stdout"`
+	Stderr          string `json:"stderr"`
+	OutputTruncated bool   `json:"outputTruncated"`
+	Running         bool   `json:"running"`
+	ExitCode        int    `json:"exitCode"`
+}
+
 type FileWriteRequest struct {
 	Path    string `json:"path"`
 	Content []byte `json:"content"`
 	Mode    uint32 `json:"mode,omitempty"`
+}
+
+type FileRenameRequest struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type FileInfo struct {
+	Path             string `json:"path"`
+	IsDir            bool   `json:"isDir"`
+	IsFile           bool   `json:"isFile"`
+	Size             int64  `json:"size"`
+	ModifiedAtUnixMs *int64 `json:"modifiedAtUnixMs,omitempty"`
+}
+
+type FileEntry struct {
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	IsDir  bool   `json:"isDir"`
+	IsFile bool   `json:"isFile"`
+	Size   int64  `json:"size"`
 }
 
 // KtdClient talks to the Rust in-sandbox guest daemon (ktd :49983).
@@ -255,6 +285,48 @@ func (c *KtdClient) Exec(ctx context.Context, addr, accessToken string, execReq 
 	return &out, nil
 }
 
+func (c *KtdClient) KillProcess(ctx context.Context, addr, accessToken string, pid int) error {
+	u := ktdURL(addr, PathProcessKill) + "?pid=" + url.QueryEscape(fmt.Sprint(pid))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(HeaderKontinueToken, accessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("ktd kill process failed (%d): %s", resp.StatusCode, string(msg))
+	}
+	return nil
+}
+
+func (c *KtdClient) ProcessLogs(ctx context.Context, addr, accessToken string, pid int) (*ProcessLogsResponse, error) {
+	u := ktdURL(addr, PathProcessLogs) + "?pid=" + url.QueryEscape(fmt.Sprint(pid))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(HeaderKontinueToken, accessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("ktd process logs failed (%d): %s", resp.StatusCode, string(msg))
+	}
+	var out ProcessLogsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *KtdClient) WriteFile(ctx context.Context, addr, accessToken string, wReq FileWriteRequest) error {
 	raw, err := json.Marshal(wReq)
 	if err != nil {
@@ -277,8 +349,54 @@ func (c *KtdClient) WriteFile(ctx context.Context, addr, accessToken string, wRe
 	return nil
 }
 
+func (c *KtdClient) WriteFileStream(ctx context.Context, addr, accessToken, path string, content io.Reader) error {
+	u := ktdURL(addr, PathFilesStream) + "?path=" + url.QueryEscape(path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, content)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set(HeaderKontinueToken, accessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ktd streamed write failed (%d)", resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *KtdClient) ReadFile(ctx context.Context, addr, accessToken, path string) ([]byte, error) {
+	body, _, err := c.OpenFile(ctx, addr, accessToken, path)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	return io.ReadAll(body)
+}
+
+func (c *KtdClient) OpenFile(ctx context.Context, addr, accessToken, path string) (io.ReadCloser, int64, error) {
 	u := ktdURL(addr, PathFiles) + "?path=" + url.QueryEscape(path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set(HeaderKontinueToken, accessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		return nil, 0, fmt.Errorf("ktd read file failed (%d)", resp.StatusCode)
+	}
+	return resp.Body, resp.ContentLength, nil
+}
+
+func (c *KtdClient) StatFile(ctx context.Context, addr, accessToken, path string) (*FileInfo, error) {
+	u := ktdURL(addr, PathFilesInfo) + "?path=" + url.QueryEscape(path)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -290,7 +408,81 @@ func (c *KtdClient) ReadFile(ctx context.Context, addr, accessToken, path string
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ktd read file failed (%d)", resp.StatusCode)
+		return nil, fmt.Errorf("ktd stat file failed (%d)", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	var out FileInfo
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *KtdClient) ListFiles(ctx context.Context, addr, accessToken, path string) ([]FileEntry, error) {
+	u := ktdURL(addr, PathFilesList) + "?path=" + url.QueryEscape(path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(HeaderKontinueToken, accessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ktd list files failed (%d)", resp.StatusCode)
+	}
+	var out []FileEntry
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *KtdClient) MakeDir(ctx context.Context, addr, accessToken, path string) error {
+	return c.fileMutation(ctx, addr, http.MethodPost, PathFilesMkdir, accessToken, path)
+}
+
+func (c *KtdClient) RemoveFile(ctx context.Context, addr, accessToken, path string) error {
+	return c.fileMutation(ctx, addr, http.MethodDelete, PathFiles, accessToken, path)
+}
+
+func (c *KtdClient) RenameFile(ctx context.Context, addr, accessToken string, renameReq FileRenameRequest) error {
+	raw, err := json.Marshal(renameReq)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ktdURL(addr, PathFilesRename), bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(HeaderKontinueToken, accessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ktd rename file failed (%d)", resp.StatusCode)
+	}
+	return nil
+}
+
+func (c *KtdClient) fileMutation(ctx context.Context, addr, method, path, accessToken, filePath string) error {
+	u := ktdURL(addr, path) + "?path=" + url.QueryEscape(filePath)
+	req, err := http.NewRequestWithContext(ctx, method, u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(HeaderKontinueToken, accessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ktd file mutation failed (%d)", resp.StatusCode)
+	}
+	return nil
 }

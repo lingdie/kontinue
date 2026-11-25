@@ -391,7 +391,7 @@ pub fn supervise_spawn_guard(parent_fd: i32) {
     };
     loop {
         let mut notif = SeccompNotif::zeroed();
-        let rc = unsafe { libc::ioctl(listener, NOTIF_RECV, &mut notif) };
+        let rc = unsafe { libc::ioctl(listener, NOTIF_RECV as _, &mut notif) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -406,14 +406,14 @@ pub fn supervise_spawn_guard(parent_fd: i32) {
             error: if deny { libc::EPERM } else { 0 },
             flags: if deny { 0 } else { SECCOMP_USER_NOTIF_FLAG_CONTINUE },
         };
-        if unsafe { libc::ioctl(listener, NOTIF_SEND, &resp) } != 0 && !deny {
+        if unsafe { libc::ioctl(listener, NOTIF_SEND as _, &resp) } != 0 && !deny {
             let fallback = SeccompNotifResp {
                 id: notif.id,
                 val: 0,
                 error: libc::EPERM,
                 flags: 0,
             };
-            let _ = unsafe { libc::ioctl(listener, NOTIF_SEND, &fallback) };
+            let _ = unsafe { libc::ioctl(listener, NOTIF_SEND as _, &fallback) };
         }
     }
     unsafe { libc::close(listener) };
@@ -485,13 +485,13 @@ struct SeccompNotifResp {
 }
 
 #[cfg(target_os = "linux")]
-const NOTIF_RECV: i32 = iowr_const(0, std::mem::size_of::<SeccompNotif>() as u64);
+const NOTIF_RECV: libc::c_ulong = iowr_const(0, std::mem::size_of::<SeccompNotif>() as u64);
 #[cfg(target_os = "linux")]
-const NOTIF_SEND: i32 = iowr_const(1, std::mem::size_of::<SeccompNotifResp>() as u64);
+const NOTIF_SEND: libc::c_ulong = iowr_const(1, std::mem::size_of::<SeccompNotifResp>() as u64);
 
 #[cfg(target_os = "linux")]
-const fn iowr_const(nr: u64, size: u64) -> i32 {
-    ((3u64 << 30) | (size << 16) | ((b'!' as u64) << 8) | nr) as i32
+const fn iowr_const(nr: u64, size: u64) -> libc::c_ulong {
+    (3u64 << 30) | (size << 16) | ((b'!' as u64) << 8) | nr
 }
 
 #[cfg(target_os = "linux")]

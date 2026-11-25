@@ -6,9 +6,14 @@ use kt_protocol::ExecRequest;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--workload-file") {
-        let [_, operation, path, mode] = args.as_slice() else { std::process::exit(1) };
+        let [_, operation, path, mode, rest @ ..] = args.as_slice() else { std::process::exit(1) };
         let Ok(mode) = mode.parse::<u32>() else { std::process::exit(1) };
-        std::process::exit(ktd::files::helper(operation, std::path::Path::new(path), mode));
+        std::process::exit(ktd::files::helper(
+            operation,
+            std::path::Path::new(path),
+            mode,
+            rest.first().map(std::path::Path::new),
+        ));
     }
     let mut listen_addr = "0.0.0.0:49983".to_string();
     let mut bootstrap_token = std::env::var("KTD_BOOTSTRAP_TOKEN")

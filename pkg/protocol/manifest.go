@@ -20,6 +20,7 @@ const (
 	SnapshotKindGoldenTemplate SnapshotKind = "GoldenTemplate"
 	SnapshotKindSessionSuspend SnapshotKind = "SessionSuspend"
 	SnapshotKindLiveFork       SnapshotKind = "LiveFork"
+	SnapshotKindPersistent     SnapshotKind = "Persistent"
 )
 
 // CompatibilityFingerprint captures node CPU and runtime attributes required for safe memory restore.
