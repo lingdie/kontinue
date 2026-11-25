@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
+	"golang.org/x/net/websocket"
 )
 
 type failedAdmissionCatalog struct {
@@ -81,5 +83,78 @@ func TestGatewayDropsIdleConnectionCounters(t *testing.T) {
 	defer gateway.inFlightMu.Unlock()
 	if _, ok := gateway.inFlight["box"]; ok {
 		t.Fatal("idle connection counter was retained")
+	}
+}
+
+func TestWebSocketSubprotocolCredentials(t *testing.T) {
+	id := base64.RawURLEncoding.EncodeToString([]byte("box"))
+	token := base64.RawURLEncoding.EncodeToString([]byte("sandbox-token"))
+	req := httptest.NewRequest(http.MethodGet, "/v1/pty", nil)
+	req.Header.Set("Sec-WebSocket-Protocol", "kontinue-auth."+id+"."+token+", kontinue")
+	gotID, gotToken := websocketCredentials(req)
+	if gotID != "box" || gotToken != "sandbox-token" {
+		t.Fatalf("decoded credentials = %q %q", gotID, gotToken)
+	}
+}
+
+func TestGatewayWebSocketSubprotocolEndToEnd(t *testing.T) {
+	const sandboxID = "box"
+	const token = "sandbox-token"
+	backendHandler := websocket.Server{
+		Handshake: func(config *websocket.Config, _ *http.Request) error {
+			config.Protocol = []string{"kontinue"}
+			return nil
+		},
+		Handler: websocket.Handler(func(conn *websocket.Conn) {
+			if conn.Request().Header.Get(protocol.HeaderKontinueSandboxID) != sandboxID || conn.Request().Header.Get(protocol.HeaderKontinueToken) != token {
+				t.Errorf("Gateway did not forward PTY credentials")
+				return
+			}
+			_ = websocket.Message.Send(conn, []byte(`{"type":"ready","pid":1}`))
+			var payload []byte
+			if err := websocket.Message.Receive(conn, &payload); err == nil {
+				_ = websocket.Message.Send(conn, append([]byte("echo:"), payload...))
+			}
+		}),
+	}
+	backend := httptest.NewServer(backendHandler)
+	defer backend.Close()
+
+	catalog := store.NewMemoryRuntimeCatalog()
+	if err := catalog.PublishRoute(context.Background(), protocol.RouteRecord{SandboxID: sandboxID, ExecutionID: 1, PodIP: strings.TrimPrefix(backend.URL, "http://"), AccessDigest: protocol.AccessDigest(token)}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := httptest.NewServer(NewGateway(Config{Catalog: catalog}).Handler())
+	defer gateway.Close()
+
+	encodedID := base64.RawURLEncoding.EncodeToString([]byte(sandboxID))
+	encodedToken := base64.RawURLEncoding.EncodeToString([]byte(token))
+	wsURL := strings.Replace(gateway.URL, "http://", "ws://", 1) + "/v1/pty"
+	config, err := websocket.NewConfig(wsURL, gateway.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Protocol = []string{"kontinue-auth." + encodedID + "." + encodedToken, "kontinue"}
+	conn, err := websocket.DialConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var ready []byte
+	if err := websocket.Message.Receive(conn, &ready); err != nil {
+		t.Fatal(err)
+	}
+	if string(ready) != `{"type":"ready","pid":1}` {
+		t.Fatalf("ready payload = %q", ready)
+	}
+	if err := websocket.Message.Send(conn, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	var echoed []byte
+	if err := websocket.Message.Receive(conn, &echoed); err != nil {
+		t.Fatal(err)
+	}
+	if string(echoed) != "echo:hello" {
+		t.Fatalf("echo payload = %q", echoed)
 	}
 }

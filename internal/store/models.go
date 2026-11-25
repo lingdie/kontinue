@@ -10,6 +10,7 @@ import (
 
 var (
 	ErrSandboxExists       = errors.New("sandbox ID is already in use")
+	ErrVolumeExists        = errors.New("volume ID is already in use")
 	ErrSnapshotExists      = errors.New("snapshot ID is already in use")
 	ErrNotFound            = errors.New("record not found")
 	ErrStaleExecutionFence = errors.New("stale executionId rejected by route fence")
@@ -42,27 +43,44 @@ type TemplateBuild struct {
 	Slot           protocol.CarrierSlot `json:"slot"`
 	PeerAddr       string               `json:"peerAddr,omitempty"`
 	GuestEndpoint  string               `json:"guestEndpoint,omitempty"`
+	StartedAt      time.Time            `json:"startedAt"`
+	Failed         bool                 `json:"failed,omitempty"`
+}
+
+type TemplateBuildRecord struct {
+	Version       int       `json:"version"`
+	SnapshotID    string    `json:"snapshotId,omitempty"`
+	Phase         string    `json:"phase"`
+	StatusMessage string    `json:"statusMessage,omitempty"`
+	Logs          []string  `json:"logs,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+	CompletedAt   time.Time `json:"completedAt,omitempty"`
 }
 
 type TemplateRecord struct {
-	TenantID         string         `json:"-"`
-	Build            *TemplateBuild `json:"-"`
-	TemplateID       string         `json:"templateId"`
-	Name             string         `json:"name"`
-	BaseImage        string         `json:"baseImage"`
-	WarmupScript     string         `json:"warmupScript,omitempty"`
-	Tier             string         `json:"tier"`
-	PinInL1Tmpfs     bool           `json:"pinInL1Tmpfs"`
-	TraceHotPages    bool           `json:"traceHotPages"`
-	Phase            string         `json:"phase"`
-	GoldenSnapshotID string         `json:"goldenSnapshotId,omitempty"`
-	StatusMessage    string         `json:"statusMessage,omitempty"`
-	CreatedAt        time.Time      `json:"createdAt"`
-	UpdatedAt        time.Time      `json:"updatedAt"`
+	TenantID         string                `json:"-"`
+	Build            *TemplateBuild        `json:"-"`
+	TemplateID       string                `json:"templateId"`
+	Name             string                `json:"name"`
+	BaseImage        string                `json:"baseImage"`
+	WarmupScript     string                `json:"warmupScript,omitempty"`
+	Tier             string                `json:"tier"`
+	PinInL1Tmpfs     bool                  `json:"pinInL1Tmpfs"`
+	TraceHotPages    bool                  `json:"traceHotPages"`
+	Phase            string                `json:"phase"`
+	Version          int                   `json:"version"`
+	Tags             map[string]string     `json:"tags,omitempty"`
+	History          []TemplateBuildRecord `json:"history,omitempty"`
+	BuildLogs        []string              `json:"buildLogs,omitempty"`
+	GoldenSnapshotID string                `json:"goldenSnapshotId,omitempty"`
+	StatusMessage    string                `json:"statusMessage,omitempty"`
+	CreatedAt        time.Time             `json:"createdAt"`
+	UpdatedAt        time.Time             `json:"updatedAt"`
 }
 
 type SnapshotRecord struct {
 	SnapshotID       string                            `json:"snapshotId"`
+	TenantID         string                            `json:"-"`
 	Kind             protocol.SnapshotKind             `json:"kind"`
 	TemplateID       string                            `json:"templateId,omitempty"`
 	SourceSandboxID  string                            `json:"sourceSandboxId,omitempty"`
@@ -93,48 +111,81 @@ type ForkReceipt struct {
 	RequestHash string   `json:"requestHash"`
 	ChildIDs    []string `json:"childIds"`
 }
+
+type ForkChildConfig struct {
+	SandboxID          string                 `json:"sandboxId,omitempty"`
+	EnvVars            map[string]string      `json:"envVars,omitempty"`
+	Metadata           map[string]string      `json:"metadata,omitempty"`
+	IdleTimeoutSeconds *int64                 `json:"idleTimeoutSeconds,omitempty"`
+	CPUMillis          *int64                 `json:"cpuMillis,omitempty"`
+	MemoryBytes        *int64                 `json:"memoryBytes,omitempty"`
+	Volumes            []protocol.VolumeMount `json:"volumes,omitempty"`
+}
+
 type PendingFork struct {
 	ForkReceipt
 	RequestKey string            `json:"requestKey,omitempty"`
 	SnapshotID string            `json:"snapshotId"`
 	EnvVars    map[string]string `json:"envVars,omitempty"`
+	Children   []ForkChildConfig `json:"children,omitempty"`
 }
 
 type SandboxRecord struct {
-	ArenaTier                   string               `json:"arenaTier,omitempty"`
-	RestoreViewCopiedBytes      *int64               `json:"restoreViewCopiedBytes,omitempty"`
-	CreateKey                   string               `json:"createKey,omitempty"`
-	CreateRequestHash           string               `json:"createRequestHash,omitempty"`
-	TenantID                    string               `json:"tenantId,omitempty"`
-	PendingFork                 *PendingFork         `json:"pendingFork,omitempty"`
-	ForkOperationID             string               `json:"forkOperationId,omitempty"`
-	PendingPlacement            *ActivationPlacement `json:"pendingPlacement,omitempty"`
-	FailureReason               string               `json:"failureReason,omitempty"`
-	SandboxID                   string               `json:"sandboxId"`
-	TemplateID                  string               `json:"templateId,omitempty"`
-	BaseImage                   string               `json:"baseImage"`
-	Tier                        string               `json:"tier"`
-	State                       SandboxState         `json:"state"`
-	ExecutionID                 int64                `json:"executionId"`
-	LifecycleID                 string               `json:"lifecycleId"`
-	PendingSnapshotID           string               `json:"pendingSnapshotId,omitempty"`
-	ActiveSnapshotID            string               `json:"activeSnapshotId,omitempty"`
-	CurrentNodeID               string               `json:"currentNodeId,omitempty"`
-	OriginNodeID                string               `json:"originNodeId,omitempty"`
-	CurrentSlotID               string               `json:"currentSlotId,omitempty"`
-	CarrierPodNamespace         string               `json:"carrierPodNamespace,omitempty"`
-	CarrierPodName              string               `json:"carrierPodName,omitempty"`
-	PodIP                       string               `json:"podIp,omitempty"`
-	PoolAllocation              string               `json:"poolAllocation,omitempty"`
-	AccessToken                 string               `json:"accessToken,omitempty"`
-	BootstrapToken              string               `json:"bootstrapToken,omitempty"`
-	EnvVars                     map[string]string    `json:"envVars,omitempty"`
-	IdleTimeoutSeconds          int64                `json:"idleTimeoutSeconds"`
-	CPUMillis                   int64                `json:"cpuMillis,omitempty"`
-	MemoryBytes                 int64                `json:"memoryBytes,omitempty"`
-	AllowFilesystemOnlyFallback bool                 `json:"allowFilesystemOnlyFallback"`
-	CreatedAt                   time.Time            `json:"createdAt"`
-	UpdatedAt                   time.Time            `json:"updatedAt"`
+	ArenaTier                   string                 `json:"arenaTier,omitempty"`
+	RestoreViewCopiedBytes      *int64                 `json:"restoreViewCopiedBytes,omitempty"`
+	CreateKey                   string                 `json:"createKey,omitempty"`
+	CreateRequestHash           string                 `json:"createRequestHash,omitempty"`
+	TenantID                    string                 `json:"tenantId,omitempty"`
+	PendingFork                 *PendingFork           `json:"pendingFork,omitempty"`
+	ForkOperationID             string                 `json:"forkOperationId,omitempty"`
+	PendingPlacement            *ActivationPlacement   `json:"pendingPlacement,omitempty"`
+	FailureReason               string                 `json:"failureReason,omitempty"`
+	SandboxID                   string                 `json:"sandboxId"`
+	TemplateID                  string                 `json:"templateId,omitempty"`
+	BaseImage                   string                 `json:"baseImage"`
+	Tier                        string                 `json:"tier"`
+	State                       SandboxState           `json:"state"`
+	ExecutionID                 int64                  `json:"executionId"`
+	LifecycleID                 string                 `json:"lifecycleId"`
+	PendingSnapshotID           string                 `json:"pendingSnapshotId,omitempty"`
+	ActiveSnapshotID            string                 `json:"activeSnapshotId,omitempty"`
+	CurrentNodeID               string                 `json:"currentNodeId,omitempty"`
+	OriginNodeID                string                 `json:"originNodeId,omitempty"`
+	CurrentSlotID               string                 `json:"currentSlotId,omitempty"`
+	CarrierPodNamespace         string                 `json:"carrierPodNamespace,omitempty"`
+	CarrierPodName              string                 `json:"carrierPodName,omitempty"`
+	PodIP                       string                 `json:"podIp,omitempty"`
+	PoolAllocation              string                 `json:"poolAllocation,omitempty"`
+	AccessToken                 string                 `json:"accessToken,omitempty"`
+	BootstrapToken              string                 `json:"bootstrapToken,omitempty"`
+	EnvVars                     map[string]string      `json:"envVars,omitempty"`
+	Metadata                    map[string]string      `json:"metadata,omitempty"`
+	Volumes                     []protocol.VolumeMount `json:"volumes,omitempty"`
+	IdleTimeoutSeconds          int64                  `json:"idleTimeoutSeconds"`
+	CPUMillis                   int64                  `json:"cpuMillis,omitempty"`
+	MemoryBytes                 int64                  `json:"memoryBytes,omitempty"`
+	AllowFilesystemOnlyFallback bool                   `json:"allowFilesystemOnlyFallback"`
+	CreatedAt                   time.Time              `json:"createdAt"`
+	UpdatedAt                   time.Time              `json:"updatedAt"`
+}
+
+type VolumeRecord struct {
+	TenantID  string            `json:"-"`
+	VolumeID  string            `json:"volumeId"`
+	Name      string            `json:"name,omitempty"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	CreatedAt time.Time         `json:"createdAt"`
+	UpdatedAt time.Time         `json:"updatedAt"`
+}
+
+type WebhookRecord struct {
+	TenantID  string    `json:"-"`
+	WebhookID string    `json:"webhookId"`
+	URL       string    `json:"url"`
+	Events    []string  `json:"events,omitempty"`
+	Secret    string    `json:"-"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // MetadataStore persists durable templates, snapshots, and sandbox lifecycles (PostgreSQL).
@@ -146,6 +197,8 @@ type MetadataStore interface {
 	SaveTemplateBuild(ctx context.Context, tpl *TemplateRecord) error
 	ListPendingTemplateIDs(ctx context.Context) ([]string, error)
 	ListTemplates(ctx context.Context) ([]TemplateRecord, error)
+	UpdateTemplate(ctx context.Context, tpl *TemplateRecord) error
+	DeleteTemplate(ctx context.Context, templateID string) error
 
 	// LockSnapshotSet lets publications overlap and excludes physical collection.
 	LockSnapshotSet(ctx context.Context, exclusive bool) (release func(), err error)
@@ -159,11 +212,22 @@ type MetadataStore interface {
 
 	CreateSandbox(ctx context.Context, sbx *SandboxRecord) error
 	GetSandbox(ctx context.Context, sandboxID string) (*SandboxRecord, error)
+	ListSandboxes(ctx context.Context) ([]SandboxRecord, error)
 	CommitFork(ctx context.Context, source *SandboxRecord, children []*SandboxRecord) error
 	GetForkReceipt(ctx context.Context, sourceID, requestKey string) (*ForkReceipt, error)
 	SaveSandbox(ctx context.Context, sbx *SandboxRecord) error
 	ListSandboxesToSweep(ctx context.Context) ([]SandboxRecord, error)
 	DeleteSandbox(ctx context.Context, sandboxID string) error
+
+	CreateVolume(ctx context.Context, volume *VolumeRecord) error
+	GetVolume(ctx context.Context, volumeID string) (*VolumeRecord, error)
+	ListVolumes(ctx context.Context) ([]VolumeRecord, error)
+	DeleteVolume(ctx context.Context, volumeID string) error
+
+	CreateWebhook(ctx context.Context, webhook *WebhookRecord) error
+	GetWebhook(ctx context.Context, webhookID string) (*WebhookRecord, error)
+	ListWebhooks(ctx context.Context) ([]WebhookRecord, error)
+	DeleteWebhook(ctx context.Context, webhookID string) error
 
 	// TryLeader acquires a cluster-wide leader lock for background workers.
 	// release must be called when the critical section ends. ok=false means another replica holds it.

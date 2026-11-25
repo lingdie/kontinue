@@ -33,9 +33,11 @@ CREATE TABLE IF NOT EXISTS kt_templates (
 
 ALTER TABLE kt_templates ADD COLUMN IF NOT EXISTS build JSONB;
 ALTER TABLE kt_templates ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE kt_templates ADD COLUMN IF NOT EXISTS details JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS kt_snapshots (
     snapshot_id        TEXT PRIMARY KEY,
+    tenant_id          TEXT NOT NULL DEFAULT 'local',
     kind               TEXT NOT NULL,
     template_id        TEXT NOT NULL DEFAULT '',
     source_sandbox_id  TEXT NOT NULL DEFAULT '',
@@ -54,6 +56,8 @@ CREATE TABLE IF NOT EXISTS kt_snapshots (
     created_at         TIMESTAMPTZ NOT NULL
 );
 
+ALTER TABLE kt_snapshots ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
+
 CREATE TABLE IF NOT EXISTS kt_sandboxes (
     sandbox_id            TEXT PRIMARY KEY,
     payload_json          JSONB NOT NULL,
@@ -69,6 +73,23 @@ CREATE TABLE IF NOT EXISTS kt_fork_receipts (
     PRIMARY KEY (source_id, request_key)
 );
 
+CREATE TABLE IF NOT EXISTS kt_volumes (
+    volume_id  TEXT PRIMARY KEY,
+    tenant_id  TEXT NOT NULL,
+    payload_json JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kt_webhooks (
+    webhook_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    events_json JSONB NOT NULL,
+    secret TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_kt_sandboxes_create_key
 ON kt_sandboxes ((payload_json->>'createKey')) WHERE payload_json ? 'createKey';
 CREATE INDEX IF NOT EXISTS idx_kt_sandboxes_state ON kt_sandboxes(state);
@@ -80,6 +101,36 @@ type PostgresMetadataStore struct {
 	pool          *pgxpool.Pool
 	locks         *pgxpool.Pool
 	snapshotLocks *pgxpool.Pool
+}
+
+type templateDetails struct {
+	Version   int                   `json:"version"`
+	Tags      map[string]string     `json:"tags,omitempty"`
+	History   []TemplateBuildRecord `json:"history,omitempty"`
+	BuildLogs []string              `json:"buildLogs,omitempty"`
+}
+
+func marshalTemplateDetails(tpl *TemplateRecord) []byte {
+	raw, _ := json.Marshal(templateDetails{Version: tpl.Version, Tags: tpl.Tags, History: tpl.History, BuildLogs: tpl.BuildLogs})
+	return raw
+}
+
+func unmarshalTemplateDetails(raw []byte, tpl *TemplateRecord) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var details templateDetails
+	if err := json.Unmarshal(raw, &details); err != nil {
+		return err
+	}
+	tpl.Version = details.Version
+	if tpl.Version == 0 {
+		tpl.Version = 1
+	}
+	tpl.Tags = details.Tags
+	tpl.History = details.History
+	tpl.BuildLogs = details.BuildLogs
+	return nil
 }
 
 func NewPostgresMetadataStore(ctx context.Context, connString string) (*PostgresMetadataStore, error) {
@@ -155,37 +206,69 @@ func (s *PostgresMetadataStore) CreateTemplate(ctx context.Context, tpl *Templat
 	if tpl.CreatedAt.IsZero() {
 		tpl.CreatedAt = now
 	}
+	if tpl.Version == 0 {
+		tpl.Version = 1
+	}
 	tpl.UpdatedAt = now
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO kt_templates (
 			template_id, name, base_image, warmup_script, tier, pin_in_l1_tmpfs,
-			trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, build, tenant_id
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, build, tenant_id, details
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 		tpl.TemplateID, tpl.Name, tpl.BaseImage, tpl.WarmupScript, tpl.Tier, tpl.PinInL1Tmpfs,
-		tpl.TraceHotPages, tpl.Phase, tpl.GoldenSnapshotID, tpl.StatusMessage, tpl.CreatedAt, tpl.UpdatedAt, tpl.Build, tpl.TenantID,
+		tpl.TraceHotPages, tpl.Phase, tpl.GoldenSnapshotID, tpl.StatusMessage, tpl.CreatedAt, tpl.UpdatedAt, tpl.Build, tpl.TenantID, marshalTemplateDetails(tpl),
 	)
 	return err
 }
 
 func (s *PostgresMetadataStore) GetTemplate(ctx context.Context, templateID string) (*TemplateRecord, error) {
 	var t TemplateRecord
+	var details []byte
 	err := s.pool.QueryRow(ctx, `
 		SELECT template_id, name, base_image, warmup_script, tier, pin_in_l1_tmpfs,
-		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, build, tenant_id
+		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, build, tenant_id, details
 		FROM kt_templates WHERE template_id = $1`, templateID,
 	).Scan(
 		&t.TemplateID, &t.Name, &t.BaseImage, &t.WarmupScript, &t.Tier, &t.PinInL1Tmpfs,
-		&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt, &t.Build, &t.TenantID,
+		&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt, &t.Build, &t.TenantID, &details,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	return &t, err
+	if err != nil {
+		return nil, err
+	}
+	if err := unmarshalTemplateDetails(details, &t); err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 func (s *PostgresMetadataStore) SaveTemplateBuild(ctx context.Context, t *TemplateRecord) error {
 	t.UpdatedAt = time.Now().UTC()
-	tag, err := s.pool.Exec(ctx, `UPDATE kt_templates SET phase=$2,golden_snapshot_id=$3,status_message=$4,build=$5,updated_at=$6 WHERE template_id=$1`, t.TemplateID, t.Phase, t.GoldenSnapshotID, t.StatusMessage, t.Build, t.UpdatedAt)
+	tag, err := s.pool.Exec(ctx, `UPDATE kt_templates SET phase=$2,golden_snapshot_id=$3,status_message=$4,build=$5,details=$6,updated_at=$7 WHERE template_id=$1`, t.TemplateID, t.Phase, t.GoldenSnapshotID, t.StatusMessage, t.Build, marshalTemplateDetails(t), t.UpdatedAt)
+	if err == nil && tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
+	return err
+}
+
+func (s *PostgresMetadataStore) UpdateTemplate(ctx context.Context, t *TemplateRecord) error {
+	t.UpdatedAt = time.Now().UTC()
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE kt_templates SET name=$2,base_image=$3,warmup_script=$4,tier=$5,pin_in_l1_tmpfs=$6,
+		trace_hot_pages=$7,phase=$8,golden_snapshot_id=$9,status_message=$10,build=$11,details=$12,updated_at=$13
+		WHERE template_id=$1`,
+		t.TemplateID, t.Name, t.BaseImage, t.WarmupScript, t.Tier, t.PinInL1Tmpfs,
+		t.TraceHotPages, t.Phase, t.GoldenSnapshotID, t.StatusMessage, t.Build, marshalTemplateDetails(t), t.UpdatedAt)
+	if err == nil && tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
+	return err
+}
+
+func (s *PostgresMetadataStore) DeleteTemplate(ctx context.Context, templateID string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM kt_templates WHERE template_id=$1`, templateID)
 	if err == nil && tag.RowsAffected() != 1 {
 		return ErrNotFound
 	}
@@ -203,7 +286,7 @@ func (s *PostgresMetadataStore) ListPendingTemplateIDs(ctx context.Context) ([]s
 func (s *PostgresMetadataStore) ListTemplates(ctx context.Context) ([]TemplateRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT template_id, name, base_image, warmup_script, tier, pin_in_l1_tmpfs,
-		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, tenant_id
+		       trace_hot_pages, phase, golden_snapshot_id, status_message, created_at, updated_at, tenant_id, details
 		FROM kt_templates ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -212,10 +295,14 @@ func (s *PostgresMetadataStore) ListTemplates(ctx context.Context) ([]TemplateRe
 	var out []TemplateRecord
 	for rows.Next() {
 		var t TemplateRecord
+		var details []byte
 		if err := rows.Scan(
 			&t.TemplateID, &t.Name, &t.BaseImage, &t.WarmupScript, &t.Tier, &t.PinInL1Tmpfs,
-			&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt, &t.TenantID,
+			&t.TraceHotPages, &t.Phase, &t.GoldenSnapshotID, &t.StatusMessage, &t.CreatedAt, &t.UpdatedAt, &t.TenantID, &details,
 		); err != nil {
+			return nil, err
+		}
+		if err := unmarshalTemplateDetails(details, &t); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -251,12 +338,12 @@ func (s *PostgresMetadataStore) CreateSnapshot(ctx context.Context, snap *Snapsh
 	fpRaw, _ := json.Marshal(snap.Fingerprint)
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO kt_snapshots (
-			snapshot_id, kind, template_id, source_sandbox_id, parent_snapshot_id,
+			snapshot_id, tenant_id, kind, template_id, source_sandbox_id, parent_snapshot_id,
 			base_image, manifest_uri, origin_node_id, origin_peer_addr,
 			total_memory_bytes, dirty_memory_bytes, dirty_chunks, reused_chunks,
 			superseded, bootstrap_token, fingerprint_json, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-		snap.SnapshotID, string(snap.Kind), snap.TemplateID, snap.SourceSandboxID, snap.ParentSnapshotID,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+		snap.SnapshotID, snap.TenantID, string(snap.Kind), snap.TemplateID, snap.SourceSandboxID, snap.ParentSnapshotID,
 		snap.BaseImage, snap.ManifestURI, snap.OriginNodeID, snap.OriginPeerAddr,
 		snap.TotalMemoryBytes, snap.DirtyMemoryBytes, snap.DirtyChunks, snap.ReusedChunks,
 		snap.Superseded, snap.BootstrapToken, fpRaw, snap.CreatedAt,
@@ -273,13 +360,13 @@ func (s *PostgresMetadataStore) GetSnapshot(ctx context.Context, snapshotID stri
 	var kindStr string
 	var fpRaw []byte
 	err := s.pool.QueryRow(ctx, `
-		SELECT snapshot_id, kind, template_id, source_sandbox_id, parent_snapshot_id,
+		SELECT snapshot_id, tenant_id, kind, template_id, source_sandbox_id, parent_snapshot_id,
 		       base_image, manifest_uri, origin_node_id, origin_peer_addr,
 		       total_memory_bytes, dirty_memory_bytes, dirty_chunks, reused_chunks,
 		       superseded, bootstrap_token, fingerprint_json, created_at
 		FROM kt_snapshots WHERE snapshot_id = $1`, snapshotID,
 	).Scan(
-		&snap.SnapshotID, &kindStr, &snap.TemplateID, &snap.SourceSandboxID, &snap.ParentSnapshotID,
+		&snap.SnapshotID, &snap.TenantID, &kindStr, &snap.TemplateID, &snap.SourceSandboxID, &snap.ParentSnapshotID,
 		&snap.BaseImage, &snap.ManifestURI, &snap.OriginNodeID, &snap.OriginPeerAddr,
 		&snap.TotalMemoryBytes, &snap.DirtyMemoryBytes, &snap.DirtyChunks, &snap.ReusedChunks,
 		&snap.Superseded, &snap.BootstrapToken, &fpRaw, &snap.CreatedAt,
@@ -302,7 +389,7 @@ func (s *PostgresMetadataStore) MarkSnapshotSuperseded(ctx context.Context, snap
 
 func (s *PostgresMetadataStore) ListGCandidateSnapshots(ctx context.Context) ([]SnapshotRecord, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT s.snapshot_id, s.kind, s.template_id, s.source_sandbox_id, s.parent_snapshot_id,
+		SELECT s.snapshot_id, s.tenant_id, s.kind, s.template_id, s.source_sandbox_id, s.parent_snapshot_id,
 		       s.base_image, s.manifest_uri, s.origin_node_id, s.origin_peer_addr,
 		       s.total_memory_bytes, s.dirty_memory_bytes, s.dirty_chunks, s.reused_chunks,
 		       s.superseded, s.bootstrap_token, s.fingerprint_json, s.created_at
@@ -321,7 +408,7 @@ func (s *PostgresMetadataStore) ListGCandidateSnapshots(ctx context.Context) ([]
 		var kindStr string
 		var fpRaw []byte
 		if err := rows.Scan(
-			&snap.SnapshotID, &kindStr, &snap.TemplateID, &snap.SourceSandboxID, &snap.ParentSnapshotID,
+			&snap.SnapshotID, &snap.TenantID, &kindStr, &snap.TemplateID, &snap.SourceSandboxID, &snap.ParentSnapshotID,
 			&snap.BaseImage, &snap.ManifestURI, &snap.OriginNodeID, &snap.OriginPeerAddr,
 			&snap.TotalMemoryBytes, &snap.DirtyMemoryBytes, &snap.DirtyChunks, &snap.ReusedChunks,
 			&snap.Superseded, &snap.BootstrapToken, &fpRaw, &snap.CreatedAt,
@@ -357,7 +444,7 @@ func (s *PostgresMetadataStore) UnpublishedSnapshot(ctx context.Context) (string
 
 func (s *PostgresMetadataStore) ListAllSnapshots(ctx context.Context) ([]SnapshotRecord, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT snapshot_id, kind, template_id, source_sandbox_id, parent_snapshot_id,
+		SELECT snapshot_id, tenant_id, kind, template_id, source_sandbox_id, parent_snapshot_id,
 		       base_image, manifest_uri, origin_node_id, origin_peer_addr,
 		       total_memory_bytes, dirty_memory_bytes, dirty_chunks, reused_chunks,
 		       superseded, bootstrap_token, fingerprint_json, created_at
@@ -372,7 +459,7 @@ func (s *PostgresMetadataStore) ListAllSnapshots(ctx context.Context) ([]Snapsho
 		var kindStr string
 		var fpRaw []byte
 		if err := rows.Scan(
-			&snap.SnapshotID, &kindStr, &snap.TemplateID, &snap.SourceSandboxID, &snap.ParentSnapshotID,
+			&snap.SnapshotID, &snap.TenantID, &kindStr, &snap.TemplateID, &snap.SourceSandboxID, &snap.ParentSnapshotID,
 			&snap.BaseImage, &snap.ManifestURI, &snap.OriginNodeID, &snap.OriginPeerAddr,
 			&snap.TotalMemoryBytes, &snap.DirtyMemoryBytes, &snap.DirtyChunks, &snap.ReusedChunks,
 			&snap.Superseded, &snap.BootstrapToken, &fpRaw, &snap.CreatedAt,
@@ -435,6 +522,27 @@ func (s *PostgresMetadataStore) GetSandbox(ctx context.Context, sandboxID string
 		return nil, err
 	}
 	return &sbx, nil
+}
+
+func (s *PostgresMetadataStore) ListSandboxes(ctx context.Context) ([]SandboxRecord, error) {
+	rows, err := s.pool.Query(ctx, `SELECT payload_json FROM kt_sandboxes ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SandboxRecord
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var sandbox SandboxRecord
+		if err := json.Unmarshal(raw, &sandbox); err != nil {
+			return nil, err
+		}
+		out = append(out, sandbox)
+	}
+	return out, rows.Err()
 }
 
 func (s *PostgresMetadataStore) SaveSandbox(ctx context.Context, sbx *SandboxRecord) error {
@@ -523,5 +631,135 @@ func (s *PostgresMetadataStore) ListSandboxesToSweep(ctx context.Context) ([]San
 
 func (s *PostgresMetadataStore) DeleteSandbox(ctx context.Context, sandboxID string) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM kt_sandboxes WHERE sandbox_id = $1`, sandboxID)
+	return err
+}
+
+func (s *PostgresMetadataStore) CreateVolume(ctx context.Context, volume *VolumeRecord) error {
+	now := time.Now().UTC()
+	if volume.CreatedAt.IsZero() {
+		volume.CreatedAt = now
+	}
+	volume.UpdatedAt = now
+	raw, err := json.Marshal(volume)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `INSERT INTO kt_volumes (volume_id, tenant_id, payload_json, updated_at) VALUES ($1,$2,$3,$4)`, volume.VolumeID, volume.TenantID, raw, volume.UpdatedAt)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return ErrVolumeExists
+	}
+	return err
+}
+
+func (s *PostgresMetadataStore) GetVolume(ctx context.Context, volumeID string) (*VolumeRecord, error) {
+	var raw []byte
+	var owner string
+	err := s.pool.QueryRow(ctx, `SELECT tenant_id, payload_json FROM kt_volumes WHERE volume_id=$1`, volumeID).Scan(&owner, &raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var volume VolumeRecord
+	if err := json.Unmarshal(raw, &volume); err != nil {
+		return nil, err
+	}
+	volume.TenantID = owner
+	return &volume, nil
+}
+
+func (s *PostgresMetadataStore) ListVolumes(ctx context.Context) ([]VolumeRecord, error) {
+	rows, err := s.pool.Query(ctx, `SELECT tenant_id, payload_json FROM kt_volumes ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []VolumeRecord
+	for rows.Next() {
+		var raw []byte
+		var owner string
+		if err := rows.Scan(&owner, &raw); err != nil {
+			return nil, err
+		}
+		var volume VolumeRecord
+		if err := json.Unmarshal(raw, &volume); err != nil {
+			return nil, err
+		}
+		volume.TenantID = owner
+		out = append(out, volume)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresMetadataStore) DeleteVolume(ctx context.Context, volumeID string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM kt_volumes WHERE volume_id=$1`, volumeID)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return err
+}
+
+func (s *PostgresMetadataStore) CreateWebhook(ctx context.Context, webhook *WebhookRecord) error {
+	now := time.Now().UTC()
+	if webhook.CreatedAt.IsZero() {
+		webhook.CreatedAt = now
+	}
+	webhook.UpdatedAt = now
+	events, err := json.Marshal(webhook.Events)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `INSERT INTO kt_webhooks (webhook_id, tenant_id, url, events_json, secret, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7)`, webhook.WebhookID, webhook.TenantID, webhook.URL, events, webhook.Secret, webhook.CreatedAt, webhook.UpdatedAt)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return ErrTransitionLocked
+	}
+	return err
+}
+
+func (s *PostgresMetadataStore) GetWebhook(ctx context.Context, webhookID string) (*WebhookRecord, error) {
+	var webhook WebhookRecord
+	var events []byte
+	err := s.pool.QueryRow(ctx, `SELECT webhook_id, tenant_id, url, events_json, secret, created_at, updated_at FROM kt_webhooks WHERE webhook_id=$1`, webhookID).Scan(&webhook.WebhookID, &webhook.TenantID, &webhook.URL, &events, &webhook.Secret, &webhook.CreatedAt, &webhook.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(events, &webhook.Events); err != nil {
+		return nil, err
+	}
+	return &webhook, nil
+}
+
+func (s *PostgresMetadataStore) ListWebhooks(ctx context.Context) ([]WebhookRecord, error) {
+	rows, err := s.pool.Query(ctx, `SELECT webhook_id, tenant_id, url, events_json, secret, created_at, updated_at FROM kt_webhooks ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WebhookRecord
+	for rows.Next() {
+		var webhook WebhookRecord
+		var events []byte
+		if err := rows.Scan(&webhook.WebhookID, &webhook.TenantID, &webhook.URL, &events, &webhook.Secret, &webhook.CreatedAt, &webhook.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(events, &webhook.Events); err != nil {
+			return nil, err
+		}
+		out = append(out, webhook)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresMetadataStore) DeleteWebhook(ctx context.Context, webhookID string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM kt_webhooks WHERE webhook_id=$1`, webhookID)
+	if err == nil && tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
 	return err
 }

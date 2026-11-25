@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path/filepath"
+	"slices"
+	"strings"
 
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
@@ -15,41 +18,85 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+type forkChildResult struct {
+	ChildID string
+	Sandbox *store.SandboxRecord
+	Err     error
+}
+
 // ForkSandbox persists the capture and branch identities before contacting a node.
 func (s *Server) ForkSandbox(ctx context.Context, sourceID string, req ForkSandboxRequest) (_ []*store.SandboxRecord, retErr error) {
-	if req.Count <= 0 {
-		req.Count = 1
-	}
-	ctx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "apiserver.fork_sandbox", attribute.String(telemetry.AttrSandboxID, sourceID), attribute.Int("fork.count", req.Count))
-	defer func() { telemetry.EndSpan(span, retErr) }()
-	receipt, err := s.prepareFork(ctx, sourceID, &req, "")
+	results, err := s.ForkSandboxWithResults(ctx, sourceID, req)
 	if err != nil {
 		return nil, err
 	}
-	results := make([]*store.SandboxRecord, len(receipt.ChildIDs))
+	children := make([]*store.SandboxRecord, 0, len(results))
+	for _, result := range results {
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		children = append(children, result.Sandbox)
+	}
+	return children, nil
+}
+
+func (s *Server) ForkSandboxWithResults(ctx context.Context, sourceID string, req ForkSandboxRequest) ([]forkChildResult, error) {
+	if len(req.Children) > 0 {
+		if req.Count > 0 && req.Count != len(req.Children) {
+			return nil, fmt.Errorf("fork count must match children length")
+		}
+		req.Count = len(req.Children)
+	} else if req.Count <= 0 {
+		req.Count = 1
+	}
+	for _, child := range req.Children {
+		if err := validateForkChildConfig(sourceID, child); err != nil {
+			return nil, err
+		}
+	}
+	ctx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "apiserver.fork_sandbox", attribute.String(telemetry.AttrSandboxID, sourceID), attribute.Int("fork.count", req.Count))
+	var retErr error
+	defer func() { telemetry.EndSpan(span, retErr) }()
+	receipt, err := s.prepareFork(ctx, sourceID, &req, "")
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+	results := make([]forkChildResult, len(receipt.ChildIDs))
 	var workers errgroup.Group
 	for i, id := range receipt.ChildIDs {
+		i, id := i, id
 		workers.Go(func() error {
+			result := forkChildResult{ChildID: id}
 			lock, err := s.lockActivation(ctx, id)
 			if err != nil {
-				return err
+				result.Err = err
+				results[i] = result
+				return nil
 			}
 			defer lock.close()
 			child, err := s.sandbox(ctx, id)
 			if err != nil {
-				return err
+				result.Err = err
+				results[i] = result
+				return nil
 			}
 			// The caller might retry after a branch was deleted and its name reused.
 			if child.ForkOperationID != receipt.OperationID {
-				return store.ErrStaleExecutionFence
+				result.Err = store.ErrStaleExecutionFence
+				results[i] = result
+				return nil
 			}
 			if child.State == store.SandboxStateCreating {
 				child, err = s.advanceActivation(ctx, child, lock)
 				if err != nil {
-					return err
+					result.Err = err
+					results[i] = result
+					return nil
 				}
 			}
-			results[i] = child
+			result.Sandbox = child
+			results[i] = result
 			return nil
 		})
 	}
@@ -110,9 +157,21 @@ func (s *Server) prepareFork(ctx context.Context, sourceID string, req *ForkSand
 			default:
 				return nil, store.ErrTransitionLocked
 			}
-			fork = &store.PendingFork{ForkReceipt: store.ForkReceipt{OperationID: randHex(12), RequestHash: digest}, RequestKey: key, SnapshotID: snapshotID, EnvVars: req.EnvVars}
+			fork = &store.PendingFork{ForkReceipt: store.ForkReceipt{OperationID: randHex(12), RequestHash: digest}, RequestKey: key, SnapshotID: snapshotID, EnvVars: req.EnvVars, Children: append([]store.ForkChildConfig(nil), req.Children...)}
 			for i := 0; i < req.Count; i++ {
-				fork.ChildIDs = append(fork.ChildIDs, fmt.Sprintf("%s-fork-%d-%s", sourceID, i+1, randHex(8)))
+				childID := ""
+				if i < len(req.Children) {
+					childID = req.Children[i].SandboxID
+				}
+				if childID == "" {
+					childID = fmt.Sprintf("%s-fork-%d-%s", sourceID, i+1, randHex(8))
+				}
+				for _, existing := range fork.ChildIDs {
+					if existing == childID {
+						return nil, fmt.Errorf("duplicate fork child sandbox id %q", childID)
+					}
+				}
+				fork.ChildIDs = append(fork.ChildIDs, childID)
 			}
 			src.PendingFork = fork
 			if err := s.cfg.Meta.SaveSandbox(ctx, src); err != nil {
@@ -133,21 +192,74 @@ func (s *Server) prepareFork(ctx context.Context, sourceID string, req *ForkSand
 	} else if err != nil {
 		return nil, err
 	}
-	env := make(map[string]string, len(src.EnvVars)+len(fork.EnvVars))
-	maps.Copy(env, src.EnvVars)
-	maps.Copy(env, fork.EnvVars)
 	children := make([]*store.SandboxRecord, 0, len(fork.ChildIDs))
-	for _, id := range fork.ChildIDs {
+	for i, id := range fork.ChildIDs {
+		var config store.ForkChildConfig
+		if i < len(fork.Children) {
+			config = fork.Children[i]
+		}
+		env := make(map[string]string, len(src.EnvVars)+len(fork.EnvVars)+len(config.EnvVars))
+		maps.Copy(env, src.EnvVars)
+		maps.Copy(env, fork.EnvVars)
+		maps.Copy(env, config.EnvVars)
+		metadata := maps.Clone(src.Metadata)
+		if metadata == nil && len(config.Metadata) > 0 {
+			metadata = make(map[string]string, len(config.Metadata))
+		}
+		maps.Copy(metadata, config.Metadata)
+		idleTimeout := src.IdleTimeoutSeconds
+		if config.IdleTimeoutSeconds != nil {
+			idleTimeout = *config.IdleTimeoutSeconds
+		}
+		cpuMillis := src.CPUMillis
+		if config.CPUMillis != nil {
+			cpuMillis = *config.CPUMillis
+		}
+		memoryBytes := src.MemoryBytes
+		if config.MemoryBytes != nil {
+			memoryBytes = *config.MemoryBytes
+		}
+		volumes := slices.Clone(src.Volumes)
+		if config.Volumes != nil {
+			volumes = slices.Clone(config.Volumes)
+		}
 		children = append(children, &store.SandboxRecord{
 			TenantID: src.TenantID, SandboxID: id, ForkOperationID: fork.OperationID, TemplateID: src.TemplateID, BaseImage: src.BaseImage, Tier: src.Tier,
 			State: store.SandboxStateCreating, ExecutionID: src.ExecutionID + 1, LifecycleID: "life-" + randHex(6),
 			OriginNodeID: snapshot.OriginNodeID, ActiveSnapshotID: snapshot.SnapshotID, BootstrapToken: snapshot.BootstrapToken,
-			AccessToken: "kt_fork_" + randHex(16), EnvVars: env, CPUMillis: src.CPUMillis, MemoryBytes: src.MemoryBytes,
-			IdleTimeoutSeconds: src.IdleTimeoutSeconds, AllowFilesystemOnlyFallback: src.AllowFilesystemOnlyFallback,
+			AccessToken: "kt_fork_" + randHex(16), EnvVars: env, CPUMillis: cpuMillis, MemoryBytes: memoryBytes,
+			IdleTimeoutSeconds: idleTimeout, AllowFilesystemOnlyFallback: src.AllowFilesystemOnlyFallback,
+			Metadata: metadata,
+			Volumes:  volumes,
 		})
 	}
 	if err := s.cfg.Meta.CommitFork(ctx, src, children); err != nil {
 		return nil, err
 	}
 	return &fork.ForkReceipt, nil
+}
+
+func validateForkChildConfig(sourceID string, child store.ForkChildConfig) error {
+	if child.SandboxID != "" && !validForkSandboxID(child.SandboxID, sourceID) {
+		return fmt.Errorf("invalid fork child sandbox id %q", child.SandboxID)
+	}
+	if child.IdleTimeoutSeconds != nil && *child.IdleTimeoutSeconds < 0 {
+		return fmt.Errorf("fork child idle timeout cannot be negative")
+	}
+	if child.CPUMillis != nil && *child.CPUMillis < 0 {
+		return fmt.Errorf("fork child cpu millis cannot be negative")
+	}
+	if child.MemoryBytes != nil && *child.MemoryBytes < 0 {
+		return fmt.Errorf("fork child memory bytes cannot be negative")
+	}
+	for _, volume := range child.Volumes {
+		if volume.VolumeID == "" || filepath.Base(volume.VolumeID) != volume.VolumeID || volume.MountPath == "" || !filepath.IsAbs(volume.MountPath) {
+			return fmt.Errorf("fork child volume mounts require a volumeId and absolute mountPath")
+		}
+	}
+	return nil
+}
+
+func validForkSandboxID(id, sourceID string) bool {
+	return id != sourceID && len(id) <= 128 && strings.TrimSpace(id) == id && id != "." && id != ".." && !strings.ContainsAny(id, "/\\")
 }

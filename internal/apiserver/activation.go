@@ -140,7 +140,7 @@ func (s *Server) advanceActivation(ctx context.Context, sb *store.SandboxRecord,
 	}
 	req := &protocol.HydrateSlotRequest{Slot: p.Slot, SandboxID: sb.SandboxID, ExecutionID: sb.ExecutionID, LifecycleID: sb.LifecycleID,
 		TemplateID: sb.TemplateID, SnapshotID: sb.ActiveSnapshotID, RestoreMode: p.RestoreMode,
-		BaseImage: sb.BaseImage, BootstrapToken: sb.BootstrapToken, AccessToken: sb.AccessToken, EnvVars: sb.EnvVars, CPUMillis: sb.CPUMillis, MemoryBytes: sb.MemoryBytes, DeferRoutePublication: true}
+		BaseImage: sb.BaseImage, BootstrapToken: sb.BootstrapToken, AccessToken: sb.AccessToken, EnvVars: sb.EnvVars, Volumes: sb.Volumes, CPUMillis: sb.CPUMillis, MemoryBytes: sb.MemoryBytes, DeferRoutePublication: true}
 	result, err := node.HydrateSlot(ctx, req)
 	if err != nil {
 		if status.Code(err) == codes.FailedPrecondition {

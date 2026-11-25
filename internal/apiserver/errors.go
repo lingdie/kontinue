@@ -48,6 +48,8 @@ func writeLifecycleError(w http.ResponseWriter, r *http.Request, err error) {
 		problem = invalidSandboxCredential
 	case errors.Is(err, store.ErrSandboxExists):
 		problem = sandboxAlreadyExists
+	case errors.Is(err, store.ErrVolumeExists):
+		problem = lifecycleProblem{http.StatusConflict, publicError{"volume_exists", "volume ID is already in use"}}
 	case errors.Is(err, store.ErrTransitionLocked):
 		problem = transitionInProgress
 	case errors.Is(err, store.ErrStaleExecutionFence):

@@ -98,8 +98,20 @@ func (s *Server) template(ctx context.Context, id string) (*store.TemplateRecord
 	return t, err
 }
 
+func (s *Server) volume(ctx context.Context, id string) (*store.VolumeRecord, error) {
+	volume, err := s.cfg.Meta.GetVolume(ctx, id)
+	if err == nil && !visible(ctx, volume.TenantID) {
+		return nil, errOtherTenant
+	}
+	return volume, err
+}
+
 func (s *Server) tenantHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isSignedFileRequest(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		tenant := localTenant
 		if s.cfg.TenantKeys != nil {
 			header := r.Header.Get("Authorization")
@@ -114,6 +126,14 @@ func (s *Server) tenantHandler(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, principal{tenant: tenant})))
 	})
+}
+
+func isSignedFileRequest(r *http.Request) bool {
+	if r.URL.Query().Get("signature") == "" || (r.Method != http.MethodGet && r.Method != http.MethodPut) {
+		return false
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/sandboxes/"), "/"), "/")
+	return len(parts) == 2 && parts[1] == "files"
 }
 
 // The gateway can wake or verify only the sandbox whose access credential it presents.

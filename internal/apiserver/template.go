@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/kontinue-sh/kontinue/internal/store"
 	"github.com/kontinue-sh/kontinue/pkg/protocol"
@@ -26,12 +27,82 @@ func (s *Server) BuildGoldenTemplate(ctx context.Context, req CreateTemplateRequ
 		return nil, err
 	}
 	defer unlock()
-	t := &store.TemplateRecord{TenantID: tenantID(ctx), TemplateID: req.TemplateID, Name: req.Name, BaseImage: req.BaseImage, Tier: req.Tier, WarmupScript: req.WarmupScript, PinInL1Tmpfs: req.PinInL1Tmpfs, TraceHotPages: req.TraceHotPages, Phase: "Allocating",
-		Build: &store.TemplateBuild{SnapshotID: "snap-golden-" + randHex(12), LifecycleID: "life-" + randHex(12), AccessToken: "warmup-" + randHex(16), BootstrapToken: "boot-" + randHex(16)}}
+	now := time.Now().UTC()
+	t := &store.TemplateRecord{TenantID: tenantID(ctx), TemplateID: req.TemplateID, Name: req.Name, BaseImage: req.BaseImage, Tier: req.Tier, Version: 1, WarmupScript: req.WarmupScript, PinInL1Tmpfs: req.PinInL1Tmpfs, TraceHotPages: req.TraceHotPages, Phase: "Allocating", BuildLogs: []string{"build requested"},
+		Build: &store.TemplateBuild{SnapshotID: "snap-golden-" + randHex(12), LifecycleID: "life-" + randHex(12), AccessToken: "warmup-" + randHex(16), BootstrapToken: "boot-" + randHex(16), StartedAt: now}}
 	if err := s.cfg.Meta.CreateTemplate(ctx, t); err != nil {
 		return nil, err
 	}
 	return s.advanceTemplateBuild(ctx, t)
+}
+
+func (s *Server) RebuildGoldenTemplate(ctx context.Context, templateID string, req CreateTemplateRequest) (_ *store.TemplateRecord, retErr error) {
+	ctx, span := telemetry.StartSpan(ctx, "kontinue-apiserver", "apiserver.rebuild_golden_template", attribute.String("template.id", templateID))
+	defer func() { telemetry.EndSpan(span, retErr) }()
+	unlock, err := s.lockTemplate(ctx, templateID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	t, err := s.template(ctx, templateID)
+	if err != nil {
+		return nil, err
+	}
+	if t.Build != nil || t.Phase == "Allocating" || t.Phase == "Starting" || t.Phase == "WarmingUp" || t.Phase == store.TemplateCapturing || t.Phase == "Releasing" {
+		return nil, store.ErrTransitionLocked
+	}
+	if req.Name != "" {
+		t.Name = req.Name
+	}
+	if req.BaseImage != "" {
+		t.BaseImage = req.BaseImage
+	}
+	if req.WarmupScript != "" {
+		t.WarmupScript = req.WarmupScript
+	}
+	if req.Tier != "" {
+		t.Tier = req.Tier
+	}
+	t.PinInL1Tmpfs = req.PinInL1Tmpfs
+	t.TraceHotPages = req.TraceHotPages
+	if t.Version == 0 {
+		t.Version = 1
+	}
+	t.Version++
+	t.Phase = "Allocating"
+	t.StatusMessage = ""
+	t.BuildLogs = []string{fmt.Sprintf("build %d requested", t.Version)}
+	t.Build = &store.TemplateBuild{SnapshotID: "snap-golden-" + randHex(12), LifecycleID: "life-" + randHex(12), AccessToken: "warmup-" + randHex(16), BootstrapToken: "boot-" + randHex(16), StartedAt: time.Now().UTC()}
+	if err := s.cfg.Meta.UpdateTemplate(ctx, t); err != nil {
+		return nil, err
+	}
+	return s.advanceTemplateBuild(ctx, t)
+}
+
+func appendTemplateLog(t *store.TemplateRecord, message string) {
+	if message == "" {
+		return
+	}
+	t.BuildLogs = append(t.BuildLogs, message)
+	if len(t.BuildLogs) > 100 {
+		t.BuildLogs = t.BuildLogs[len(t.BuildLogs)-100:]
+	}
+}
+
+func recordTemplateBuild(t *store.TemplateRecord, failed bool) {
+	if t.Build == nil {
+		return
+	}
+	completed := time.Now().UTC()
+	phase := "Ready"
+	if failed {
+		phase = "Failed"
+	}
+	record := store.TemplateBuildRecord{Version: t.Version, SnapshotID: t.Build.SnapshotID, Phase: phase, StatusMessage: t.StatusMessage, Logs: append([]string(nil), t.BuildLogs...), CreatedAt: t.Build.StartedAt, CompletedAt: completed}
+	t.History = append(t.History, record)
+	if len(t.History) > 50 {
+		t.History = t.History[len(t.History)-50:]
+	}
 }
 
 func (s *Server) lockTemplate(ctx context.Context, id string) (func(), error) {
@@ -79,6 +150,7 @@ func (s *Server) advanceTemplateBuild(ctx context.Context, t *store.TemplateReco
 			b.Slot.NodeID, b.Slot.NodeIP, b.Slot.NodeGRPCAddr = dec.Node.NodeID, dec.Node.NodeIP, dec.Node.GRPCAddr
 			b.PeerAddr = dec.Node.P2PAddr
 			t.Phase = "Starting"
+			appendTemplateLog(t, "carrier allocated")
 		case "Starting":
 			if err := s.cfg.Catalog.FinishReservation(ctx, b.LifecycleID, false); err != nil {
 				return nil, err
@@ -92,33 +164,42 @@ func (s *Server) advanceTemplateBuild(ctx context.Context, t *store.TemplateReco
 				return nil, err
 			}
 			b.GuestEndpoint = res.PodIP
+			appendTemplateLog(t, "carrier started")
 			// A warmup is arbitrary user code. Record the attempt before invoking
 			// it so the reconciler never repeats ambiguous external side effects.
 			if t.WarmupScript != "" {
 				t.Phase = "WarmingUp"
+				appendTemplateLog(t, "warmup started")
 				if err := s.cfg.Meta.SaveTemplateBuild(ctx, t); err != nil {
 					return nil, err
 				}
 				out, err := s.ktdClient.Exec(ctx, b.GuestEndpoint, b.AccessToken, protocol.ExecRequest{Command: []string{"/bin/sh", "-c", t.WarmupScript}, TimeoutMs: 120000})
 				if err != nil || out.ExitCode != 0 {
+					b.Failed = true
 					t.StatusMessage = "warmup command failed"
 					if out != nil {
 						t.StatusMessage = fmt.Sprintf("warmup command exited with status %d", out.ExitCode)
 					}
 					t.Phase = "Releasing"
+					appendTemplateLog(t, "warmup failed")
 					break
 				}
+				appendTemplateLog(t, "warmup completed")
 			}
 			t.Phase = store.TemplateCapturing
+			appendTemplateLog(t, "capturing snapshot")
 		case "WarmingUp":
+			b.Failed = true
 			t.StatusMessage = "warmup was interrupted before its outcome was recorded"
 			t.Phase = "Releasing"
+			appendTemplateLog(t, "warmup interrupted")
 		case store.TemplateCapturing:
 			if err := s.captureTemplate(ctx, t); err != nil {
 				return nil, err
 			}
 			t.GoldenSnapshotID = b.SnapshotID
 			t.Phase = "Releasing"
+			appendTemplateLog(t, "snapshot captured")
 		case "Releasing":
 			nc, err := s.nodeClient(ctx, b.Slot.NodeGRPCAddr)
 			if err != nil {
@@ -136,8 +217,11 @@ func (s *Server) advanceTemplateBuild(ctx context.Context, t *store.TemplateReco
 					return nil, err
 				}
 			}
+			appendTemplateLog(t, "carrier released")
+			failed := b.Failed
+			recordTemplateBuild(t, failed)
 			t.Build = nil
-			if t.GoldenSnapshotID == "" {
+			if failed || t.GoldenSnapshotID == "" {
 				t.Phase = "Failed"
 			} else {
 				if t.PinInL1Tmpfs {

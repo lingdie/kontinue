@@ -94,10 +94,15 @@ func (p *PlacementEngine) selectAndClaimSlot(ctx context.Context, req PlacementR
 
 	var candidates []scoredNode
 	for _, n := range nodes {
-		if req.RequiredFingerprint != nil && req.SnapshotID != "" {
-			if !req.RequiredFingerprint.CompatibleWith(n.Fingerprint) {
+		mode := protocol.RestoreModeMemory
+		if req.SnapshotID == "" {
+			mode = protocol.RestoreModeCold
+		}
+		if req.RequiredFingerprint != nil && req.SnapshotID != "" && !req.RequiredFingerprint.CompatibleWith(n.Fingerprint) {
+			if !req.AllowFilesystemOnlyFallback {
 				continue
 			}
+			mode = protocol.RestoreModeFilesystemOnly
 		}
 		// Add small jitter (0..1.0) so equal-score nodes balance burst traffic evenly instead ofherd-piling node 0!
 		score := memoryHeadroomScore(n) + rand.Float64()
@@ -109,10 +114,6 @@ func (p *PlacementEngine) selectAndClaimSlot(ctx context.Context, req PlacementR
 		}
 		if req.SnapshotID != "" && slices.Contains(n.L1Snapshots, req.SnapshotID) {
 			score += 500.0
-		}
-		mode := protocol.RestoreModeMemory
-		if req.SnapshotID == "" {
-			mode = protocol.RestoreModeCold
 		}
 		candidates = append(candidates, scoredNode{hb: n, score: score, mode: mode})
 	}

@@ -103,7 +103,7 @@ func main() {
 	}
 	kubelet := apiserver.NewHTTPSKubeletClient(os.Getenv("KUBELET_BEARER_TOKEN"), *kubeletInsec)
 	srv := apiserver.NewServer(apiserver.ServerConfig{
-		TraceToken: os.Getenv("KONTINUE_TRACE_TOKEN"), TenantKeys: keys, Meta: metaStore,
+		TraceToken: os.Getenv("KONTINUE_TRACE_TOKEN"), TenantKeys: keys, FileURLSecret: os.Getenv("KONTINUE_FILE_URL_SECRET"), Meta: metaStore,
 		Catalog:     catalog,
 		Replenisher: replenisher,
 		Kubelet:     kubelet,

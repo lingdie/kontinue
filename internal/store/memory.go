@@ -4,6 +4,7 @@ import (
 	"context"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,8 @@ type MemoryMetadataStore struct {
 	templates     map[string]TemplateRecord
 	snapshots     map[string]SnapshotRecord
 	sandboxes     map[string]SandboxRecord
+	volumes       map[string]VolumeRecord
+	webhooks      map[string]WebhookRecord
 	forkReceipts  map[[2]string]ForkReceipt
 	leaders       map[string]bool
 }
@@ -34,6 +37,8 @@ func NewMemoryMetadataStore() *MemoryMetadataStore {
 		templates:     make(map[string]TemplateRecord),
 		snapshots:     make(map[string]SnapshotRecord),
 		sandboxes:     make(map[string]SandboxRecord),
+		volumes:       make(map[string]VolumeRecord),
+		webhooks:      make(map[string]WebhookRecord),
 		forkReceipts:  make(map[[2]string]ForkReceipt),
 		leaders:       make(map[string]bool),
 	}
@@ -62,6 +67,9 @@ func (m *MemoryMetadataStore) CreateTemplate(_ context.Context, tpl *TemplateRec
 	if tpl.CreatedAt.IsZero() {
 		tpl.CreatedAt = now
 	}
+	if tpl.Version == 0 {
+		tpl.Version = 1
+	}
 	tpl.UpdatedAt = now
 	if _, ok := m.templates[tpl.TemplateID]; ok {
 		return ErrTransitionLocked
@@ -86,6 +94,12 @@ func cloneTemplate(t TemplateRecord) TemplateRecord {
 		b := *t.Build
 		t.Build = &b
 	}
+	t.Tags = maps.Clone(t.Tags)
+	t.History = slices.Clone(t.History)
+	for i := range t.History {
+		t.History[i].Logs = slices.Clone(t.History[i].Logs)
+	}
+	t.BuildLogs = slices.Clone(t.BuildLogs)
 	return t
 }
 
@@ -97,6 +111,27 @@ func (m *MemoryMetadataStore) SaveTemplateBuild(_ context.Context, tpl *Template
 	}
 	tpl.UpdatedAt = time.Now().UTC()
 	m.templates[tpl.TemplateID] = cloneTemplate(*tpl)
+	return nil
+}
+
+func (m *MemoryMetadataStore) UpdateTemplate(_ context.Context, tpl *TemplateRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.templates[tpl.TemplateID]; !ok {
+		return ErrNotFound
+	}
+	tpl.UpdatedAt = time.Now().UTC()
+	m.templates[tpl.TemplateID] = cloneTemplate(*tpl)
+	return nil
+}
+
+func (m *MemoryMetadataStore) DeleteTemplate(_ context.Context, templateID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.templates[templateID]; !ok {
+		return ErrNotFound
+	}
+	delete(m.templates, templateID)
 	return nil
 }
 
@@ -279,6 +314,25 @@ func (m *MemoryMetadataStore) GetSandbox(_ context.Context, sandboxID string) (*
 	return &cp, nil
 }
 
+func (m *MemoryMetadataStore) ListSandboxes(_ context.Context) ([]SandboxRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]SandboxRecord, 0, len(m.sandboxes))
+	for _, sandbox := range m.sandboxes {
+		out = append(out, cloneSandbox(sandbox))
+	}
+	slices.SortFunc(out, func(a, b SandboxRecord) int {
+		if a.CreatedAt.After(b.CreatedAt) {
+			return -1
+		}
+		if a.CreatedAt.Before(b.CreatedAt) {
+			return 1
+		}
+		return strings.Compare(a.SandboxID, b.SandboxID)
+	})
+	return out, nil
+}
+
 func (m *MemoryMetadataStore) SaveSandbox(_ context.Context, sbx *SandboxRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -358,6 +412,61 @@ func (m *MemoryMetadataStore) DeleteSandbox(_ context.Context, sandboxID string)
 	return nil
 }
 
+func (m *MemoryMetadataStore) CreateVolume(_ context.Context, volume *VolumeRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.volumes[volume.VolumeID]; exists {
+		return ErrVolumeExists
+	}
+	now := time.Now().UTC()
+	if volume.CreatedAt.IsZero() {
+		volume.CreatedAt = now
+	}
+	volume.UpdatedAt = now
+	m.volumes[volume.VolumeID] = cloneVolume(*volume)
+	return nil
+}
+
+func (m *MemoryMetadataStore) GetVolume(_ context.Context, volumeID string) (*VolumeRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	volume, ok := m.volumes[volumeID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := cloneVolume(volume)
+	return &cp, nil
+}
+
+func (m *MemoryMetadataStore) ListVolumes(_ context.Context) ([]VolumeRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]VolumeRecord, 0, len(m.volumes))
+	for _, volume := range m.volumes {
+		out = append(out, cloneVolume(volume))
+	}
+	slices.SortFunc(out, func(a, b VolumeRecord) int {
+		if a.CreatedAt.After(b.CreatedAt) {
+			return -1
+		}
+		if a.CreatedAt.Before(b.CreatedAt) {
+			return 1
+		}
+		return strings.Compare(a.VolumeID, b.VolumeID)
+	})
+	return out, nil
+}
+
+func (m *MemoryMetadataStore) DeleteVolume(_ context.Context, volumeID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.volumes[volumeID]; !exists {
+		return ErrNotFound
+	}
+	delete(m.volumes, volumeID)
+	return nil
+}
+
 func cloneSandbox(in SandboxRecord) SandboxRecord {
 	if in.RestoreViewCopiedBytes != nil {
 		size := *in.RestoreViewCopiedBytes
@@ -367,6 +476,7 @@ func cloneSandbox(in SandboxRecord) SandboxRecord {
 		f := *in.PendingFork
 		f.ChildIDs = slices.Clone(f.ChildIDs)
 		f.EnvVars = maps.Clone(f.EnvVars)
+		f.Children = cloneForkChildren(f.Children)
 		in.PendingFork = &f
 	}
 	if in.PendingPlacement != nil {
@@ -380,7 +490,98 @@ func cloneSandbox(in SandboxRecord) SandboxRecord {
 		}
 		in.EnvVars = cp
 	}
+	if in.Metadata != nil {
+		in.Metadata = maps.Clone(in.Metadata)
+	}
+	if in.Volumes != nil {
+		in.Volumes = slices.Clone(in.Volumes)
+	}
 	return in
+}
+
+func cloneForkChildren(children []ForkChildConfig) []ForkChildConfig {
+	if children == nil {
+		return nil
+	}
+	out := make([]ForkChildConfig, len(children))
+	for i, child := range children {
+		out[i] = child
+		out[i].EnvVars = maps.Clone(child.EnvVars)
+		out[i].Metadata = maps.Clone(child.Metadata)
+		out[i].Volumes = slices.Clone(child.Volumes)
+		if child.IdleTimeoutSeconds != nil {
+			value := *child.IdleTimeoutSeconds
+			out[i].IdleTimeoutSeconds = &value
+		}
+		if child.CPUMillis != nil {
+			value := *child.CPUMillis
+			out[i].CPUMillis = &value
+		}
+		if child.MemoryBytes != nil {
+			value := *child.MemoryBytes
+			out[i].MemoryBytes = &value
+		}
+	}
+	return out
+}
+
+func cloneVolume(in VolumeRecord) VolumeRecord {
+	in.Metadata = maps.Clone(in.Metadata)
+	return in
+}
+
+func cloneWebhook(in WebhookRecord) WebhookRecord {
+	in.Events = slices.Clone(in.Events)
+	return in
+}
+
+func (m *MemoryMetadataStore) CreateWebhook(_ context.Context, webhook *WebhookRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.webhooks[webhook.WebhookID]; exists {
+		return ErrTransitionLocked
+	}
+	now := time.Now().UTC()
+	if webhook.CreatedAt.IsZero() {
+		webhook.CreatedAt = now
+	}
+	webhook.UpdatedAt = now
+	m.webhooks[webhook.WebhookID] = cloneWebhook(*webhook)
+	return nil
+}
+
+func (m *MemoryMetadataStore) GetWebhook(_ context.Context, webhookID string) (*WebhookRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	webhook, ok := m.webhooks[webhookID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := cloneWebhook(webhook)
+	return &cp, nil
+}
+
+func (m *MemoryMetadataStore) ListWebhooks(_ context.Context) ([]WebhookRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]WebhookRecord, 0, len(m.webhooks))
+	for _, webhook := range m.webhooks {
+		out = append(out, cloneWebhook(webhook))
+	}
+	slices.SortFunc(out, func(a, b WebhookRecord) int {
+		return strings.Compare(a.WebhookID, b.WebhookID)
+	})
+	return out, nil
+}
+
+func (m *MemoryMetadataStore) DeleteWebhook(_ context.Context, webhookID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.webhooks[webhookID]; !exists {
+		return ErrNotFound
+	}
+	delete(m.webhooks, webhookID)
+	return nil
 }
 
 // MemoryRuntimeCatalog implements RuntimeCatalog with identical atomic fencing semantics to Redis Lua scripts.

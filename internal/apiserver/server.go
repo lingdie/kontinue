@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,16 +31,17 @@ import (
 )
 
 type ServerConfig struct {
-	TraceToken  string
-	TenantKeys  TenantKeys
-	Meta        store.MetadataStore
-	Catalog     store.RuntimeCatalog
-	Placement   *PlacementEngine
-	Replenisher *CarrierPoolReplenisher
-	Kubelet     KubeletCheckpointer
-	Recorder    *telemetry.FlightRecorder
-	SandboxDom  string
-	ReuseSlots  bool
+	TraceToken    string
+	TenantKeys    TenantKeys
+	FileURLSecret string
+	Meta          store.MetadataStore
+	Catalog       store.RuntimeCatalog
+	Placement     *PlacementEngine
+	Replenisher   *CarrierPoolReplenisher
+	Kubelet       KubeletCheckpointer
+	Recorder      *telemetry.FlightRecorder
+	SandboxDom    string
+	ReuseSlots    bool
 	// CAS enables physical orphan chunk / artifact deletion during snapshot GC sweeps.
 	CAS interface {
 		GetManifest(ctx context.Context, snapshotID string) (*protocol.SnapshotManifest, error)
@@ -48,11 +51,13 @@ type ServerConfig struct {
 
 // Server implements kontinue-apiserver's synchronous REST lifecycle API, idle evictor, and snapshot GC.
 type Server struct {
-	cfg        ServerConfig
-	ktdClient  *protocol.KtdClient
-	mux        *http.ServeMux
-	nodeConnMu sync.Mutex
-	nodeConns  map[string]*grpc.ClientConn
+	cfg           ServerConfig
+	ktdClient     *protocol.KtdClient
+	mux           *http.ServeMux
+	nodeConnMu    sync.Mutex
+	nodeConns     map[string]*grpc.ClientConn
+	fileURLKey    []byte
+	webhookClient *http.Client
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -66,11 +71,17 @@ func NewServer(cfg ServerConfig) *Server {
 		}
 		cfg.Placement = NewPlacementEngine(cfg.Catalog, cold)
 	}
+	fileURLKey := []byte(cfg.FileURLSecret)
+	if len(fileURLKey) == 0 {
+		fileURLKey = []byte(randHex(32))
+	}
 	s := &Server{
-		cfg:       cfg,
-		ktdClient: protocol.NewKtdClient(30 * time.Second),
-		mux:       http.NewServeMux(),
-		nodeConns: make(map[string]*grpc.ClientConn),
+		cfg:           cfg,
+		ktdClient:     protocol.NewKtdClient(30 * time.Second),
+		mux:           http.NewServeMux(),
+		nodeConns:     make(map[string]*grpc.ClientConn),
+		fileURLKey:    fileURLKey,
+		webhookClient: &http.Client{Timeout: 10 * time.Second},
 	}
 	s.registerRoutes()
 	return s
@@ -93,6 +104,8 @@ func (s *Server) registerRoutes() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	s.mux.HandleFunc("/metrics", s.metrics)
+	s.mux.Handle("/v1/dashboard", s.tenantHandler(http.HandlerFunc(s.handleDashboard)))
 	s.mux.HandleFunc("POST /internal/gateway/sandboxes/{id}/{action}", s.gatewayAction)
 	if s.cfg.Recorder != nil && (s.cfg.TraceToken != "" || s.cfg.TenantKeys == nil) {
 		s.mux.HandleFunc(protocol.PathDebugTraces, s.cfg.Recorder.OperatorHandler(s.cfg.TraceToken))
@@ -101,6 +114,12 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("/v1/templates/", s.tenantHandler(http.HandlerFunc(s.handleTemplateByID)))
 	s.mux.Handle("/v1/sandboxes", s.tenantHandler(http.HandlerFunc(s.handleSandboxes)))
 	s.mux.Handle("/v1/sandboxes/", s.tenantHandler(http.HandlerFunc(s.handleSandboxActions)))
+	s.mux.Handle("/v1/snapshots", s.tenantHandler(http.HandlerFunc(s.handleSnapshots)))
+	s.mux.Handle("/v1/snapshots/", s.tenantHandler(http.HandlerFunc(s.handleSnapshotByID)))
+	s.mux.Handle("/v1/volumes", s.tenantHandler(http.HandlerFunc(s.handleVolumes)))
+	s.mux.Handle("/v1/volumes/", s.tenantHandler(http.HandlerFunc(s.handleVolumeByID)))
+	s.mux.Handle("/v1/webhooks", s.tenantHandler(http.HandlerFunc(s.handleWebhooks)))
+	s.mux.Handle("/v1/webhooks/", s.tenantHandler(http.HandlerFunc(s.handleWebhookByID)))
 }
 
 type CreateTemplateRequest struct {
@@ -113,23 +132,46 @@ type CreateTemplateRequest struct {
 	TraceHotPages bool   `json:"traceHotPages"`
 }
 
+type TemplateTagRequest struct {
+	Tag        string `json:"tag"`
+	SnapshotID string `json:"snapshotId,omitempty"`
+}
+
 type CreateSandboxRequest struct {
-	RequestKey                  string            `json:"-"`
-	SandboxID                   string            `json:"sandboxId,omitempty"`
-	TemplateID                  string            `json:"templateId,omitempty"`
-	BaseImage                   string            `json:"baseImage,omitempty"`
-	Tier                        string            `json:"tier,omitempty"`
-	EnvVars                     map[string]string `json:"envVars,omitempty"`
-	IdleTimeoutSeconds          int64             `json:"idleTimeoutSeconds,omitempty"`
-	CPUMillis                   int64             `json:"cpuMillis,omitempty"`
-	MemoryBytes                 int64             `json:"memoryBytes,omitempty"`
-	AllowFilesystemOnlyFallback bool              `json:"allowFilesystemOnlyFallback,omitempty"`
+	RequestKey                  string                 `json:"-"`
+	SandboxID                   string                 `json:"sandboxId,omitempty"`
+	TemplateID                  string                 `json:"templateId,omitempty"`
+	SnapshotID                  string                 `json:"snapshotId,omitempty"`
+	BaseImage                   string                 `json:"baseImage,omitempty"`
+	Tier                        string                 `json:"tier,omitempty"`
+	EnvVars                     map[string]string      `json:"envVars,omitempty"`
+	IdleTimeoutSeconds          int64                  `json:"idleTimeoutSeconds,omitempty"`
+	CPUMillis                   int64                  `json:"cpuMillis,omitempty"`
+	MemoryBytes                 int64                  `json:"memoryBytes,omitempty"`
+	AllowFilesystemOnlyFallback bool                   `json:"allowFilesystemOnlyFallback,omitempty"`
+	Metadata                    map[string]string      `json:"metadata,omitempty"`
+	Volumes                     []protocol.VolumeMount `json:"volumes,omitempty"`
+}
+
+type UpdateSandboxTimeoutRequest struct {
+	IdleTimeoutSeconds int64 `json:"idleTimeoutSeconds"`
+}
+
+type CreateSnapshotRequest struct {
+	SnapshotID string `json:"snapshotId,omitempty"`
+}
+
+type CreateVolumeRequest struct {
+	VolumeID string            `json:"volumeId,omitempty"`
+	Name     string            `json:"name,omitempty"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 type ForkSandboxRequest struct {
-	RequestKey string            `json:"-"`
-	Count      int               `json:"count"`
-	EnvVars    map[string]string `json:"envVars,omitempty"`
+	RequestKey string                  `json:"-"`
+	Count      int                     `json:"count"`
+	EnvVars    map[string]string       `json:"envVars,omitempty"`
+	Children   []store.ForkChildConfig `json:"children,omitempty"`
 }
 
 func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
@@ -158,6 +200,7 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 			writeLifecycleError(w, r, err)
 			return
 		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "template.created", publicTemplate(tpl))
 		writeJSON(w, http.StatusCreated, publicTemplate(tpl))
 	default:
 		writeProblem(w, r, methodNotAllowed, nil)
@@ -165,7 +208,92 @@ func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/v1/templates/")
+	trimmed := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/templates/"), "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) == 2 && parts[1] == "builds" {
+		tpl, err := s.template(r.Context(), parts[0])
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		if r.Method == http.MethodPost {
+			var req CreateTemplateRequest
+			if r.Body != nil && r.ContentLength != 0 {
+				if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+					writeProblem(w, r, invalidJSON, err)
+					return
+				}
+			}
+			rebuilt, err := s.RebuildGoldenTemplate(r.Context(), tpl.TemplateID, req)
+			if err != nil {
+				writeLifecycleError(w, r, err)
+				return
+			}
+			s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "template.build.created", publicTemplate(rebuilt))
+			writeJSON(w, http.StatusCreated, publicTemplate(rebuilt))
+			return
+		}
+		if r.Method == http.MethodGet {
+			out := make([]templateBuildResponse, 0, len(tpl.History))
+			for _, build := range tpl.History {
+				out = append(out, publicTemplateBuild(build))
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		writeProblem(w, r, methodNotAllowed, nil)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet {
+		tpl, err := s.template(r.Context(), parts[0])
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"templateId": tpl.TemplateID, "version": tpl.Version, "phase": tpl.Phase, "statusMessage": tpl.StatusMessage, "logs": append([]string(nil), tpl.BuildLogs...)})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "tags" && r.Method == http.MethodPost {
+		var req TemplateTagRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			writeProblem(w, r, invalidJSON, err)
+			return
+		}
+		tpl, err := s.template(r.Context(), parts[0])
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		if strings.TrimSpace(req.Tag) == "" {
+			writeProblem(w, r, invalidJSON, fmt.Errorf("tag is required"))
+			return
+		}
+		snapshotID := req.SnapshotID
+		if snapshotID == "" {
+			snapshotID = tpl.GoldenSnapshotID
+		}
+		if snapshotID == "" {
+			writeProblem(w, r, transitionInProgress, fmt.Errorf("template has no ready snapshot"))
+			return
+		}
+		snapshot, err := s.cfg.Meta.GetSnapshot(r.Context(), snapshotID)
+		if err != nil || snapshot.TemplateID != tpl.TemplateID || !s.snapshotVisible(r.Context(), snapshot) {
+			writeProblem(w, r, resourceNotFound, store.ErrNotFound)
+			return
+		}
+		if tpl.Tags == nil {
+			tpl.Tags = make(map[string]string)
+		}
+		tpl.Tags[req.Tag] = snapshotID
+		if err := s.cfg.Meta.UpdateTemplate(r.Context(), tpl); err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "template.tag.updated", publicTemplate(tpl))
+		writeJSON(w, http.StatusOK, publicTemplate(tpl))
+		return
+	}
+	id := parts[0]
 	tpl, err := s.template(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeProblem(w, r, templateNotFound, err)
@@ -175,10 +303,215 @@ func (s *Server) handleTemplateByID(w http.ResponseWriter, r *http.Request) {
 		writeLifecycleError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, publicTemplate(tpl))
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, publicTemplate(tpl))
+	case http.MethodDelete:
+		if tpl.Build != nil || tpl.Phase == "Allocating" || tpl.Phase == "Starting" || tpl.Phase == "WarmingUp" || tpl.Phase == store.TemplateCapturing || tpl.Phase == "Releasing" {
+			writeProblem(w, r, transitionInProgress, fmt.Errorf("template build is still active"))
+			return
+		}
+		if err := s.cfg.Meta.DeleteTemplate(r.Context(), id); err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "template.deleted", map[string]string{"templateId": id})
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeProblem(w, r, methodNotAllowed, nil)
+	}
+}
+
+func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		all, err := s.cfg.Meta.ListAllSnapshots(r.Context())
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		out := make([]snapshotResponse, 0, len(all))
+		for i := range all {
+			if s.snapshotVisible(r.Context(), &all[i]) {
+				out = append(out, publicSnapshot(&all[i]))
+			}
+		}
+		writeJSON(w, http.StatusOK, out)
+	default:
+		writeProblem(w, r, methodNotAllowed, nil)
+	}
+}
+
+func (s *Server) handleVolumes(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		volumes, err := s.cfg.Meta.ListVolumes(r.Context())
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		out := make([]store.VolumeRecord, 0, len(volumes))
+		for i := range volumes {
+			if visible(r.Context(), volumes[i].TenantID) {
+				out = append(out, volumes[i])
+			}
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPost:
+		var req CreateVolumeRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			writeProblem(w, r, invalidJSON, err)
+			return
+		}
+		if req.VolumeID == "" {
+			req.VolumeID = "vol-" + randHex(8)
+		}
+		volume := &store.VolumeRecord{TenantID: tenantID(r.Context()), VolumeID: req.VolumeID, Name: req.Name, Metadata: req.Metadata}
+		if err := s.cfg.Meta.CreateVolume(r.Context(), volume); err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "volume.created", volume)
+		writeJSON(w, http.StatusCreated, volume)
+	default:
+		writeProblem(w, r, methodNotAllowed, nil)
+	}
+}
+
+func (s *Server) handleVolumeByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/volumes/")
+	volume, err := s.volume(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeProblem(w, r, resourceNotFound, err)
+		return
+	}
+	if err != nil {
+		writeLifecycleError(w, r, err)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, volume)
+	case http.MethodDelete:
+		sandboxes, err := s.cfg.Meta.ListSandboxes(r.Context())
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		for _, sandbox := range sandboxes {
+			if !visible(r.Context(), sandbox.TenantID) {
+				continue
+			}
+			for _, mount := range sandbox.Volumes {
+				if mount.VolumeID == id && sandbox.State != store.SandboxStateTerminated {
+					writeProblem(w, r, transitionInProgress, fmt.Errorf("volume %s is attached to sandbox %s", id, sandbox.SandboxID))
+					return
+				}
+			}
+		}
+		if err := s.cfg.Meta.DeleteVolume(r.Context(), id); err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "volume.deleted", map[string]string{"volumeId": id})
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeProblem(w, r, methodNotAllowed, nil)
+	}
+}
+
+func (s *Server) handleSnapshotByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/snapshots/")
+	snapshot, err := s.cfg.Meta.GetSnapshot(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeProblem(w, r, resourceNotFound, err)
+		return
+	}
+	if err != nil {
+		writeLifecycleError(w, r, err)
+		return
+	}
+	if !s.snapshotVisible(r.Context(), snapshot) {
+		writeProblem(w, r, resourceNotFound, store.ErrNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, publicSnapshot(snapshot))
+	case http.MethodDelete:
+		if err := s.cfg.Meta.MarkSnapshotSuperseded(r.Context(), id); err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeProblem(w, r, methodNotAllowed, nil)
+	}
+}
+
+func (s *Server) snapshotVisible(ctx context.Context, snapshot *store.SnapshotRecord) bool {
+	if snapshot.TenantID != "" {
+		return visible(ctx, snapshot.TenantID)
+	}
+	if snapshot.SourceSandboxID != "" {
+		sandbox, err := s.cfg.Meta.GetSandbox(ctx, snapshot.SourceSandboxID)
+		return err == nil && visible(ctx, sandbox.TenantID)
+	}
+	if snapshot.TemplateID != "" {
+		template, err := s.cfg.Meta.GetTemplate(ctx, snapshot.TemplateID)
+		return err == nil && visible(ctx, template.TenantID)
+	}
+	return visible(ctx, "")
 }
 
 func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		if r.URL.RawQuery == "" {
+			writeProblem(w, r, methodNotAllowed, nil)
+			return
+		}
+		list, err := s.cfg.Meta.ListSandboxes(r.Context())
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		stateFilter := store.SandboxState(r.URL.Query().Get("state"))
+		templateFilter := r.URL.Query().Get("templateId")
+		limit := 100
+		if value := r.URL.Query().Get("limit"); value != "" {
+			if parsed, parseErr := strconv.Atoi(value); parseErr == nil {
+				limit = parsed
+			}
+		}
+		if limit < 1 {
+			limit = 1
+		}
+		if limit > 1000 {
+			limit = 1000
+		}
+		cursor := r.URL.Query().Get("cursor")
+		items := make([]sandboxResponse, 0, min(limit, len(list)))
+		started := cursor == ""
+		nextCursor := ""
+		for _, sandbox := range list {
+			if !visible(r.Context(), sandbox.TenantID) || (stateFilter != "" && sandbox.State != stateFilter) || (templateFilter != "" && sandbox.TemplateID != templateFilter) {
+				continue
+			}
+			if !started {
+				if sandbox.SandboxID != cursor {
+					continue
+				}
+				started = true
+			}
+			if len(items) == limit {
+				nextCursor = sandbox.SandboxID
+				break
+			}
+			items = append(items, publicSandbox(&sandbox))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"sandboxes": items, "nextCursor": nextCursor})
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeProblem(w, r, methodNotAllowed, nil)
 		return
@@ -194,6 +527,7 @@ func (s *Server) handleSandboxes(w http.ResponseWriter, r *http.Request) {
 		writeLifecycleError(w, r, err)
 		return
 	}
+	s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "sandbox.created", publicSandbox(sbx))
 	writeJSON(w, http.StatusCreated, issueSandbox(sbx))
 }
 
@@ -205,6 +539,61 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sandboxID := parts[0]
+	if len(parts) == 3 && parts[1] == "files" && parts[2] == "urls" && r.Method == http.MethodPost {
+		var req SignedFileURLRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			writeProblem(w, r, invalidJSON, err)
+			return
+		}
+		response, err := s.createSignedFileURL(r.Context(), sandboxID, req)
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, response)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "files" && (r.Method == http.MethodGet || r.Method == http.MethodPut) {
+		s.serveSignedFile(w, r, sandboxID)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "events" && r.Method == http.MethodGet {
+		sbx, err := s.sandbox(r.Context(), sandboxID)
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"events": []map[string]any{{"type": "sandbox." + strings.ToLower(string(sbx.State)), "sandboxId": sbx.SandboxID, "state": sbx.State, "executionId": sbx.ExecutionID, "lifecycleId": sbx.LifecycleID, "at": sbx.UpdatedAt}}})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet {
+		sbx, err := s.sandbox(r.Context(), sandboxID)
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		pid, err := strconv.Atoi(r.URL.Query().Get("pid"))
+		if err != nil || pid <= 0 || sbx.State != store.SandboxStateRunning {
+			writeProblem(w, r, resourceNotFound, fmt.Errorf("running sandbox and positive pid are required"))
+			return
+		}
+		route, err := s.routeForExecution(r.Context(), sbx)
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		addr := route.PodIP
+		if _, _, splitErr := net.SplitHostPort(addr); splitErr != nil {
+			addr = net.JoinHostPort(addr, strconv.Itoa(protocol.DefaultKtdPort))
+		}
+		logs, err := s.ktdClient.ProcessLogs(r.Context(), addr, sbx.AccessToken, pid)
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, logs)
+		return
+	}
 
 	if len(parts) == 1 {
 		switch r.Method {
@@ -220,10 +609,16 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 			}
 			writeJSON(w, http.StatusOK, publicSandbox(sbx))
 		case http.MethodDelete:
+			sbx, lookupErr := s.sandbox(r.Context(), sandboxID)
+			if lookupErr != nil {
+				writeLifecycleError(w, r, lookupErr)
+				return
+			}
 			if err := s.DeleteSandbox(r.Context(), sandboxID); err != nil {
 				writeLifecycleError(w, r, err)
 				return
 			}
+			s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "sandbox.deleted", publicSandbox(sbx))
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			writeProblem(w, r, methodNotAllowed, nil)
@@ -246,6 +641,7 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 			writeLifecycleError(w, r, err)
 			return
 		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "sandbox.suspended", publicSnapshot(snap))
 		writeJSON(w, http.StatusOK, publicSnapshot(snap))
 	case "resume":
 		sbx, err := s.ResumeSandbox(r.Context(), sandboxID)
@@ -253,6 +649,7 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 			writeLifecycleError(w, r, err)
 			return
 		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "sandbox.resumed", publicSandbox(sbx))
 		writeJSON(w, http.StatusOK, publicSandbox(sbx))
 	case "fork":
 		var fReq ForkSandboxRequest
@@ -263,7 +660,7 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		fReq.RequestKey = r.Header.Get(protocol.HeaderIdempotencyKey)
-		forks, err := s.ForkSandbox(r.Context(), sandboxID, fReq)
+		forks, err := s.ForkSandboxWithResults(r.Context(), sandboxID, fReq)
 		if err != nil {
 			switch {
 			case errors.Is(err, store.ErrTransitionLocked):
@@ -275,13 +672,104 @@ func (s *Server) handleSandboxActions(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		pub := make([]issuedSandbox, 0, len(forks))
-		for _, f := range forks {
-			pub = append(pub, issueSandbox(f))
+		pub := make([]forkChildResponse, 0, len(forks))
+		partial := false
+		for _, result := range forks {
+			item := forkChildResponse{ChildID: result.ChildID}
+			if result.Sandbox != nil {
+				issued := issueSandbox(result.Sandbox)
+				item.Sandbox = &issued
+			}
+			if result.Err != nil {
+				partial = true
+				item.Error = result.Err.Error()
+			}
+			pub = append(pub, item)
 		}
-		writeJSON(w, http.StatusCreated, pub)
+		if partial {
+			s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "sandbox.forked", pub)
+			writeJSON(w, http.StatusMultiStatus, pub)
+			return
+		}
+		legacy := make([]issuedSandbox, 0, len(forks))
+		for _, result := range forks {
+			legacy = append(legacy, issueSandbox(result.Sandbox))
+		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "sandbox.forked", legacy)
+		writeJSON(w, http.StatusCreated, legacy)
+	case "connect":
+		sbx, err := s.sandbox(r.Context(), sandboxID)
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		if sbx.State == store.SandboxStateSuspended {
+			sbx, err = s.ResumeSandbox(r.Context(), sandboxID)
+			if err != nil {
+				writeLifecycleError(w, r, err)
+				return
+			}
+		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "sandbox.connected", publicSandbox(sbx))
+		writeJSON(w, http.StatusOK, issueSandbox(sbx))
+	case "timeout":
+		var timeoutReq UpdateSandboxTimeoutRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&timeoutReq); err != nil {
+			writeProblem(w, r, invalidJSON, err)
+			return
+		}
+		sbx, err := s.UpdateSandboxTimeout(r.Context(), sandboxID, timeoutReq.IdleTimeoutSeconds)
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "sandbox.timeout.updated", publicSandbox(sbx))
+		writeJSON(w, http.StatusOK, publicSandbox(sbx))
+	case "snapshots":
+		var snapshotReq CreateSnapshotRequest
+		if r.Body != nil && r.ContentLength != 0 {
+			if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&snapshotReq); err != nil {
+				writeProblem(w, r, invalidJSON, err)
+				return
+			}
+		}
+		snapshot, err := s.CreatePersistentSnapshot(r.Context(), sandboxID, snapshotReq.SnapshotID)
+		if err != nil {
+			writeLifecycleError(w, r, err)
+			return
+		}
+		s.emitWebhookEvent(r.Context(), tenantID(r.Context()), "sandbox.snapshot.created", publicSnapshot(snapshot))
+		writeJSON(w, http.StatusCreated, publicSnapshot(snapshot))
 	default:
 		writeProblem(w, r, unknownSandboxAction, nil)
+	}
+}
+
+func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
+	sandboxes, err := s.cfg.Meta.ListSandboxes(r.Context())
+	if err != nil {
+		writeLifecycleError(w, r, err)
+		return
+	}
+	counts := make(map[store.SandboxState]int)
+	for _, sandbox := range sandboxes {
+		if visible(r.Context(), sandbox.TenantID) {
+			counts[sandbox.State]++
+		}
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	for _, state := range []store.SandboxState{store.SandboxStateCreating, store.SandboxStateRunning, store.SandboxStateSuspended, store.SandboxStateFailed} {
+		fmt.Fprintf(w, "kontinue_sandboxes{state=%q} %d\n", state, counts[state])
+	}
+	volumes, err := s.cfg.Meta.ListVolumes(r.Context())
+	if err == nil {
+		count := 0
+		for _, volume := range volumes {
+			if visible(r.Context(), volume.TenantID) {
+				count++
+			}
+		}
+		fmt.Fprintf(w, "kontinue_volumes %d\n", count)
 	}
 }
 
@@ -328,6 +816,20 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (_
 	var snap *store.SnapshotRecord
 	baseImage := req.BaseImage
 	tier := req.Tier
+	if req.SnapshotID != "" {
+		snap, err = s.cfg.Meta.GetSnapshot(ctx, req.SnapshotID)
+		if err != nil {
+			retErr = err
+			return nil, err
+		}
+		if snap.Superseded || !s.snapshotVisible(ctx, snap) {
+			return nil, store.ErrNotFound
+		}
+		baseImage = snap.BaseImage
+		if req.TemplateID == "" {
+			req.TemplateID = snap.TemplateID
+		}
+	}
 	if req.TemplateID != "" {
 		tpl, err := s.template(ctx, req.TemplateID)
 		if err != nil {
@@ -337,11 +839,13 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (_
 		if tpl.Phase != "Ready" || tpl.GoldenSnapshotID == "" {
 			return nil, store.ErrTransitionLocked
 		}
-		baseImage = tpl.BaseImage
+		if snap == nil {
+			baseImage = tpl.BaseImage
+		}
 		if tier == "" {
 			tier = tpl.Tier
 		}
-		if tpl.GoldenSnapshotID != "" {
+		if snap == nil && tpl.GoldenSnapshotID != "" {
 			snap, err = s.cfg.Meta.GetSnapshot(ctx, tpl.GoldenSnapshotID)
 			if err != nil {
 				retErr = err
@@ -351,6 +855,14 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (_
 	}
 	if tier == "" {
 		tier = protocol.DefaultCarrierTier
+	}
+	for _, mount := range req.Volumes {
+		if mount.VolumeID == "" || mount.MountPath == "" || !strings.HasPrefix(mount.MountPath, "/") {
+			return nil, fmt.Errorf("volume mounts require a volumeId and absolute mountPath")
+		}
+		if _, err := s.volume(ctx, mount.VolumeID); err != nil {
+			return nil, err
+		}
 	}
 
 	var snapID, bootTok string
@@ -364,11 +876,55 @@ func (s *Server) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (_
 	sbx := &store.SandboxRecord{CreateKey: createKey, CreateRequestHash: requestHash, TenantID: tenantID(ctx), SandboxID: req.SandboxID, TemplateID: req.TemplateID, BaseImage: baseImage, Tier: tier,
 		State: store.SandboxStateCreating, ExecutionID: 1, LifecycleID: "life-" + randHex(6), ActiveSnapshotID: snapID,
 		AccessToken: "kt_live_" + randHex(16), BootstrapToken: bootTok, EnvVars: req.EnvVars, IdleTimeoutSeconds: req.IdleTimeoutSeconds,
-		CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes, AllowFilesystemOnlyFallback: req.AllowFilesystemOnlyFallback}
+		CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes, AllowFilesystemOnlyFallback: req.AllowFilesystemOnlyFallback, Metadata: req.Metadata, Volumes: req.Volumes}
 	if err := s.cfg.Meta.CreateSandbox(ctx, sbx); err != nil {
 		return nil, err
 	}
 	return s.advanceActivation(ctx, sbx, lock)
+}
+
+func (s *Server) UpdateSandboxTimeout(ctx context.Context, sandboxID string, idleTimeoutSeconds int64) (*store.SandboxRecord, error) {
+	if idleTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("idleTimeoutSeconds must be non-negative")
+	}
+	unlock, err := s.lockExecution(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	sbx, err := s.sandbox(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	sbx.IdleTimeoutSeconds = idleTimeoutSeconds
+	if err := s.cfg.Meta.SaveSandbox(ctx, sbx); err != nil {
+		return nil, err
+	}
+	return sbx, nil
+}
+
+func (s *Server) CreatePersistentSnapshot(ctx context.Context, sandboxID, requestedID string) (*store.SnapshotRecord, error) {
+	unlock, err := s.lockExecution(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	sbx, err := s.sandbox(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	if sbx.State != store.SandboxStateRunning {
+		return nil, fmt.Errorf("cannot snapshot sandbox in state %s", sbx.State)
+	}
+	route, err := s.routeForExecution(ctx, sbx)
+	if err != nil {
+		return nil, err
+	}
+	snapshotID := requestedID
+	if snapshotID == "" {
+		snapshotID = "snap-persistent-" + randHex(12)
+	}
+	return s.captureSandbox(ctx, sbx, route, snapshotID, protocol.SnapshotKindPersistent, checkpointCaptureIfMissing)
 }
 
 // A session-scoped lock covers checkpoint, upload and commit, regardless of their duration.
@@ -577,8 +1133,21 @@ func (s *Server) publishCheckpoint(ctx context.Context, prep *protocol.PrepareCh
 
 	}
 
+	snapshotTenant := ""
+	if prep.SandboxID != "" {
+		if source, lookupErr := s.cfg.Meta.GetSandbox(ctx, prep.SandboxID); lookupErr == nil {
+			snapshotTenant = source.TenantID
+		}
+	}
+	if snapshotTenant == "" && prep.TemplateID != "" {
+		if template, lookupErr := s.cfg.Meta.GetTemplate(ctx, prep.TemplateID); lookupErr == nil {
+			snapshotTenant = template.TenantID
+		}
+	}
+
 	snapRec := &store.SnapshotRecord{
 		SnapshotID:       newSnapID,
+		TenantID:         snapshotTenant,
 		Kind:             prep.Kind,
 		TemplateID:       prep.TemplateID,
 		SourceSandboxID:  prep.SandboxID,

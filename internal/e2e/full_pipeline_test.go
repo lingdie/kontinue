@@ -464,9 +464,12 @@ func TestFullPolyglotPipeline_GoldenTemplate_Clone_Fork_Suspend_CrossNodeP2PResu
 		TraceHotPages: true,
 	})
 	tplResp, err := httpClient.Post(apiHTTP.URL+"/v1/templates", "application/json", bytes.NewReader(tplReqBody))
-	if err != nil || tplResp.StatusCode != http.StatusCreated {
+	if err != nil {
+		t.Fatalf("POST /v1/templates failed: %v", err)
+	}
+	if tplResp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(tplResp.Body)
-		t.Fatalf("POST /v1/templates failed (status=%v, err=%v): %s", tplResp.StatusCode, err, string(body))
+		t.Fatalf("POST /v1/templates failed (status=%d): %s", tplResp.StatusCode, string(body))
 	}
 	var createdTpl store.TemplateRecord
 	_ = json.NewDecoder(tplResp.Body).Decode(&createdTpl)

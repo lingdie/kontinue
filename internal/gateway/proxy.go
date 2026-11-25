@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,6 +97,14 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if sandboxID, token := websocketCredentials(r); sandboxID != "" {
+		if r.Header.Get(protocol.HeaderKontinueSandboxID) == "" {
+			r.Header.Set(protocol.HeaderKontinueSandboxID, sandboxID)
+		}
+		if r.Header.Get(protocol.HeaderKontinueToken) == "" {
+			r.Header.Set(protocol.HeaderKontinueToken, token)
+		}
+	}
 	sandboxID, targetPort := g.resolveTarget(r)
 	if sandboxID == "" {
 		http.Error(w, `{"error":"missing sandbox identifier in Host or X-Kontinue-Sandbox-ID"}`, http.StatusBadRequest)
@@ -258,6 +267,24 @@ func (g *Gateway) resolveTarget(r *http.Request) (sandboxID string, port int) {
 		}
 	}
 	return "", port
+}
+
+// websocketCredentials allows browser WebSocket clients to authenticate without
+// custom headers. The client offers a fixed "kontinue" subprotocol plus an
+// auth subprotocol carrying base64url-encoded sandbox ID and access token.
+func websocketCredentials(r *http.Request) (sandboxID, token string) {
+	for _, offered := range strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",") {
+		parts := strings.Split(strings.TrimSpace(offered), ".")
+		if len(parts) != 3 || parts[0] != "kontinue-auth" {
+			continue
+		}
+		id, idErr := base64.RawURLEncoding.DecodeString(parts[1])
+		access, accessErr := base64.RawURLEncoding.DecodeString(parts[2])
+		if idErr == nil && accessErr == nil {
+			return string(id), string(access)
+		}
+	}
+	return "", ""
 }
 
 func (g *Gateway) counterFor(sandboxID string) *atomic.Int64 {
