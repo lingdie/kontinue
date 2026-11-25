@@ -1,0 +1,814 @@
+# 对应提交 05d2fac 的 Kontinue 中文架构走查模型
+# 序列描述中的示例 ID 仅作示意。
+
+resources:
+- name: Go 模块
+  abstract: true
+  color: "#009DB8"
+  icon: Dev/go.svg
+
+- name: Rust 模块
+  abstract: true
+  color: "#B7410E"
+  icon: Dev/rust.svg
+
+- name: 外部服务
+  abstract: true
+  color: DimGray
+  style: dashed
+
+- name: 用户
+  subtitle: 开发者或 Agent 运维人员
+  icon: Networking/user.svg
+
+- name: Agent SDK
+  subtitle: SDK 或 ktctl 调用方
+  instanceOf: Go 模块
+  icon: Dev/go.svg
+  description: |
+    客户端入口，负责创建沙箱、控制生命周期流转，并通过网关发送 exec 或文件操作请求。
+
+- name: Web 客户端
+  subtitle: 浏览器或 Webhook 调用方
+  icon: Networking/browser-search.svg
+  description: |
+    通过网关主机名约定访问沙箱的外部 HTTP 调用方。
+
+- name: Kontinue 控制面
+  style: dashed
+  backgroundColor: "#f5f8ff"
+  icon: Networking/network-hub.svg
+  children:
+  - name: Kontinue API Server
+    subtitle: kontinue-apiserver
+    instanceOf: Go 模块
+    icon: Networking/server-settings.svg
+    description: |
+      无状态生命周期服务，负责持久化沙箱状态、筛选兼容节点、申请 Carrier 槽位、协调检查点以及发布受栅栏保护的路由。
+  - name: Kontinue 网关
+    subtitle: kontinue-gateway
+    instanceOf: Go 模块
+    icon: Networking/router.svg
+    description: |
+      无状态边缘代理，负责通过 Redis 准入请求、使用 singleflight 自动唤醒休眠沙箱，并将流量转发至客体端点。
+
+- name: 元数据与路由存储
+  style: dashed
+  backgroundColor: "#fffaf3"
+  icon: Networking/database-secure.svg
+  children:
+  - name: PostgreSQL
+    subtitle: 生命周期元数据
+    instanceOf: 外部服务
+    icon: Dev/postgresql.svg
+    description: |
+      持久化存储模板、快照、沙箱状态、执行代数（ExecutionID）与分叉回执。
+  - name: Redis 目录
+    subtitle: 路由与 Carrier 池
+    instanceOf: 外部服务
+    icon: Dev/redis.svg
+    description: |
+      热目录存储，保存节点心跳、空闲 Carrier 槽位、活跃路由、准入租约与单调递增执行栅栏。
+
+- name: Kubernetes 基础设施
+  style: dashed
+  backgroundColor: "#f6fbff"
+  icon: Networking/cloud-hosting.svg
+  children:
+  - name: Kubernetes API
+    subtitle: Carrier 池控制
+    instanceOf: 外部服务
+    icon: Networking/cloud-server.svg
+    description: |
+      用于创建和删除 Carrier Pod 的后台控制面。热激活路径绕开调度器与 etcd 热路径。
+  - name: Kubelet
+    subtitle: HTTPS 检查点接口
+    instanceOf: 外部服务
+    icon: Networking/server-settings.svg
+    description: |
+      节点本地 Kubernetes 组件，接收官方检查点请求并转发 CRI RPC。
+
+- name: 工作节点
+  style: dashed
+  backgroundColor: "#f8f8f8"
+  icon: Networking/datacenter.svg
+  children:
+  - name: Kontinue 节点守护进程
+    subtitle: kontinued
+    instanceOf: Go 模块
+    icon: Networking/server.svg
+    description: |
+      节点本地 gRPC 服务，负责槽位激活、释放、检查点执行、恢复日志与路由就绪上报。
+    children:
+    - name: Arena 管理器
+      subtitle: L1 tmpfs、L2 NVMe、L3 ArenaFS
+      instanceOf: Go 模块
+      icon: Networking/data-synchronization.svg
+      description: |
+        选择最快的恢复视图、在本地物化分片，或挂载由节点 P2P 与对象存储支撑的按需加载 ArenaFS 视图。
+      children:
+      - name: L1 Tmpfs
+        subtitle: 固定硬链接视图
+        icon: Networking/hard-drive.svg
+        description: |
+          针对同节点已固定黄金快照的零拷贝恢复视图。
+      - name: L2 NVMe CAS
+        subtitle: 本地分片物化
+        icon: Networking/database-files.svg
+        description: |
+          当快照的全部非零分片均已在本地 CAS 中就绪时使用的磁盘视图。
+      - name: L3 ArenaFS
+        subtitle: 按需 FUSE 视图
+        icon: Networking/database-files.svg
+        description: |
+          基于 FUSE 的视图，按需拉取缺失内存页，并在后台恢复返回后持续提供读取服务。
+    - name: Arena P2P
+      subtitle: 源节点 gRPC 服务
+      instanceOf: Go 模块
+      icon: Networking/computer-link.svg
+      description: |
+        当恢复节点与快照来源节点不同时，跨节点读取快照分片的对等服务。
+  - name: CRI Shim
+    subtitle: kontinue-cri-shim
+    instanceOf: Go 模块
+    icon: Networking/network-switch.svg
+    description: |
+      宿主机 CRI 代理，为 Kubelet PLEG 保留 Carrier 容器身份，并拦截 CheckpointContainer 转交 Kontinue 节点守护进程。
+  - name: Containerd
+    subtitle: containerd.sock
+    instanceOf: 外部服务
+    icon: Networking/server.svg
+    description: |
+      供 CRI shim 执行常规 CRI 操作并维护 Carrier Pod 身份的容器运行时服务。
+  - name: gVisor 包装器
+    subtitle: kontinue-runsc
+    instanceOf: Rust 模块
+    icon: Dev/rust.svg
+    description: |
+      OCI 包装器，负责将沙箱接入 Carrier 网络命名空间、注入恢复视图，并将 start 重写为后台 gVisor 恢复。
+  - name: 本地 CAS
+    subtitle: NVMe 分片存储
+    instanceOf: 外部服务
+    icon: Networking/hard-drive.svg
+    description: |
+      节点本地 BLAKE3 分片存储，供 L2 物化以及缺页中断的首级查询使用。
+
+- name: 客体运行时
+  style: dashed
+  backgroundColor: "#f7fff8"
+  icon: Networking/desktop.svg
+  children:
+  - name: Carrier Pod
+    subtitle: 预热网络与身份外壳
+    instanceOf: 外部服务
+    icon: Networking/cloud-server.svg
+    description: |
+      真实的 Kubernetes Pod，提供稳定的 Pod UID、CNI 网络命名空间、Pod IP 与 Kubelet 可见的容器身份。
+  - name: ktd
+    subtitle: 49983 端口客体 PID 1
+    instanceOf: Rust 模块
+    icon: Dev/rust.svg
+    description: |
+      沙箱内常驻代理，负责执行 HeldInit、密钥注入、身份重置、冻结、解冻、exec、PTY 及文件操作。
+  - name: 工作负载
+    subtitle: Python、Node、浏览器或 Agent 进程树
+    instanceOf: 外部服务
+    icon: Networking/workstation.svg
+    description: |
+      从 gVisor 内存快照恢复并通过 ktd 对外提供服务的租户进程树。
+
+- name: 快照对象存储
+  subtitle: S3 或 MinIO
+  instanceOf: 外部服务
+  icon: Networking/cloud-network-storage.svg
+  description: |
+    共享对象存储，保存快照清单、拆分后的 gVisor 产物与非零 2 MiB BLAKE3 分片。
+
+perspectives:
+- name: 创建沙箱
+  color: "#1525c0"
+  notes: |
+    此视角展示了示例沙箱 sbx-demo-01 的热激活路径。API 先提交生命周期意图，调度放置认领兼容的 Carrier 槽位，节点恢复内存镜像，最后仅在客体就绪后由 API 发布受栅栏保护的路由。示例 ID 仅作示意。
+    #### 其他视角
+    [请求转发] - 通过网关向运行中的客体转发流量。
+
+    [自动唤醒] - 在路由缺失时唤醒已挂起沙箱并服务等待中的请求。
+
+    [挂起沙箱] - 排空流量并捕获拆分式 gVisor 检查点。
+
+    [构建模板] - 预热构建沙箱并发布可复用的黄金快照。
+
+    [运行时拓扑] - 展示调用方、控制面、工作节点、存储与客体之间的跨域依赖。
+
+    [恢复层级] - 对比 L1 tmpfs、L2 NVMe 与 L3 ArenaFS 的依赖关系。
+  sequence:
+    start: 用户
+    steps:
+    - to: Agent SDK
+      label: 请求创建沙箱
+      description: |
+        调用方提交 POST /v1/sandboxes，附带模板、资源配额与环境变量。
+        ##### internal/apiserver/server.go:181
+    - to: Kontinue API Server
+      label: 创建沙箱
+      description: |
+        CreateSandbox 分配沙箱标识、将 ExecutionID 设为 1，并创建持久化的 CREATING 记录。
+        ##### internal/apiserver/server.go:288
+    - to: PostgreSQL
+      label: 保存生命周期意图
+      description: |
+        PostgreSQL 记录沙箱行、活跃快照引用、引导令牌、访问令牌输入与生命周期标识。
+        ##### internal/apiserver/server.go:364
+    - to: Kontinue API Server
+      color: gray
+      label: 意图已保存
+    - to: Redis 目录
+      label: 认领 Carrier 槽位
+      description: |
+        调度放置会过滤不兼容硬件、按快照局部性排序，并通过 Redis Lua SPOP 原子认领一个空闲 Carrier 槽位。
+        ##### internal/apiserver/placement.go:58
+    - to: Kontinue API Server
+      color: gray
+      label: 槽位已分配
+    - subSequence:
+        name: 恢复与启动
+        color: "#e62100"
+        notes: |
+          该阶段将认领到的 Carrier Pod 转化为租户沙箱，同时保留原 Pod 的网络命名空间与 Kubelet 可见身份。
+        steps:
+        - to: Kontinue 节点守护进程
+          label: 激活槽位
+          description: |
+            API 发送 HydrateSlot 请求，包含槽位、快照、执行栅栏、访问令牌与环境变量。
+            ##### internal/apiserver/activation.go:137
+        - to: Arena 管理器
+          label: 准备内存视图
+          description: |
+            节点根据快照局部性选择 L1 硬链接、L2 本地物化或 L3 按需加载的 ArenaFS。
+            ##### internal/node/hydrator/service.go:427
+        - to: 本地 CAS
+          label: 读取本地分片
+          description: |
+            当快照已存在于当前工作节点时，恢复视图直接读取本地 BLAKE3 分片。
+            ##### internal/node/arena/manager.go:564
+        - to: Arena 管理器
+          color: gray
+          label: 视图已就绪
+        - to: gVisor 包装器
+          label: 恢复 gVisor
+          description: |
+            包装器使用恢复视图与 Carrier 网络命名空间启动新的 runsc 实例。
+            ##### internal/node/hydrator/driver_gvisor.go:113
+        - to: ktd
+          label: 执行 HeldInit
+          description: |
+            ktd 校验执行栅栏、轮换访问令牌、注入租户环境变量、重新播种身份标识并解冻客体。
+            ##### internal/node/hydrator/service.go:495
+        - to: 工作负载
+          label: 恢复工作负载
+          description: |
+            解除冻结的 cgroup 后，被恢复的进程树继续运行。
+        - to: ktd
+          color: gray
+          label: 客体就绪
+        - to: gVisor 包装器
+          color: gray
+          label: 恢复完成
+        - to: Arena 管理器
+          color: gray
+          label: 视图已释放
+        - to: Kontinue 节点守护进程
+          color: gray
+          label: 激活回执
+    - to: Kontinue API Server
+      color: gray
+      label: 激活结果
+    - to: PostgreSQL
+      label: 提交 RUNNING 状态
+      description: |
+        节点确认激活后，API 写入节点、槽位、Pod IP、Arena 层级与 RUNNING 状态。
+        ##### internal/apiserver/activation.go:158
+    - to: Kontinue API Server
+      color: gray
+      label: 状态已提交
+    - to: Redis 目录
+      label: 发布受栅栏保护的路由
+      description: |
+        Redis 存储带有 ExecutionID、槽位标识、生命周期标识与访问摘要的路由，防止旧启动覆盖新执行。
+        ##### internal/apiserver/activation.go:170
+    - to: Kontinue API Server
+      color: gray
+      label: 路由已发布
+    - to: Agent SDK
+      color: gray
+      label: 返回访问端点
+    - to: 用户
+      color: gray
+      label: 沙箱就绪
+
+- name: 请求转发
+  color: "#1b5e20"
+  notes: |
+    此视角展示了沙箱处于运行状态后的热请求路径。网关基于 Redis 准入请求、为长连接流续约准入租约，并直接转发至客体 Pod IP，租户数据流量无需经过 PostgreSQL 或 API Server。
+  sequence:
+    start: 用户
+    steps:
+    - to: Agent SDK
+      label: 发送执行请求
+      description: |
+        调用方携带沙箱凭证发送 SDK 或命令执行请求。
+    - to: Kontinue 网关
+      label: 转发请求
+      description: |
+        网关从 Host 或 X-Kontinue-Sandbox-ID 解析沙箱标识并发起路由准入。
+        ##### internal/gateway/proxy.go:92
+    - to: Redis 目录
+      label: 准入路由
+      description: |
+        Redis 校验当前路由归属，并为本次请求创建短时准入租约。
+        ##### internal/gateway/proxy.go:113
+    - to: Kontinue 网关
+      color: gray
+      label: 路由已准入
+    - to: ktd
+      label: 代理至客体
+      description: |
+        反向代理将流量发往路由对应的 Pod IP 与目标端口，同时网关为长连接流自动续约准入租约。
+        ##### internal/gateway/proxy.go:141
+    - to: 工作负载
+      label: 执行操作
+      description: |
+        ktd 将请求分发至已恢复的工作负载进程树执行。
+    - to: ktd
+      color: gray
+      label: 操作结果
+    - to: Kontinue 网关
+      color: gray
+      label: 客体响应
+    - to: Agent SDK
+      color: gray
+      label: SDK 响应
+    - to: 用户
+      color: gray
+      label: 返回结果
+
+- name: 自动唤醒
+  color: "#8a1bba"
+  notes: |
+    此视角展示了示例沙箱 sbx-demo-01 因已挂起而不存在 Redis 路由时的冷边缘唤醒路径。并发请求在网关共享同一次 singleflight 唤醒流程，API 递增 ExecutionID，等待中的请求仅在新的受栅栏保护路由发布后才会被准入放行。
+  sequence:
+    start: 用户
+    steps:
+    - to: Agent SDK
+      label: 发送请求
+      description: |
+        调用方携带访问凭证发送常规沙箱请求。
+    - to: Kontinue 网关
+      label: 解析沙箱
+      description: |
+        网关解析沙箱标识并在联系 API Server 前先查询 Redis。
+        ##### internal/gateway/proxy.go:99
+    - to: Redis 目录
+      label: 查找路由
+      description: |
+        Redis 返回未找到已挂起沙箱的活跃路由。
+        ##### internal/gateway/proxy.go:113
+    - to: Kontinue 网关
+      color: gray
+      label: 路由未命中
+    - to: Kontinue API Server
+      label: 唤醒沙箱
+      description: |
+        网关调用内部唤醒动作。API 获取生命周期锁、递增 ExecutionID 并推进激活流程。
+        ##### internal/gateway/proxy.go:209
+    - to: PostgreSQL
+      label: 加载挂起状态
+      description: |
+        API 读取已挂起的沙箱及其活跃快照，随后分配下一代执行编号。
+        ##### internal/apiserver/server.go:620
+    - to: Kontinue API Server
+      color: gray
+      label: 状态已加载
+    - to: Redis 目录
+      label: 排空旧准入状态
+      description: |
+        API 在认领新槽位前先结束上一执行代的路由与准入状态。
+        ##### internal/apiserver/server.go:638
+    - to: Kontinue API Server
+      color: gray
+      label: 上一代执行已释放
+    - subSequence:
+        name: 跨节点恢复
+        color: "#f57f17"
+        notes: |
+          此处展示跨节点或冷缓存路径；当快照已位于本地节点时，相同流程可止步于 L1 或 L2。
+        steps:
+        - to: Kontinue 节点守护进程
+          label: 激活下一执行代
+          description: |
+            API 将递增后的执行代与挂起快照发送至兼容的工作节点。
+            ##### internal/apiserver/activation.go:141
+        - to: Arena 管理器
+          label: 挂载按需视图
+          description: |
+            L3 ArenaFS 立即打开体积较小的核心产物，并将内存页读取推迟到客体实际访问时触发。
+            ##### internal/node/arena/manager.go:609
+        - to: Arena P2P
+          label: 读取源节点分片
+          description: |
+            跨节点恢复会优先向原节点请求分片，再回退到共享对象存储。
+            ##### internal/node/arena/manager.go:581
+        - to: 快照对象存储
+          label: Range 拉取分片
+          description: |
+            缺失的内存分片由按需页读取器通过 HTTP Range 方式拉取。
+        - to: Arena P2P
+          color: gray
+          label: 分片已返回
+        - to: Arena 管理器
+          color: gray
+          label: 按需视图已就绪
+        - to: gVisor 包装器
+          label: 恢复实例
+          description: |
+            kontinue-runsc 基于恢复视图与 Carrier 网络命名空间创建 gVisor 实例。
+            ##### internal/node/hydrator/driver_gvisor.go:217
+        - to: ktd
+          label: 应用 HeldInit
+          description: |
+            HeldInit 清理模板身份、注入租户密钥并解冻新执行代。
+            ##### internal/node/hydrator/service.go:495
+        - to: 工作负载
+          label: 恢复工作负载运行
+          description: |
+            租户进程树重新恢复对外服务。
+        - to: ktd
+          color: gray
+          label: 客体就绪
+        - to: gVisor 包装器
+          color: gray
+          label: 恢复完成
+        - to: Arena 管理器
+          color: gray
+          label: 视图已释放
+        - to: Kontinue 节点守护进程
+          color: gray
+          label: 激活回执
+    - to: Kontinue API Server
+      color: gray
+      label: 激活已确认
+    - to: PostgreSQL
+      label: 提交恢复状态
+      description: |
+        API 将 RUNNING 状态以及新的执行代和当前节点归属提交到数据库。
+        ##### internal/apiserver/activation.go:161
+    - to: Kontinue API Server
+      color: gray
+      label: 状态已提交
+    - to: Redis 目录
+      label: 发布新路由
+      description: |
+        路由绑定新的执行代、槽位与生命周期标识作为栅栏。
+        ##### internal/apiserver/activation.go:170
+    - to: Kontinue API Server
+      color: gray
+      label: 路由已上线
+    - to: Kontinue 网关
+      color: gray
+      label: 唤醒完成
+    - to: Redis 目录
+      label: 准入恢复后的路由
+      description: |
+        原请求对照刚刚发布的新路由完成准入校验。
+    - to: Kontinue 网关
+      color: gray
+      label: 请求已准入
+    - to: ktd
+      label: 转发等待中的请求
+      description: |
+        网关将请求转发至刚恢复完成的客体。
+        ##### internal/gateway/proxy.go:151
+    - to: 工作负载
+      label: 处理请求
+      description: |
+        工作负载处理请求并返回响应。
+    - to: ktd
+      color: gray
+      label: 响应已就绪
+    - to: Kontinue 网关
+      color: gray
+      label: 响应已转发
+    - to: Agent SDK
+      color: gray
+      label: 响应已返回
+    - to: 用户
+      color: gray
+      label: 返回结果
+
+- name: 挂起沙箱
+  color: "#1b918a"
+  notes: |
+    此视角展示了运行中的沙箱进入 SUSPENDING、捕获拆分式 gVisor 检查点、注册快照并释放 Carrier 槽位的流程。捕获前会先排空路由，防止新请求与检查点产生竞态。
+  sequence:
+    start: 用户
+    steps:
+    - to: Agent SDK
+      label: 请求挂起
+      description: |
+        调用方提交 POST /v1/sandboxes/{id}/suspend。
+    - to: Kontinue API Server
+      label: 挂起沙箱
+      description: |
+        SuspendSandbox 获取执行锁、解析受栅栏保护的路由并开启挂起流转。
+        ##### internal/apiserver/server.go:386
+    - to: Redis 目录
+      label: 排空路由
+      description: |
+        Redis 拒绝新请求准入并等待活跃请求完成后再摘除路由。
+        ##### internal/apiserver/server.go:426
+    - to: Kontinue API Server
+      color: gray
+      label: 路由已排空
+    - to: PostgreSQL
+      label: 标记 SUSPENDING
+      description: |
+        PostgreSQL 记录待提交的会话快照 ID 与中间生命周期状态。
+        ##### internal/apiserver/server.go:434
+    - to: Kontinue API Server
+      color: gray
+      label: 状态流转已保存
+    - subSequence:
+        name: 捕获快照
+        color: "#1525c0"
+        notes: |
+          该阶段保证节点侧检查点操作幂等；发生重试时可直接重放日志化回执，而不会对同一执行代重复捕获。
+        steps:
+        - to: Kontinue 节点守护进程
+          label: 准备检查点
+          description: |
+            API 要求节点绑定当前活跃执行代并预暂存目标快照。
+            ##### internal/apiserver/server.go:560
+        - to: Kontinue API Server
+          color: gray
+          label: 检查点已就绪
+        - to: Kubelet
+          label: 调用检查点接口
+          description: |
+            API 调用节点本地 Kubernetes 检查点接口以导出 Carrier 容器。
+            ##### internal/apiserver/server.go:564
+        - to: CRI Shim
+          label: 转发 CRI 调用
+          description: |
+            CRI shim 拦截 CheckpointContainer 并将拆分式检查点委派给 kontinued。
+            ##### internal/crishim/proxy.go:151
+        - to: Kontinue 节点守护进程
+          label: 执行检查点
+          description: |
+            节点校验槽位归属、调用检查点驱动、切分分片产物并记录结果。
+            ##### internal/node/hydrator/service.go:212
+        - to: ktd
+          label: 冻结客体
+          description: |
+            客体代理在捕获内存镜像前先冻结工作负载 cgroup。
+        - to: gVisor 包装器
+          label: 捕获 gVisor 镜像
+          description: |
+            包装器以无压缩方式执行 runsc checkpoint 并保持进程继续运行。
+            ##### internal/node/hydrator/driver_gvisor.go:239
+        - to: Arena 管理器
+          label: 切分检查点分片
+          description: |
+            Arena helper 对非零 2 MiB 内存页进行哈希，并基于父快照生成清单。
+            ##### internal/node/arena/manager.go:240
+        - to: 快照对象存储
+          label: 上传快照产物
+          description: |
+            节点将清单与分片数据块发布至 S3 或 MinIO。
+        - to: Arena 管理器
+          color: gray
+          label: 上传完成
+        - to: gVisor 包装器
+          color: gray
+          label: 镜像已捕获
+        - to: ktd
+          color: gray
+          label: 客体已冻结
+        - to: Kontinue 节点守护进程
+          color: gray
+          label: 检查点已暂存
+        - to: CRI Shim
+          color: gray
+          label: CRI 响应
+        - to: Kubelet
+          color: gray
+          label: 检查点响应
+        - to: Kontinue API Server
+          color: gray
+          label: 捕获完成
+    - to: PostgreSQL
+      label: 注册快照
+      description: |
+        API 持久化清单元数据、来源节点、父快照、脏页分片与引导令牌。
+        ##### internal/apiserver/server.go:580
+    - to: Kontinue API Server
+      color: gray
+      label: 快照已注册
+    - to: Kontinue 节点守护进程
+      label: 释放 Carrier
+      description: |
+        仅当快照持久化成功且节点返回带栅栏的释放回执后，API 才释放执行槽位。
+        ##### internal/apiserver/server.go:476
+    - to: Kontinue API Server
+      color: gray
+      label: 槽位已释放
+    - to: PostgreSQL
+      label: 提交 SUSPENDED 状态
+      description: |
+        沙箱指向新的会话快照并清空当前活跃槽位分配。
+        ##### internal/apiserver/server.go:458
+    - to: Kontinue API Server
+      color: gray
+      label: 状态已提交
+    - to: Agent SDK
+      color: gray
+      label: 返回挂起响应
+    - to: 用户
+      color: gray
+      label: 沙箱已挂起
+
+- name: 构建模板
+  color: "#f57f17"
+  notes: |
+    此视角展示了 POST /v1/templates 如何构建可复用的黄金内存快照。构建器在冷沙箱中运行预热脚本、捕获拆分镜像、登记快照，并可按需将其预热固定到工作节点的 L1 tmpfs 中。
+  sequence:
+    start: 用户
+    steps:
+    - to: Agent SDK
+      label: 请求构建模板
+      description: |
+        调用方通过 POST /v1/templates 提交基础镜像与预热脚本。
+    - to: Kontinue API Server
+      label: 构建黄金模板
+      description: |
+        BuildGoldenTemplate 创建模板构建记录并启动状态机。
+        ##### internal/apiserver/template.go:15
+    - to: PostgreSQL
+      label: 保存构建状态
+      description: |
+        PostgreSQL 记录构建快照 ID、生命周期 ID 与 Allocating 阶段。
+        ##### internal/apiserver/template.go:29
+    - to: Kontinue API Server
+      color: gray
+      label: 构建已保存
+    - to: Redis 目录
+      label: 认领构建槽位
+      description: |
+        模板构建沿用与沙箱激活相同的兼容节点筛选与 Carrier 槽位分配路径。
+        ##### internal/apiserver/template.go:69
+    - to: Kontinue API Server
+      color: gray
+      label: 槽位已分配
+    - to: Kontinue 节点守护进程
+      label: 启动冷构建器
+      description: |
+        API 使用 RestoreModeCold 激活构建器，并因属于内部构建客体而延迟路由发布。
+        ##### internal/apiserver/template.go:83
+    - to: gVisor 包装器
+      label: 启动 gVisor
+      description: |
+        节点生成 OCI bundle 并启动冷态 gVisor 沙箱。
+    - to: ktd
+      label: 执行预热脚本
+      description: |
+        构建器就绪后，API 通过客体代理执行预热脚本。
+        ##### internal/apiserver/template.go:95
+    - to: 工作负载
+      label: 预热进程树
+      description: |
+        预热脚本启动进程并加载后续克隆可共享的内存页。
+    - to: ktd
+      color: gray
+      label: 预热完成
+    - to: gVisor 包装器
+      color: gray
+      label: 构建器运行中
+    - to: Kontinue 节点守护进程
+      color: gray
+      label: 构建器就绪
+    - to: Kontinue API Server
+      color: gray
+      label: 预热已记录
+    - to: Kontinue 节点守护进程
+      label: 冻结构建器
+      description: |
+        节点协调对构建器客体执行冻结与检查点准备。
+    - to: Arena 管理器
+      label: 摄取检查点
+      description: |
+        节点运行检查点驱动并将原始镜像文件摄取至 Arena。
+        ##### internal/node/hydrator/service.go:297
+    - to: Arena 管理器
+      label: 发布清单
+      description: |
+        Arena 对拆分镜像进行分片，并将清单与分片上传至对象存储。
+        ##### internal/node/arena/manager.go:240
+    - to: 快照对象存储
+      label: 存储黄金产物
+      description: |
+        共享存储持久化黄金快照清单与可复用的非零内存分片。
+    - to: Arena 管理器
+      color: gray
+      label: 产物已持久化
+    - to: Kontinue 节点守护进程
+      color: gray
+      label: 捕获就绪
+    - to: Kontinue API Server
+      color: gray
+      label: 构建器结果
+    - to: PostgreSQL
+      label: 注册黄金快照
+      description: |
+        PostgreSQL 记录黄金快照并将模板阶段更新为 Ready。
+        ##### internal/apiserver/template.go:116
+    - to: Kontinue API Server
+      color: gray
+      label: 模板就绪
+    - to: Agent SDK
+      color: gray
+      label: 返回模板响应
+    - to: 用户
+      color: gray
+      label: 模板可用
+
+- name: 运行时拓扑
+  color: "#306998"
+  orientation: leftToRight
+  defaultArrowLabel: 调用
+  notes: |
+    此视角展示了边缘层、控制面、工作节点、客体、Kubernetes、元数据与快照存储之间的运行时依赖图。层级包含关系由资源树表示，箭头则体现跨边界调用与数据依赖。
+  relations:
+  - from: 用户
+    to: Agent SDK, Web 客户端
+    label: 调用
+    description: |
+      人工或自动化调用方通过 SDK 发起生命周期操作，并通过面向网关的客户端发送租户业务流量。
+  - from: Agent SDK
+    to: Kontinue API Server, Kontinue 网关
+  - from: Web 客户端
+    to: Kontinue 网关
+  - from: Kontinue 网关
+    to: Redis 目录, Kontinue API Server, ktd
+  - from: Kontinue API Server
+    to: PostgreSQL, Redis 目录, Kontinue 节点守护进程, Kubelet, Kubernetes API
+  - from: Kubelet
+    to: CRI Shim
+  - from: CRI Shim
+    to: Containerd, Kontinue 节点守护进程
+  - from: Kontinue 节点守护进程
+    to: CRI Shim, gVisor 包装器, ktd
+  - from: gVisor 包装器
+    to: Arena 管理器, Carrier Pod
+  - from: Arena 管理器
+    to: 本地 CAS, Arena P2P, 快照对象存储
+  - from: Arena P2P
+    to: 快照对象存储
+  - from: ktd
+    to: 工作负载, Carrier Pod
+
+- name: 恢复层级
+  color: "#8a1bba"
+  orientation: topToBottom
+  defaultArrowLabel: 回退至
+  notes: |
+    此视角对比了 PrepareRestoreView 实现的分级恢复策略。调度放置优先考虑本地快照局部性，节点侧则依次选择 L1 固定硬链接、L2 本地 CAS 物化或 L3 ArenaFS 按需读取。
+  relations:
+  - from: Kontinue API Server
+    to: L1 Tmpfs, L2 NVMe CAS, L3 ArenaFS
+    label: 选择恢复路径
+    description: |
+      SelectAndClaimSlot 结合快照局部性与硬件兼容性，在激活前选定工作节点。
+      ##### internal/apiserver/placement.go:58
+  - from: L1 Tmpfs
+    to: gVisor 包装器
+    label: 提供视图
+  - from: L2 NVMe CAS
+    to: 本地 CAS
+    label: 物化自
+  - from: L2 NVMe CAS
+    to: gVisor 包装器
+    label: 提供视图
+  - from: L3 ArenaFS
+    to: Arena P2P, 快照对象存储
+    label: 按需读取页自
+  - from: L3 ArenaFS
+    to: gVisor 包装器
+    label: 提供视图
+  - from: Arena P2P
+    to: 快照对象存储
+    label: 回退至
+  - from: gVisor 包装器
+    to: ktd
+    label: 启动
+  - from: ktd
+    to: 工作负载
+    label: 解冻

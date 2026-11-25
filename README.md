@@ -34,13 +34,13 @@ Suspension drains the route before checkpointing. The split checkpoint is stored
 
 ## Architecture walkthrough
 
-[`ilograph.yaml`](ilograph.yaml) is the source model for the architecture views. It includes resource ownership, external dependencies, the Create Sandbox sequence, the hot Serve Request path, Auto Resume, Suspend Sandbox, Build Template, runtime topology, and restore tiers. The sequence descriptions include the implementation file and line that owns each important transition.
+[`ilograph.yaml`](ilograph.yaml) (and its Chinese counterpart [`ilograph.zh.yaml`](ilograph.zh.yaml)) is the source model for the architecture views. It includes resource ownership, external dependencies, the Create Sandbox sequence, the hot Serve Request path, Auto Resume, Suspend Sandbox, Build Template, runtime topology, and restore tiers. The sequence descriptions include the implementation file and line that owns each important transition.
 
-The standalone landing page embeds the complete standalone HTML export produced by Ilograph. The embedded view keeps the native perspective tray, resource canvas, notes, detail control, walkthrough, and fullscreen controls inside the page. The landing page does not expose the YAML source to visitors. `landing/public/ilograph.html` is the browser artifact and `ilograph.yaml` remains the repository source model used to regenerate it.
+The standalone landing page embeds the complete standalone HTML export produced by Ilograph. The embedded view keeps the native perspective tray, resource canvas, notes, detail control, walkthrough, and fullscreen controls inside the page. The landing page does not expose the YAML source to visitors. `landing/public/ilograph.html` and `landing/public/ilograph.zh.html` are the browser artifacts and `ilograph.yaml` / `ilograph.zh.yaml` remain the repository source models.
 
 ## Standalone landing page
 
-The landing page lives in [`landing/`](landing/) and uses Node.js built-ins only. It serves the UI and proxies `/api/*` to the configured Kontinue API Server, so browser requests stay same-origin while the page talks to a real cluster.
+The landing page lives in [`landing/`](landing/) and uses Node.js built-ins only. It serves the English page at `/` and the Chinese page at `/zh/`, and proxies `/api/*` to the configured Kontinue API Server, so browser requests stay same-origin while the page talks to a real cluster.
 
 Start it against a local API Server:
 
@@ -49,7 +49,7 @@ cd landing
 KONTINUE_API_URL=http://127.0.0.1:8081 npm start
 ```
 
-Open `http://127.0.0.1:3000`. The page runs the following workflow without a setup form.
+Open `http://127.0.0.1:3000` (or `http://127.0.0.1:3000/zh/` for the Chinese version). The page runs the following workflow without a setup form.
 
 1. The Node process connects to the cluster selected by `KONTINUE_API_URL` and injects the configured tenant and trace credentials into upstream requests.
 2. The page checks the API and selects the first `Ready` template from `/v1/templates`.
@@ -66,7 +66,7 @@ KONTINUE_TRACE_ENDPOINTS=http://127.0.0.1:8080,http://127.0.0.1:8081,http://127.
 npm start
 ```
 
-Use `npm run sync-architecture` after updating the repository-level `ilograph.yaml` so the source used for the next official Ilograph HTML export stays aligned with the checked-in model. Replace `landing/public/ilograph.html` with that standalone export after regenerating it in Ilograph.
+Use `npm run sync-architecture` after updating the repository-level `ilograph.yaml` or `ilograph.zh.yaml` so the source used for the next official Ilograph HTML export stays aligned with the checked-in model. Replace `landing/public/ilograph.html` (and regenerate `landing/public/ilograph.zh.html`) when updating the diagrams.
 
 The landing page does not ask visitors for credentials, cluster URLs, trace endpoints, template IDs, or runtime parameters. These values stay in the Node process configuration and are forwarded by the local proxy.
 

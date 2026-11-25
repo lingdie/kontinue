@@ -123,6 +123,58 @@ a {
   text-decoration-color: var(--color-signal-pink);
 }
 
+.lang-switch {
+  display: inline-flex;
+  align-items: center;
+  border: var(--border);
+  background: var(--color-white);
+}
+
+.lang-switch a {
+  padding: 5px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  text-decoration: none;
+  letter-spacing: 0.04em;
+}
+
+.lang-switch a + a {
+  border-left: var(--border);
+}
+
+.lang-switch a.is-current {
+  background: var(--color-black);
+  color: var(--color-white);
+}
+
+.lang-switch a:not(.is-current):hover,
+.lang-switch a:not(.is-current):focus-visible {
+  background: var(--color-yellow);
+  color: var(--color-black);
+}
+
+html[lang="zh-CN"] {
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Inter, system-ui, sans-serif;
+}
+
+html[lang="zh-CN"] .hero h1,
+html[lang="zh-CN"] .section-header h2,
+html[lang="zh-CN"] .workspace-panel-head h3 {
+  letter-spacing: -0.01em;
+  line-height: 1.18;
+}
+
+html[lang="zh-CN"] .section-kicker {
+  letter-spacing: 0.06em;
+}
+
+html[lang="zh-CN"] .path-step strong {
+  font-size: 22px;
+  letter-spacing: 0;
+}
+
 .header-connection {
   min-height: 28px;
   padding-left: 24px;
@@ -1011,6 +1063,11 @@ a {
 
   .site-nav a {
     font-size: 12px;
+  }
+
+  .lang-switch a {
+    padding: 4px 8px;
+    font-size: 10px;
   }
 
   .header-connection {

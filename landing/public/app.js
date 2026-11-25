@@ -1,3 +1,87 @@
+const isZh = (document.documentElement.lang || "").toLowerCase().startsWith("zh");
+
+const copy = isZh
+  ? {
+      inlineLive: "已连接",
+      inlineError: "离线",
+      inlineIdle: "自动连接",
+      dashboardCounts: (running, creating, suspended) => `${running} 运行中 · ${creating} 创建中 · ${suspended} 已挂起`,
+      dashboardStatusError: (status) => `控制台返回状态 ${status}`,
+      templateStatusError: (status) => `模板查询返回状态 ${status}`,
+      noReadyTemplate: "暂无处于 Ready 状态的运行时模板。",
+      connected: "已连接",
+      connectedSummary: (count) => `已连接 · ${count} 个沙箱 · 已选定就绪模板`,
+      ready: "就绪",
+      apiOnline: "API 在线",
+      apiReachable: "API 可达 · 已选定就绪模板",
+      offline: "离线",
+      clusterUnavailable: "当前配置的集群不可用。",
+      phases: { CREATING: "创建中", RUNNING: "运行中", FAILED: "失败" },
+      waiting: "等待中",
+      ptyPlaceholder: "沙箱激活后将自动打开 PTY 终端…",
+      ptyExit: (code) => `已退出 ${code ?? ""}`.trim(),
+      ptyConnectingLog: "正在连接沙箱 PTY 终端…\n",
+      connecting: "连接中",
+      error: "错误",
+      ptyFailedLog: "\nPTY 连接失败。\n",
+      closed: "已关闭",
+      createPersisting: "正在持久化生命周期意图并等待激活…",
+      createWaiting: "API 将等待至客体就绪后返回。",
+      createStatusError: (status) => `创建沙箱返回状态 ${status}`,
+      traceWaitId: "等待 API 响应及其链路 Trace ID。",
+      traceWaitSpans: "等待生命周期 Span 上报。",
+      traceQueryAfter: "激活完成后将自动查询调用链路。",
+      traceUnavailable: "链路信息暂不可用",
+      traceReading: "正在读取 Flight Recorder。",
+      traceStatusError: (status) => `链路查询返回状态 ${status}`,
+      sandboxFilter: "按沙箱过滤",
+      spanCount: (count) => `${count} 个 Span`,
+      traceFooterLive: "来自 /debug/traces 的记录 Span。",
+      traceFooterEmpty: "当前环形缓冲区中暂无匹配的 Span。",
+      noSpansTitle: "未找到链路 Span。",
+      noSpansHint: "请在请求完成后点击刷新重试。",
+    }
+  : {
+      inlineLive: "CONNECTED",
+      inlineError: "OFFLINE",
+      inlineIdle: "AUTO-CONNECT",
+      dashboardCounts: (running, creating, suspended) => `${running} running · ${creating} creating · ${suspended} suspended`,
+      dashboardStatusError: (status) => `Dashboard returned ${status}`,
+      templateStatusError: (status) => `Template lookup returned ${status}`,
+      noReadyTemplate: "No Ready runtime template is available.",
+      connected: "CONNECTED",
+      connectedSummary: (count) => `Connected · ${count} sandboxes · Ready template selected`,
+      ready: "READY",
+      apiOnline: "API online",
+      apiReachable: "API reachable · Ready template selected",
+      offline: "OFFLINE",
+      clusterUnavailable: "The configured cluster is unavailable.",
+      phases: {},
+      waiting: "WAITING",
+      ptyPlaceholder: "Opening a PTY after sandbox activation…",
+      ptyExit: (code) => `EXIT ${code ?? ""}`.trim(),
+      ptyConnectingLog: "Connecting to the sandbox PTY…\n",
+      connecting: "CONNECTING",
+      error: "ERROR",
+      ptyFailedLog: "\nPTY connection failed.\n",
+      closed: "CLOSED",
+      createPersisting: "Persisting lifecycle intent and waiting for activation…",
+      createWaiting: "The API waits until the guest is ready.",
+      createStatusError: (status) => `Sandbox creation returned ${status}`,
+      traceWaitId: "Waiting for the API response and its trace ID.",
+      traceWaitSpans: "Waiting for lifecycle spans.",
+      traceQueryAfter: "The trace will be queried after activation completes.",
+      traceUnavailable: "Trace unavailable",
+      traceReading: "Reading Flight Recorder.",
+      traceStatusError: (status) => `Trace query returned ${status}`,
+      sandboxFilter: "sandbox filter",
+      spanCount: (count) => `${count} spans`,
+      traceFooterLive: "Spans returned by /debug/traces.",
+      traceFooterEmpty: "No matching spans are in the active recorder buffer.",
+      noSpansTitle: "No spans found.",
+      noSpansHint: "Try Refresh after the request completes.",
+    };
+
 const state = {
   apiBase: window.location.origin,
   tenantToken: "",
@@ -75,7 +159,7 @@ function setFeedback(element, message, kind = "") {
 function setConnectionState(kind) {
   elements.connectionDot.className = `connection-dot${kind ? ` is-${kind}` : ""}`;
   if (elements.connectionStateInline) {
-    elements.connectionStateInline.textContent = kind === "live" ? "CONNECTED" : kind === "error" ? "OFFLINE" : "AUTO-CONNECT";
+    elements.connectionStateInline.textContent = kind === "live" ? copy.inlineLive : kind === "error" ? copy.inlineError : copy.inlineIdle;
   }
 }
 
@@ -84,14 +168,14 @@ function renderDashboard(payload) {
   const running = counts.RUNNING || 0;
   const creating = counts.CREATING || 0;
   const suspended = counts.SUSPENDED || 0;
-  elements.dashboardStatus.textContent = `${running} running · ${creating} creating · ${suspended} suspended`;
+  elements.dashboardStatus.textContent = copy.dashboardCounts(running, creating, suspended);
 }
 
 async function loadDashboard() {
   const response = await fetch(apiUrl("/v1/dashboard"), { headers: authHeaders() });
   const payload = await readResponse(response);
   if (!response.ok) {
-    const error = new Error(responseMessage(payload, `Dashboard returned ${response.status}`));
+    const error = new Error(responseMessage(payload, copy.dashboardStatusError(response.status)));
     error.status = response.status;
     throw error;
   }
@@ -106,12 +190,12 @@ async function loadDefaultTemplate() {
   const response = await fetch(apiUrl("/v1/templates"), { headers: authHeaders() });
   const payload = await readResponse(response);
   if (!response.ok) {
-    throw new Error(responseMessage(payload, `Template lookup returned ${response.status}`));
+    throw new Error(responseMessage(payload, copy.templateStatusError(response.status)));
   }
   const templates = Array.isArray(payload) ? payload : payload.templates || [];
   const readyTemplate = templates.find((template) => template.phase === "Ready" && template.templateId);
   if (!readyTemplate) {
-    throw new Error("No Ready runtime template is available.");
+    throw new Error(copy.noReadyTemplate);
   }
   state.templateId = readyTemplate.templateId;
   return state.templateId;
@@ -123,8 +207,8 @@ async function detectConnection() {
     const payload = await loadDashboard();
     await loadDefaultTemplate();
     setConnectionState("live");
-    elements.connectionState.textContent = "CONNECTED";
-    setFeedback(elements.connectionFeedback, `Connected · ${payload.sandboxes?.length || 0} sandboxes · Ready template selected`, "success");
+    elements.connectionState.textContent = copy.connected;
+    setFeedback(elements.connectionFeedback, copy.connectedSummary(payload.sandboxes?.length || 0), "success");
   } catch (error) {
     if (error.status === 404) {
       try {
@@ -132,9 +216,9 @@ async function detectConnection() {
         if (health.ok) {
           await loadDefaultTemplate();
           setConnectionState("live");
-          elements.connectionState.textContent = "READY";
-          elements.dashboardStatus.textContent = "API online";
-          setFeedback(elements.connectionFeedback, "API reachable · Ready template selected", "success");
+          elements.connectionState.textContent = copy.ready;
+          elements.dashboardStatus.textContent = copy.apiOnline;
+          setFeedback(elements.connectionFeedback, copy.apiReachable, "success");
           return;
         }
       } catch {
@@ -142,14 +226,14 @@ async function detectConnection() {
       }
     }
     setConnectionState("error");
-    elements.connectionState.textContent = "OFFLINE";
-    elements.dashboardStatus.textContent = "OFFLINE";
-    setFeedback(elements.connectionFeedback, "The configured cluster is unavailable.", "error");
+    elements.connectionState.textContent = copy.offline;
+    elements.dashboardStatus.textContent = copy.offline;
+    setFeedback(elements.connectionFeedback, copy.clusterUnavailable, "error");
   }
 }
 
 function setCreatePhase(phase, feedback = "") {
-  elements.createState.textContent = phase;
+  elements.createState.textContent = copy.phases[phase] || phase;
   elements.sandboxForm.classList.toggle("is-creating", phase === "CREATING");
   elements.sandboxForm.classList.toggle("is-success", phase === "RUNNING");
   elements.sandboxForm.classList.toggle("is-error", phase === "FAILED");
@@ -209,8 +293,8 @@ function resetTerminal() {
   closePty();
   state.accessToken = "";
   elements.terminal.hidden = true;
-  setTerminalState("WAITING");
-  elements.terminalOutput.textContent = "Opening a PTY after sandbox activation…";
+  setTerminalState(copy.waiting);
+  elements.terminalOutput.textContent = copy.ptyPlaceholder;
   elements.terminalOutput.tabIndex = -1;
 }
 
@@ -230,7 +314,7 @@ async function handlePtyMessage(socket, raw) {
       const message = JSON.parse(value);
       if (message.type === "ready") {
         state.ptyReady = true;
-        setTerminalState("CONNECTED");
+        setTerminalState(copy.connected);
         elements.terminalOutput.tabIndex = 0;
         elements.terminalOutput.focus();
         return;
@@ -238,7 +322,7 @@ async function handlePtyMessage(socket, raw) {
       if (message.type === "exit") {
         state.ptyReady = false;
         elements.terminalOutput.tabIndex = -1;
-        setTerminalState(`EXIT ${message.exitCode ?? ""}`.trim());
+        setTerminalState(copy.ptyExit(message.exitCode));
         return;
       }
     } catch {
@@ -255,8 +339,8 @@ async function openPty() {
   elements.terminal.hidden = false;
   elements.terminal.classList.remove("is-live", "is-error");
   elements.terminal.classList.add("is-opening");
-  elements.terminalOutput.textContent = "Connecting to the sandbox PTY…\n";
-  setTerminalState("CONNECTING");
+  elements.terminalOutput.textContent = copy.ptyConnectingLog;
+  setTerminalState(copy.connecting);
 
   const url = new URL("/api/pty", window.location.href);
   url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -271,7 +355,7 @@ async function openPty() {
   socket.onopen = () => {
     if (state.ptySocket === socket) {
       state.ptyReady = true;
-      setTerminalState("CONNECTED");
+      setTerminalState(copy.connected);
       elements.terminal.classList.remove("is-opening", "is-error");
       elements.terminal.classList.add("is-live");
       elements.terminalOutput.textContent = "";
@@ -286,10 +370,10 @@ async function openPty() {
     if (state.ptySocket === socket) {
       state.ptyReady = false;
       elements.terminalOutput.tabIndex = -1;
-      setTerminalState("ERROR");
+      setTerminalState(copy.error);
       elements.terminal.classList.remove("is-opening", "is-live");
       elements.terminal.classList.add("is-error");
-      appendTerminalOutput("\nPTY connection failed.\n");
+      appendTerminalOutput(copy.ptyFailedLog);
     }
   };
   socket.onclose = () => {
@@ -297,7 +381,7 @@ async function openPty() {
       state.ptyReady = false;
       state.ptySocket = null;
       elements.terminalOutput.tabIndex = -1;
-      setTerminalState("CLOSED");
+      setTerminalState(copy.closed);
       elements.terminal.classList.remove("is-opening", "is-live");
     }
   };
@@ -335,8 +419,8 @@ async function createSandbox(event) {
   event.preventDefault();
   updateConnectionState();
   elements.createButton.disabled = true;
-  setCreatePhase("CREATING", "Persisting lifecycle intent and waiting for activation…");
-  setFeedback(elements.createFeedback, "The API waits until the guest is ready.");
+  setCreatePhase("CREATING", copy.createPersisting);
+  setFeedback(elements.createFeedback, copy.createWaiting);
   clearTrace();
 
   try {
@@ -363,14 +447,14 @@ async function createSandbox(event) {
     });
     const payload = await readResponse(response);
     if (!response.ok) {
-      throw new Error(responseMessage(payload, `Sandbox creation returned ${response.status}`));
+      throw new Error(responseMessage(payload, copy.createStatusError(response.status)));
     }
 
     state.sandboxId = payload.sandboxId || "";
     state.accessToken = payload.accessToken || "";
     state.traceId = response.headers.get("X-Trace-ID") || "";
     setCreatePhase(payload.state || "RUNNING");
-    setFeedback(elements.createFeedback, `${state.sandboxId} · ${payload.state || "RUNNING"}`, "success");
+    setFeedback(elements.createFeedback, `${state.sandboxId} · ${copy.phases[payload.state || "RUNNING"] || payload.state || "RUNNING"}`, "success");
     await openPty();
     if (state.traceId || state.sandboxId) {
       await loadTrace();
@@ -389,22 +473,22 @@ function clearTrace() {
   state.traceId = "";
   state.sandboxId = "";
   elements.refreshTrace.disabled = true;
-  elements.traceIdentity.innerHTML = '<span class="trace-placeholder">Waiting for the API response and its trace ID.</span>';
-  elements.traceWaterfall.innerHTML = '<div class="empty-state"><span class="empty-mark">◌</span><p>Waiting for lifecycle spans.</p><span class="mono">POST /v1/sandboxes</span></div>';
-  elements.traceFooter.firstElementChild.textContent = "The trace will be queried after activation completes.";
+  elements.traceIdentity.innerHTML = `<span class="trace-placeholder">${escapeHtml(copy.traceWaitId)}</span>`;
+  elements.traceWaterfall.innerHTML = `<div class="empty-state"><span class="empty-mark">◌</span><p>${escapeHtml(copy.traceWaitSpans)}</p><span class="mono">POST /v1/sandboxes</span></div>`;
+  elements.traceFooter.firstElementChild.textContent = copy.traceQueryAfter;
   elements.tracePanel.classList.remove("is-live", "is-error");
   resetTerminal();
 }
 
 function showTraceError(message) {
-  elements.traceWaterfall.innerHTML = `<div class="empty-state"><span class="empty-mark trace-error-mark">!</span><p>Trace unavailable</p><span class="mono">${escapeHtml(message)}</span></div>`;
+  elements.traceWaterfall.innerHTML = `<div class="empty-state"><span class="empty-mark trace-error-mark">!</span><p>${escapeHtml(copy.traceUnavailable)}</p><span class="mono">${escapeHtml(message)}</span></div>`;
 }
 
 async function loadTrace() {
   const query = state.traceId ? `trace_id=${encodeURIComponent(state.traceId)}` : `sandbox_id=${encodeURIComponent(state.sandboxId)}`;
   const token = state.traceToken || state.tenantToken;
   elements.refreshTrace.disabled = true;
-  elements.traceWaterfall.innerHTML = '<div class="empty-state"><span class="empty-mark">◌</span><p>Reading Flight Recorder.</p><span class="mono">GET /api/debug/traces</span></div>';
+  elements.traceWaterfall.innerHTML = `<div class="empty-state"><span class="empty-mark">◌</span><p>${escapeHtml(copy.traceReading)}</p><span class="mono">GET /api/debug/traces</span></div>`;
   try {
     const traceHeaders = { ...authHeaders(token) };
     if (state.traceEndpoints) {
@@ -414,7 +498,7 @@ async function loadTrace() {
     const response = await fetch(`${state.apiBase}${tracePath}`, { headers: traceHeaders });
     const payload = await readResponse(response);
     if (!response.ok) {
-      throw new Error(responseMessage(payload, `Trace query returned ${response.status}`));
+      throw new Error(responseMessage(payload, copy.traceStatusError(response.status)));
     }
     renderTrace(payload.spans || []);
     elements.tracePanel.classList.add("is-live");
@@ -428,11 +512,11 @@ async function loadTrace() {
 
 function renderTrace(spans) {
   const sorted = [...spans].sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-  const traceLabel = state.traceId || (sorted[0] && sorted[0].traceId) || "sandbox filter";
-  elements.traceIdentity.innerHTML = `<span class="trace-id-label mono">TRACE</span><span class="trace-id mono">${escapeHtml(traceLabel)}</span><span class="trace-id-label mono">${sorted.length} spans</span>`;
-  elements.traceFooter.firstElementChild.textContent = sorted.length ? "Spans returned by /debug/traces." : "No matching spans are in the active recorder buffer.";
+  const traceLabel = state.traceId || (sorted[0] && sorted[0].traceId) || copy.sandboxFilter;
+  elements.traceIdentity.innerHTML = `<span class="trace-id-label mono">TRACE</span><span class="trace-id mono">${escapeHtml(traceLabel)}</span><span class="trace-id-label mono">${escapeHtml(copy.spanCount(sorted.length))}</span>`;
+  elements.traceFooter.firstElementChild.textContent = sorted.length ? copy.traceFooterLive : copy.traceFooterEmpty;
   if (!sorted.length) {
-    elements.traceWaterfall.innerHTML = '<div class="empty-state"><span class="empty-mark">∅</span><p>No spans found.</p><span class="mono">Try Refresh after the request completes.</span></div>';
+    elements.traceWaterfall.innerHTML = `<div class="empty-state"><span class="empty-mark">∅</span><p>${escapeHtml(copy.noSpansTitle)}</p><span class="mono">${escapeHtml(copy.noSpansHint)}</span></div>`;
     return;
   }
 

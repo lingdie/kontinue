@@ -5,6 +5,6 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "sync-architecture": "cp ../ilograph.yaml public/ilograph.yaml"
+    "sync-architecture": "cp ../ilograph.yaml public/ilograph.yaml && cp ../ilograph.zh.yaml public/ilograph.zh.yaml"
   }
 }

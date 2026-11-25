@@ -33,7 +33,12 @@ function setSecurityHeaders(response) {
 
 function serveStatic(request, response) {
   const requestedPath = new URL(request.url, "http://landing.local").pathname;
-  const requested = requestedPath === "/" ? "/index.html" : requestedPath;
+  let requested = requestedPath;
+  if (requested === "/") {
+    requested = "/index.html";
+  } else if (requested === "/zh" || requested === "/zh/") {
+    requested = "/zh/index.html";
+  }
   const candidate = normalize(join(landingRoot, requested));
   if (!candidate.startsWith(`${landingRoot}${sep}`)) {
     response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
