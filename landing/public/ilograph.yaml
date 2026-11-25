@@ -1,0 +1,815 @@
+# Kontinue architecture walkthrough for commit 05d2fac
+# Example IDs in sequence descriptions are illustrative.
+
+resources:
+- name: Go Module
+  abstract: true
+  color: "#009DB8"
+  icon: Dev/go.svg
+
+- name: Rust Module
+  abstract: true
+  color: "#B7410E"
+  icon: Dev/rust.svg
+
+- name: External Service
+  abstract: true
+  color: DimGray
+  style: dashed
+
+- name: User
+  subtitle: Developer or agent operator
+  icon: Networking/user.svg
+
+- name: Agent SDK
+  subtitle: SDK or ktctl caller
+  instanceOf: Go Module
+  icon: Dev/go.svg
+  description: |
+    Client-side entry point that creates sandboxes, controls lifecycle transitions, and sends exec or filesystem traffic through the Gateway.
+
+- name: Web Client
+  subtitle: Browser or webhook caller
+  icon: Networking/browser-search.svg
+  description: |
+    External HTTP caller that addresses a sandbox through the Gateway host convention.
+
+- name: Kontinue Control Plane
+  style: dashed
+  backgroundColor: "#f5f8ff"
+  icon: Networking/network-hub.svg
+  children:
+  - name: Kontinue API Server
+    subtitle: kontinue-apiserver
+    instanceOf: Go Module
+    icon: Networking/server-settings.svg
+    description: |
+      Stateless lifecycle service that persists sandbox state, selects compatible nodes, claims Carrier slots, coordinates checkpointing, and publishes fenced routes.
+  - name: Kontinue Gateway
+    subtitle: kontinue-gateway
+    instanceOf: Go Module
+    icon: Networking/router.svg
+    description: |
+      Stateless edge proxy that admits requests through Redis, auto-resumes suspended sandboxes with singleflight, and forwards traffic to the guest endpoint.
+
+- name: Metadata and Routing
+  style: dashed
+  backgroundColor: "#fffaf3"
+  icon: Networking/database-secure.svg
+  children:
+  - name: PostgreSQL
+    subtitle: Lifecycle metadata
+    instanceOf: External Service
+    icon: Dev/postgresql.svg
+    description: |
+      Durable store for templates, snapshots, sandbox state, execution generations, and fork receipts.
+  - name: Redis Catalog
+    subtitle: Routes and Carrier pool
+    instanceOf: External Service
+    icon: Dev/redis.svg
+    description: |
+      Hot catalog for node heartbeats, idle Carrier slots, active routes, admission leases, and monotonic execution fences.
+
+- name: Kubernetes Infrastructure
+  style: dashed
+  backgroundColor: "#f6fbff"
+  icon: Networking/cloud-hosting.svg
+  children:
+  - name: Kubernetes API
+    subtitle: Carrier pool control
+    instanceOf: External Service
+    icon: Networking/cloud-server.svg
+    description: |
+      Background control plane used to create and delete Carrier Pods. Warm activation avoids the scheduler and etcd hot path.
+  - name: Kubelet
+    subtitle: HTTPS checkpoint API
+    instanceOf: External Service
+    icon: Networking/server-settings.svg
+    description: |
+      Node-local Kubernetes component that receives the official checkpoint request and forwards the CRI RPC.
+
+- name: Worker Node
+  style: dashed
+  backgroundColor: "#f8f8f8"
+  icon: Networking/datacenter.svg
+  children:
+  - name: Kontinue Node Daemon
+    subtitle: kontinued
+    instanceOf: Go Module
+    icon: Networking/server.svg
+    description: |
+      Node-local gRPC service that owns slot hydration, release, checkpoint execution, recovery journals, and route readiness reports.
+    children:
+    - name: Arena Manager
+      subtitle: L1 tmpfs, L2 NVMe, L3 ArenaFS
+      instanceOf: Go Module
+      icon: Networking/data-synchronization.svg
+      description: |
+        Selects the fastest restore view, materializes local chunks, or mounts a lazy ArenaFS view backed by peer and object-store reads.
+      children:
+      - name: L1 Tmpfs
+        subtitle: Pinned hardlink view
+        icon: Networking/hard-drive.svg
+        description: |
+          Zero-copy view for a pinned golden snapshot on the same worker.
+      - name: L2 NVMe CAS
+        subtitle: Local chunk materialization
+        icon: Networking/database-files.svg
+        description: |
+          Disk-backed view used when every non-zero snapshot chunk is already present in the local CAS.
+      - name: L3 ArenaFS
+        subtitle: Lazy FUSE view
+        icon: Networking/database-files.svg
+        description: |
+          FUSE-backed view that fetches missing pages on demand and keeps serving after background restore returns.
+    - name: Arena P2P
+      subtitle: Origin worker gRPC
+      instanceOf: Go Module
+      icon: Networking/computer-link.svg
+      description: |
+        Cross-node peer reader for snapshot chunks when the restoring worker is different from the snapshot origin.
+  - name: CRI Shim
+    subtitle: kontinue-cri-shim
+    instanceOf: Go Module
+    icon: Networking/network-switch.svg
+    description: |
+      Host CRI proxy that preserves Carrier identity for Kubelet PLEG and intercepts CheckpointContainer for the Kontinue node daemon.
+  - name: Containerd
+    subtitle: containerd.sock
+    instanceOf: External Service
+    icon: Networking/server.svg
+    description: |
+      Runtime service used by the CRI shim for ordinary CRI operations and Carrier Pod identity.
+  - name: gVisor Wrapper
+    subtitle: kontinue-runsc
+    instanceOf: Rust Module
+    icon: Dev/rust.svg
+    description: |
+      OCI wrapper that attaches the sandbox to the Carrier network namespace, injects the restore view, and rewrites start into background gVisor restore.
+  - name: Local CAS
+    subtitle: NVMe chunk store
+    instanceOf: External Service
+    icon: Networking/hard-drive.svg
+    description: |
+      Node-local BLAKE3 chunk store used by L2 materialization and as the first page-fault lookup tier.
+
+- name: Guest Runtime
+  style: dashed
+  backgroundColor: "#f7fff8"
+  icon: Networking/desktop.svg
+  children:
+  - name: Carrier Pod
+    subtitle: Pre-warmed network and identity shell
+    instanceOf: External Service
+    icon: Networking/cloud-server.svg
+    description: |
+      Real Kubernetes Pod that supplies a stable Pod UID, CNI network namespace, Pod IP, and Kubelet-visible container identity.
+  - name: ktd
+    subtitle: Guest PID 1 on port 49983
+    instanceOf: Rust Module
+    icon: Dev/rust.svg
+    description: |
+      In-guest agent that performs HeldInit, secret injection, identity reset, freeze, thaw, exec, PTY, and file operations.
+  - name: Workload
+    subtitle: Python, Node, browser, or agent tree
+    instanceOf: External Service
+    icon: Networking/workstation.svg
+    description: |
+      Tenant process tree resumed from the gVisor memory snapshot and served through ktd.
+
+- name: Snapshot Object Store
+  subtitle: S3 or MinIO
+  instanceOf: External Service
+  icon: Networking/cloud-network-storage.svg
+  description: |
+    Shared object store for manifests, split gVisor artifacts, and non-zero 2 MiB BLAKE3 chunks.
+
+perspectives:
+- name: Create Sandbox
+  color: "#1525c0"
+  notes: |
+    This perspective shows the warm activation path for an example sandbox sbx-demo-01. The API first commits the lifecycle intent, placement claims a compatible Carrier slot, the node restores the memory image, and the API publishes a route only after the guest is ready. The example IDs are illustrative.
+    #### Other Perspectives
+    [Serve Request] - Forward traffic to a running guest through the Gateway.
+
+    [Auto Resume] - Wake a suspended sandbox on a route miss and serve the waiting request.
+
+    [Suspend Sandbox] - Drain traffic and capture a split gVisor checkpoint.
+
+    [Build Template] - Warm a builder guest and publish a reusable golden snapshot.
+
+    [Runtime Topology] - Show cross-domain dependencies between callers, control plane, workers, storage, and guests.
+
+    [Restore Tiers] - Compare L1 tmpfs, L2 NVMe, and L3 ArenaFS dependencies.
+  sequence:
+    start: User
+    steps:
+    - to: Agent SDK
+      label: Request sandbox
+      description: |
+        The caller submits POST /v1/sandboxes with a template, resource limits, and environment variables.
+        ##### internal/apiserver/server.go:181
+    - to: Kontinue API Server
+      label: Create sandbox
+      description: |
+        CreateSandbox allocates the example sandbox identity, sets ExecutionID to 1, and creates the durable CREATING record.
+        ##### internal/apiserver/server.go:288
+    - to: PostgreSQL
+      label: Save lifecycle intent
+      description: |
+        PostgreSQL stores the sandbox row, active snapshot reference, bootstrap token, access token inputs, and lifecycle identifier.
+        ##### internal/apiserver/server.go:364
+    - to: Kontinue API Server
+      color: gray
+      label: Intent saved
+    - to: Redis Catalog
+      label: Claim Carrier slot
+      description: |
+        Placement filters incompatible hardware, ranks snapshot locality, and atomically claims an idle Carrier slot with Redis Lua SPOP.
+        ##### internal/apiserver/placement.go:58
+    - to: Kontinue API Server
+      color: gray
+      label: Slot assigned
+    - subSequence:
+        name: Restore and Boot
+        color: "#e62100"
+        notes: |
+          This phase turns a claimed Carrier Pod into a tenant sandbox while preserving the Pod network namespace and Kubelet-visible identity.
+        steps:
+        - to: Kontinue Node Daemon
+          label: Hydrate slot
+          description: |
+            The API sends HydrateSlot with the slot, snapshot, execution fence, access token, and environment variables.
+            ##### internal/apiserver/activation.go:137
+        - to: Arena Manager
+          label: Prepare memory view
+          description: |
+            The node selects L1 hardlinks, L2 local materialization, or L3 lazy ArenaFS for the snapshot.
+            ##### internal/node/hydrator/service.go:427
+        - to: Local CAS
+          label: Read local chunks
+          description: |
+            The restore view reads local BLAKE3 chunks when the snapshot is available on the worker.
+            ##### internal/node/arena/manager.go:564
+        - to: Arena Manager
+          color: gray
+          label: View ready
+        - to: gVisor Wrapper
+          label: Restore gVisor
+          description: |
+            The wrapper starts a new runsc instance with the restore view and the Carrier network namespace.
+            ##### internal/node/hydrator/driver_gvisor.go:113
+        - to: ktd
+          label: Run HeldInit
+          description: |
+            ktd validates the execution fence, rotates the access token, injects tenant environment, reseeds identity, and thaws the guest.
+            ##### internal/node/hydrator/service.go:495
+        - to: Workload
+          label: Resume workload
+          description: |
+            The restored process tree continues after the frozen cgroup is released.
+        - to: ktd
+          color: gray
+          label: Guest ready
+        - to: gVisor Wrapper
+          color: gray
+          label: Restore complete
+        - to: Arena Manager
+          color: gray
+          label: View released
+        - to: Kontinue Node Daemon
+          color: gray
+          label: Activation receipt
+    - to: Kontinue API Server
+      color: gray
+      label: Activation result
+    - to: PostgreSQL
+      label: Commit RUNNING
+      description: |
+        The API records the node, slot, Pod IP, Arena tier, and running state after the node confirms activation.
+        ##### internal/apiserver/activation.go:158
+    - to: Kontinue API Server
+      color: gray
+      label: State committed
+    - to: Redis Catalog
+      label: Publish fenced route
+      description: |
+        Redis stores the route with ExecutionID, slot identity, lifecycle identity, and access digest so stale starts cannot overwrite newer executions.
+        ##### internal/apiserver/activation.go:170
+    - to: Kontinue API Server
+      color: gray
+      label: Route published
+    - to: Agent SDK
+      color: gray
+      label: Endpoint returned
+    - to: User
+      color: gray
+      label: Sandbox ready
+
+- name: Serve Request
+  color: "#1b5e20"
+  notes: |
+    This perspective details the hot request path after a sandbox is running. The Gateway admits the request against Redis, renews the admission lease for long-lived streams, and forwards directly to the guest Pod IP without sending tenant traffic through PostgreSQL or the API server.
+  sequence:
+    start: User
+    steps:
+    - to: Agent SDK
+      label: Send exec request
+      description: |
+        The caller sends an SDK or exec request with the sandbox credential.
+    - to: Kontinue Gateway
+      label: Forward request
+      description: |
+        The Gateway resolves the sandbox from the host or X-Kontinue-Sandbox-ID and begins route admission.
+        ##### internal/gateway/proxy.go:92
+    - to: Redis Catalog
+      label: Admit route
+      description: |
+        Redis checks the current route owner and creates a short-lived admission lease for the request.
+        ##### internal/gateway/proxy.go:113
+    - to: Kontinue Gateway
+      color: gray
+      label: Route admitted
+    - to: ktd
+      label: Proxy to guest
+      description: |
+        The reverse proxy targets the route Pod IP and requested port while the Gateway renews admission for a long-lived stream.
+        ##### internal/gateway/proxy.go:141
+    - to: Workload
+      label: Execute operation
+      description: |
+        ktd dispatches the request to the restored workload process tree.
+    - to: ktd
+      color: gray
+      label: Operation result
+    - to: Kontinue Gateway
+      color: gray
+      label: Guest response
+    - to: Agent SDK
+      color: gray
+      label: SDK response
+    - to: User
+      color: gray
+      label: Result returned
+
+- name: Auto Resume
+  color: "#8a1bba"
+  notes: |
+    This perspective shows the cold edge path for an example sandbox sbx-demo-01 whose Redis route is absent because it is suspended. Concurrent callers share one Gateway resume flight, the API increments ExecutionID, and the waiting request is admitted only after the new fenced route is published.
+  sequence:
+    start: User
+    steps:
+    - to: Agent SDK
+      label: Send request
+      description: |
+        The caller sends an ordinary sandbox request with the access credential.
+    - to: Kontinue Gateway
+      label: Resolve sandbox
+      description: |
+        The Gateway parses the sandbox identifier and checks Redis before contacting the API server.
+        ##### internal/gateway/proxy.go:99
+    - to: Redis Catalog
+      label: Find route
+      description: |
+        Redis returns no active route for the suspended sandbox.
+        ##### internal/gateway/proxy.go:113
+    - to: Kontinue Gateway
+      color: gray
+      label: Route miss
+    - to: Kontinue API Server
+      label: Resume sandbox
+      description: |
+        The Gateway invokes the internal resume action. The API takes the lifecycle lock, increments ExecutionID, and advances activation.
+        ##### internal/gateway/proxy.go:209
+    - to: PostgreSQL
+      label: Load suspended state
+      description: |
+        The API reads the suspended sandbox and its active snapshot before assigning the next execution generation.
+        ##### internal/apiserver/server.go:620
+    - to: Kontinue API Server
+      color: gray
+      label: State loaded
+    - to: Redis Catalog
+      label: Drain old admission
+      description: |
+        The API finishes the previous execution route and admission state before claiming a new slot.
+        ##### internal/apiserver/server.go:638
+    - to: Kontinue API Server
+      color: gray
+      label: Previous execution released
+    - subSequence:
+        name: Cross-Node Restore
+        color: "#f57f17"
+        notes: |
+          This phase is shown for the cross-node or cold-cache case. The same flow can stop at L1 or L2 when the snapshot is already local.
+        steps:
+        - to: Kontinue Node Daemon
+          label: Hydrate next execution
+          description: |
+            The API sends the incremented execution and suspended snapshot to a compatible worker.
+            ##### internal/apiserver/activation.go:141
+        - to: Arena Manager
+          label: Mount lazy view
+          description: |
+            L3 ArenaFS opens the small core artifacts immediately and defers page reads until the guest touches them.
+            ##### internal/node/arena/manager.go:609
+        - to: Arena P2P
+          label: Read origin chunks
+          description: |
+            A cross-node restore asks the origin worker for chunks before falling back to the shared object store.
+            ##### internal/node/arena/manager.go:581
+        - to: Snapshot Object Store
+          label: Range fetch chunks
+          description: |
+            Missing chunks are fetched by HTTP range through the lazy page reader.
+        - to: Arena P2P
+          color: gray
+          label: Chunk returned
+        - to: Arena Manager
+          color: gray
+          label: Lazy view ready
+        - to: gVisor Wrapper
+          label: Restore instance
+          description: |
+            kontinue-runsc creates the gVisor instance with the restored view and Carrier network namespace.
+            ##### internal/node/hydrator/driver_gvisor.go:217
+        - to: ktd
+          label: Apply HeldInit
+          description: |
+            HeldInit scrubs template identity, injects secrets, and thaws the new execution.
+            ##### internal/node/hydrator/service.go:495
+        - to: Workload
+          label: Continue workload
+          description: |
+            The tenant process tree becomes serving again.
+        - to: ktd
+          color: gray
+          label: Guest ready
+        - to: gVisor Wrapper
+          color: gray
+          label: Restore complete
+        - to: Arena Manager
+          color: gray
+          label: View released
+        - to: Kontinue Node Daemon
+          color: gray
+          label: Activation receipt
+    - to: Kontinue API Server
+      color: gray
+      label: Activation confirmed
+    - to: PostgreSQL
+      label: Commit resumed state
+      description: |
+        The API commits RUNNING with the new execution and current node assignment.
+        ##### internal/apiserver/activation.go:161
+    - to: Kontinue API Server
+      color: gray
+      label: State committed
+    - to: Redis Catalog
+      label: Publish new route
+      description: |
+        The route is fenced by the new execution, slot, and lifecycle identifiers.
+        ##### internal/apiserver/activation.go:170
+    - to: Kontinue API Server
+      color: gray
+      label: Route live
+    - to: Kontinue Gateway
+      color: gray
+      label: Resume complete
+    - to: Redis Catalog
+      label: Admit resumed route
+      description: |
+        The original request is admitted against the newly published route.
+    - to: Kontinue Gateway
+      color: gray
+      label: Request admitted
+    - to: ktd
+      label: Forward waiting request
+      description: |
+        The Gateway forwards the request to the newly restored guest.
+        ##### internal/gateway/proxy.go:151
+    - to: Workload
+      label: Serve request
+      description: |
+        The workload handles the request and returns its response.
+    - to: ktd
+      color: gray
+      label: Response ready
+    - to: Kontinue Gateway
+      color: gray
+      label: Response forwarded
+    - to: Agent SDK
+      color: gray
+      label: Response returned
+    - to: User
+      color: gray
+      label: Result returned
+
+- name: Suspend Sandbox
+  color: "#1b918a"
+  notes: |
+    This perspective shows a running sandbox entering SUSPENDING, capturing a split gVisor checkpoint, registering its snapshot, and releasing the Carrier slot. Route draining happens before capture so new requests cannot race the checkpoint.
+  sequence:
+    start: User
+    steps:
+    - to: Agent SDK
+      label: Request suspend
+      description: |
+        The caller submits POST /v1/sandboxes/{id}/suspend.
+    - to: Kontinue API Server
+      label: Suspend sandbox
+      description: |
+        SuspendSandbox takes the execution lock, resolves the fenced route, and starts the suspend transition.
+        ##### internal/apiserver/server.go:386
+    - to: Redis Catalog
+      label: Drain route
+      description: |
+        Redis refuses new admissions and waits for active requests to leave before the route is removed.
+        ##### internal/apiserver/server.go:426
+    - to: Kontinue API Server
+      color: gray
+      label: Route drained
+    - to: PostgreSQL
+      label: Mark SUSPENDING
+      description: |
+        PostgreSQL stores the pending session snapshot ID and intermediate lifecycle state.
+        ##### internal/apiserver/server.go:434
+    - to: Kontinue API Server
+      color: gray
+      label: Transition saved
+    - subSequence:
+        name: Capture Snapshot
+        color: "#1525c0"
+        notes: |
+          This phase keeps the node-side checkpoint idempotent. A retry can replay a journaled result instead of capturing the same execution twice.
+        steps:
+        - to: Kontinue Node Daemon
+          label: Prepare checkpoint
+          description: |
+            The API asks the node to bind the active execution and stage the target snapshot.
+            ##### internal/apiserver/server.go:560
+        - to: Kontinue API Server
+          color: gray
+          label: Checkpoint prepared
+        - to: Kubelet
+          label: Invoke checkpoint
+          description: |
+            The API calls the node-local Kubernetes checkpoint endpoint for the Carrier container.
+            ##### internal/apiserver/server.go:564
+        - to: CRI Shim
+          label: Forward CRI call
+          description: |
+            The shim intercepts CheckpointContainer and delegates the split checkpoint to kontinued.
+            ##### internal/crishim/proxy.go:151
+        - to: Kontinue Node Daemon
+          label: Execute checkpoint
+          description: |
+            The node verifies slot ownership, runs the checkpoint driver, chunks the artifacts, and records the result.
+            ##### internal/node/hydrator/service.go:212
+        - to: ktd
+          label: Freeze guest
+          description: |
+            The guest agent freezes the workload cgroup before the memory image is captured.
+        - to: gVisor Wrapper
+          label: Capture gVisor image
+          description: |
+            The wrapper runs runsc checkpoint with no compression and leaves the process running.
+            ##### internal/node/hydrator/driver_gvisor.go:239
+        - to: Arena Manager
+          label: Chunk checkpoint
+          description: |
+            The arena helper hashes non-zero 2 MiB pages and builds the manifest against the parent snapshot.
+            ##### internal/node/arena/manager.go:240
+        - to: Snapshot Object Store
+          label: Upload artifacts
+          description: |
+            The node publishes the manifest and chunk blobs to S3 or MinIO.
+        - to: Arena Manager
+          color: gray
+          label: Upload complete
+        - to: gVisor Wrapper
+          color: gray
+          label: Image captured
+        - to: ktd
+          color: gray
+          label: Guest frozen
+        - to: Kontinue Node Daemon
+          color: gray
+          label: Checkpoint staged
+        - to: CRI Shim
+          color: gray
+          label: CRI response
+        - to: Kubelet
+          color: gray
+          label: Checkpoint response
+        - to: Kontinue API Server
+          color: gray
+          label: Capture complete
+    - to: PostgreSQL
+      label: Register snapshot
+      description: |
+        The API persists manifest metadata, origin node, parent snapshot, dirty chunks, and bootstrap token.
+        ##### internal/apiserver/server.go:580
+    - to: Kontinue API Server
+      color: gray
+      label: Snapshot registered
+    - to: Kontinue Node Daemon
+      label: Release Carrier
+      description: |
+        The API releases the execution only after the snapshot is durable and the node returns a fenced release receipt.
+        ##### internal/apiserver/server.go:476
+    - to: Kontinue API Server
+      color: gray
+      label: Slot released
+    - to: PostgreSQL
+      label: Commit SUSPENDED
+      description: |
+        The sandbox points at the new session snapshot and clears its active slot assignment.
+        ##### internal/apiserver/server.go:458
+    - to: Kontinue API Server
+      color: gray
+      label: State committed
+    - to: Agent SDK
+      color: gray
+      label: Suspend response
+    - to: User
+      color: gray
+      label: Sandbox suspended
+
+- name: Build Template
+  color: "#f57f17"
+  notes: |
+    This perspective details how POST /v1/templates creates a reusable golden memory snapshot. The builder runs a warmup script inside a cold sandbox, captures the split image, records the snapshot, and optionally prewarms it into L1 tmpfs on workers.
+  sequence:
+    start: User
+    steps:
+    - to: Agent SDK
+      label: Request template
+      description: |
+        The caller submits a base image and warmup script through POST /v1/templates.
+    - to: Kontinue API Server
+      label: Build golden template
+      description: |
+        BuildGoldenTemplate creates the template build record and starts its phase machine.
+        ##### internal/apiserver/template.go:15
+    - to: PostgreSQL
+      label: Save build state
+      description: |
+        PostgreSQL records the build snapshot ID, lifecycle ID, and Allocating phase.
+        ##### internal/apiserver/template.go:29
+    - to: Kontinue API Server
+      color: gray
+      label: Build saved
+    - to: Redis Catalog
+      label: Claim builder slot
+      description: |
+        The template builder uses the same compatible-node and Carrier-slot placement path as sandbox activation.
+        ##### internal/apiserver/template.go:69
+    - to: Kontinue API Server
+      color: gray
+      label: Slot assigned
+    - to: Kontinue Node Daemon
+      label: Start cold builder
+      description: |
+        The API hydrates the builder with RestoreModeCold and defers route publication because it is an internal build guest.
+        ##### internal/apiserver/template.go:83
+    - to: gVisor Wrapper
+      label: Start gVisor
+      description: |
+        The node creates the OCI bundle and starts the cold gVisor sandbox.
+    - to: ktd
+      label: Run warmup
+      description: |
+        The API executes the warmup script through the guest agent after the builder is ready.
+        ##### internal/apiserver/template.go:95
+    - to: Workload
+      label: Warm process tree
+      description: |
+        The warmup starts the processes and loads the pages that future clones should share.
+    - to: ktd
+      color: gray
+      label: Warmup complete
+    - to: gVisor Wrapper
+      color: gray
+      label: Builder running
+    - to: Kontinue Node Daemon
+      color: gray
+      label: Builder ready
+    - to: Kontinue API Server
+      color: gray
+      label: Warmup recorded
+    - to: Kontinue Node Daemon
+      label: Freeze builder
+      description: |
+        The node coordinates guest freeze and checkpoint preparation for the builder.
+    - to: Arena Manager
+      label: Ingest checkpoint
+      description: |
+        The node runs the checkpoint driver and ingests raw files into the Arena.
+        ##### internal/node/hydrator/service.go:297
+    - to: Arena Manager
+      label: Publish manifest
+      description: |
+        The Arena chunks the split image and publishes the manifest and blobs to the object store.
+        ##### internal/node/arena/manager.go:240
+    - to: Snapshot Object Store
+      label: Store golden artifacts
+      description: |
+        The shared store holds the golden manifest and reusable non-zero memory chunks.
+    - to: Arena Manager
+      color: gray
+      label: Artifacts durable
+    - to: Kontinue Node Daemon
+      color: gray
+      label: Capture ready
+    - to: Kontinue API Server
+      color: gray
+      label: Builder result
+    - to: PostgreSQL
+      label: Register golden snapshot
+      description: |
+        PostgreSQL records the golden snapshot and changes the template phase to Ready.
+        ##### internal/apiserver/template.go:116
+    - to: Kontinue API Server
+      color: gray
+      label: Template ready
+    - to: Agent SDK
+      color: gray
+      label: Template response
+    - to: User
+      color: gray
+      label: Template available
+
+- name: Runtime Topology
+  color: "#306998"
+  orientation: leftToRight
+  defaultArrowLabel: calls
+  notes: |
+    This perspective shows the runtime dependency graph across edge, control plane, worker, guest, Kubernetes, metadata, and snapshot storage. Containment is represented by the resource tree, while these arrows show cross-boundary calls and data dependencies.
+  relations:
+  - from: User
+    to: Agent SDK, Web Client
+    label: invokes
+    description: |
+      Human or automation callers use the SDK for lifecycle operations and use the Gateway-facing client for tenant traffic.
+  - from: Agent SDK
+    to: Kontinue API Server, Kontinue Gateway
+  - from: Web Client
+    to: Kontinue Gateway
+  - from: Kontinue Gateway
+    to: Redis Catalog, Kontinue API Server, ktd
+  - from: Kontinue API Server
+    to: PostgreSQL, Redis Catalog, Kontinue Node Daemon, Kubelet, Kubernetes API
+  - from: Kubelet
+    to: CRI Shim
+  - from: CRI Shim
+    to: Containerd, Kontinue Node Daemon
+  - from: Kontinue Node Daemon
+    to: CRI Shim, gVisor Wrapper, ktd
+  - from: gVisor Wrapper
+    to: Arena Manager, Carrier Pod
+  - from: Arena Manager
+    to: Local CAS, Arena P2P, Snapshot Object Store
+  - from: Arena P2P
+    to: Snapshot Object Store
+  - from: ktd
+    to: Workload, Carrier Pod
+
+- name: Restore Tiers
+  color: "#8a1bba"
+  orientation: topToBottom
+  defaultArrowLabel: falls back to
+  notes: |
+    This perspective compares the restore choices implemented by PrepareRestoreView. Placement prefers local snapshot locality, while the node chooses L1 pinned hardlinks, L2 local CAS materialization, or L3 ArenaFS lazy reads.
+  relations:
+  - from: Kontinue API Server
+    to: L1 Tmpfs, L2 NVMe CAS, L3 ArenaFS
+    label: selects restore
+    description: |
+      SelectAndClaimSlot uses snapshot locality and compatible hardware to choose a worker before hydration.
+      ##### internal/apiserver/placement.go:58
+  - from: L1 Tmpfs
+    to: gVisor Wrapper
+    label: supplies view
+  - from: L2 NVMe CAS
+    to: Local CAS
+    label: materializes from
+  - from: L2 NVMe CAS
+    to: gVisor Wrapper
+    label: supplies view
+  - from: L3 ArenaFS
+    to: Arena P2P, Snapshot Object Store
+    label: reads pages from
+  - from: L3 ArenaFS
+    to: gVisor Wrapper
+    label: supplies view
+  - from: Arena P2P
+    to: Snapshot Object Store
+    label: falls back to
+  - from: gVisor Wrapper
+    to: ktd
+    label: boots
+  - from: ktd
+    to: Workload
+    label: thaws
+

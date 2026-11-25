@@ -311,7 +311,7 @@ Target: after isolating the origin node, time to first instruction on a cold nod
 
 ### M4
 
-Cold Carrier fallback, snapshot reference-count GC, and journaled ownership reconciliation on daemon restart. The gateway admits a recovered execution only while the node renews its ownership report. Incompatible hardware is rejected. There is no filesystem-only restore. `deploy/` and `hack/` are the Kind bundle. [Node recovery](NODE_RECOVERY.md)
+Cold Carrier fallback, snapshot reference-count GC, and journaled ownership reconciliation on daemon restart. The gateway admits a recovered execution only while the node renews its ownership report. Incompatible hardware is rejected unless the opt-in standalone gVisor filesystem-only path is requested. `deploy/` and `hack/` are the Kind bundle. [Node recovery](NODE_RECOVERY.md)
 
 ---
 

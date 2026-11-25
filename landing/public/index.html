@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Kontinue carries a live gVisor process across Kubernetes and lets you inspect the real lifecycle path."
+    />
+    <title>Kontinue — Carry a live process across the cluster</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="header-shell">
+        <a class="brand" href="#top" aria-label="Kontinue home">
+          <span>kontinue</span>
+          <span class="brand-mark" aria-hidden="true">///</span>
+        </a>
+        <nav class="site-nav" aria-label="Main navigation">
+          <a data-nav-link href="#architecture">Architecture</a>
+          <a data-nav-link href="#run">Live lab</a>
+        </nav>
+        <div class="header-connection" aria-label="Cluster connection">
+          <span class="connection-dot" id="connection-dot"></span>
+          <span class="mono" id="connection-state">CONNECTING</span>
+        </div>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="hero section-shell" aria-labelledby="hero-title">
+        <div class="hero-copy" data-reveal>
+          <p class="section-kicker"><span class="section-index">01</span><span>PROCESS CONTINUITY / KUBERNETES</span></p>
+          <h1 id="hero-title">Carry the work.<br /><span class="hero-accent">Keep the state.</span></h1>
+          <p class="hero-intro">
+            Kontinue moves a live gVisor process across workers while its identity, memory and route stay fenced to the same lifecycle.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#run">Launch live lab <span aria-hidden="true">↘</span></a>
+            <a class="text-link" href="#architecture">Read the system map <span aria-hidden="true">→</span></a>
+          </div>
+          <div class="hero-data" aria-label="Runtime details">
+            <div><span class="mono">RUNTIME</span><strong>gVisor</strong></div>
+            <div><span class="mono">ROUTE</span><strong>W3C traceparent</strong></div>
+            <div><span class="mono">FENCE</span><strong>ExecutionID</strong></div>
+          </div>
+        </div>
+
+        <div class="hero-visual" data-reveal aria-label="Live execution path">
+          <div class="visual-head">
+            <span class="accent-label accent-yellow">LIVE EXECUTION</span>
+            <span class="mono">PATH / 04 STATES</span>
+          </div>
+          <div class="execution-path">
+            <span class="path-line" aria-hidden="true"></span>
+            <div class="path-step is-active">
+              <span class="path-number mono">01</span>
+              <div><strong>CREATE</strong><span>intent saved</span></div>
+              <span class="path-signal" aria-hidden="true"></span>
+            </div>
+            <div class="path-step">
+              <span class="path-number mono">02</span>
+              <div><strong>HYDRATE</strong><span>slot claimed</span></div>
+              <span class="path-signal" aria-hidden="true"></span>
+            </div>
+            <div class="path-step">
+              <span class="path-number mono">03</span>
+              <div><strong>RUN</strong><span>route published</span></div>
+              <span class="path-signal" aria-hidden="true"></span>
+            </div>
+            <div class="path-step">
+              <span class="path-number mono">04</span>
+              <div><strong>RESUME</strong><span>state restored</span></div>
+              <span class="path-signal" aria-hidden="true"></span>
+            </div>
+          </div>
+          <div class="visual-foot">
+            <span>PROCESS IDENTITY / PRESERVED</span>
+            <span class="mono">STATE / FENCED</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="architecture section-shell" id="architecture" aria-labelledby="architecture-title">
+        <header class="section-header" data-reveal>
+          <div>
+            <p class="section-kicker"><span class="section-index">02</span><span>ARCHITECTURE</span></p>
+            <h2 id="architecture-title">Every handoff has a visible boundary.</h2>
+          </div>
+          <div class="section-aside">
+            <p>Move through the native Ilograph perspectives to see how a request becomes a running process, a route, a snapshot and a resumed session.</p>
+            <span class="mono">7 PERSPECTIVES / 1 LIFECYCLE</span>
+          </div>
+        </header>
+
+        <div class="architecture-stage" data-reveal>
+          <div class="stage-bar">
+            <span><i class="stage-live-dot" aria-hidden="true"></i>ILOGRAPH / LIVE VIEW</span>
+            <span class="mono">NATIVE HTML EMBED</span>
+          </div>
+          <iframe
+            class="ilograph-embed"
+            id="ilograph-frame"
+            title="Kontinue architecture in Ilograph"
+            src="/ilograph.html"
+            loading="lazy"
+            allowfullscreen
+          ></iframe>
+        </div>
+      </section>
+
+      <section class="live-lab section-shell" id="run" aria-labelledby="run-title">
+        <header class="section-header live-header" data-reveal>
+          <div>
+            <p class="section-kicker"><span class="section-index">03</span><span>INTERACTIVE RUN</span></p>
+            <h2 id="run-title">Press once. Read the whole path.</h2>
+          </div>
+          <div class="connection-summary" aria-label="Cluster connection status">
+            <div class="connection-summary-head">
+              <strong id="connection-feedback" role="status">Connecting to the cluster…</strong>
+              <span class="mono" id="dashboard-status">NOT CONNECTED</span>
+            </div>
+            <span class="mono connection-summary-state">AUTO-CONNECT / NO INPUT / <span id="connection-state-inline">AUTO-CONNECT</span></span>
+          </div>
+        </header>
+
+        <form class="create-bar" id="sandbox-form" data-reveal>
+          <div class="create-context">
+            <span class="step-mark mono">01</span>
+            <div>
+              <span class="control-label mono">DEFAULT RUNTIME</span>
+              <strong>Ready template selected automatically</strong>
+            </div>
+          </div>
+          <div class="create-status">
+            <span class="mono" id="create-state">READY</span>
+            <span class="form-feedback create-feedback" id="create-feedback" role="status"></span>
+          </div>
+          <button class="button button-primary" id="create-button" type="submit">Create sandbox <span aria-hidden="true">↗</span></button>
+        </form>
+
+        <div class="workspace-label" data-reveal>
+          <span><span class="section-index">04</span> RUN WORKSPACE</span>
+          <span class="mono">TRACE + PTY / LIVE</span>
+        </div>
+
+        <div class="workspace-grid">
+          <div class="panel trace-panel" id="trace" data-reveal>
+            <div class="workspace-panel-head">
+              <div>
+                <span class="panel-index mono">TRACE / FLIGHT RECORDER</span>
+                <h3>Lifecycle trace</h3>
+              </div>
+              <button class="source-button" id="refresh-trace" type="button" disabled>Refresh</button>
+            </div>
+            <div class="trace-identity" id="trace-identity">
+              <span class="trace-placeholder">Create a sandbox to inspect its recorded spans.</span>
+            </div>
+            <div class="trace-waterfall" id="trace-waterfall" aria-live="polite">
+              <div class="empty-state">
+                <span class="empty-mark">◎</span>
+                <p>The Flight Recorder will appear here.</p>
+                <span class="mono">POST /v1/sandboxes → trace_id</span>
+              </div>
+            </div>
+            <div class="trace-footer" id="trace-footer">
+              <span>Recorded by the active service ring buffer.</span>
+              <span class="mono">W3C / X-TRACE-ID</span>
+            </div>
+          </div>
+
+          <section class="panel terminal-panel" id="terminal" aria-labelledby="terminal-title" hidden data-reveal>
+            <div class="workspace-panel-head">
+              <div>
+                <span class="panel-index mono">PTY / GATEWAY</span>
+                <h3 id="terminal-title">Enter the sandbox.</h3>
+              </div>
+              <span class="mono panel-state" id="terminal-state">CONNECTING</span>
+            </div>
+            <div class="terminal-prompt mono">CLICK THE TERMINAL AND TYPE</div>
+            <div class="terminal-window" id="terminal-window">
+              <pre class="terminal-output" id="terminal-output" aria-live="polite" aria-label="Terminal shell" tabindex="-1">Opening a PTY after sandbox activation…</pre>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer section-shell">
+      <a class="brand" href="#top" aria-label="Back to top"><span>kontinue</span><span class="brand-mark" aria-hidden="true">///</span></a>
+      <span>Process state with a route.</span>
+      <span class="mono">LIVE LAB / 2026</span>
+    </footer>
+  </body>
+</html>

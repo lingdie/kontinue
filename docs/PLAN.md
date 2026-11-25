@@ -167,7 +167,7 @@ For offline analysis, run `python3 hack/measure-kind-carrier.py --directory tmp/
 | **M1: Single-node snapshot and fast clone** | **100%** | Closed | Kind + gVisor clone **23.7ms–48ms**. User processes are uid 1000. `/v1/pty` is a WebSocket terminal. | Egress allowlist is deferred |
 | **M2: Control plane and auto-resume** | **100%** | Complete | Postgres advisory leader lock and `kt:inflight` idle exemption verified on Kind. | None |
 | **M3: Cross-node ArenaFS, P2P, prefetch** | **95%** | Independent MinIO. The view stays until sandbox release. | 1GB of random data. SHA-256 before and after restore is `2bd667fa429401ad3eba5c13e372b44aba3f7ac5c1ad7ee423d0d7cf8c0e9121`. 515/515 chunks landed on the destination. | First-instruction time is still above the 400ms target |
-| **M4: Fallback, GC, and benchmarks** | **90%** | Cold fallback, physical GC, and node ownership reconciliation are in | Incompatible hardware is rejected. There is no filesystem-only restore. | Multi-tenant nftables and GPU remain deferred |
+| **M4: Fallback, GC, and benchmarks** | **90%** | Cold fallback, physical GC, and node ownership reconciliation are in | Incompatible hardware uses the opt-in standalone filesystem-only path. The CRI overlay remains open. | Multi-tenant nftables and GPU remain deferred |
 
 ---
 
@@ -283,7 +283,7 @@ Working path: template bake, memory clone, exec, files, suspend, resume, fork, g
 - Cold Carrier discovery uses CRI start events with periodic checks to cover missed events.
 - The 1GB random-buffer digest matches before and after restore, and all 515 chunks landed on the destination. The view unmounts when the sandbox is released, and that close deletes the view directory and the staging directory. An interrupted ArenaFS server leaves its allocation quarantined across daemon restart.
 
-Out of scope: heterogeneous filesystem-only restore, `hostNetwork` Carriers, and GPU snapshots. The network allowlist waits.
+Out of scope: CRI-compatible heterogeneous filesystem-only restore, `hostNetwork` Carriers, and GPU snapshots. The standalone gVisor driver supports the opt-in rootfs path. The network allowlist waits.
 
 ### 3.3 Route, verified on Kind on 2026-11-20
 
@@ -310,3 +310,67 @@ Cold create is `API Create → kubelet sync → RunPodSandbox → CNI ADD → pa
 | No | `hostNetwork` Carriers. That breaks one sandbox per netns. | Rejected |
 
 Cilium did not meaningfully change cold-create p50 (about 1.5s). It did improve cold wake (p50 about 680ms).
+
+## 5. E2B capability gap prioritization (2026-11-21)
+
+The following priority decision records the current delivery order. P0 items remain documented for later security work and do not block the next implementation cycle.
+
+### Deferred P0 security work
+
+- Per-sandbox egress allowlists and deny rules, including blocking access to the node Kubernetes API.
+- Secret management outside the guest and short-lived workload identity.
+- A security-boundary decision for moving from gVisor and Carrier Pod isolation to a per-sandbox microVM boundary, or documenting the supported threat model.
+
+### P1 implementation scope
+
+- Stream command stdout and stderr, retain background process output, and add process termination and log retrieval.
+- Add sandbox list, pagination, filtering, metadata, connect, timeout updates, explicit snapshots, and filesystem-only resume modes.
+- Return per-child Fork results and support child-specific lifecycle configuration.
+- Expand the filesystem API with directory operations, streaming transfer, file metadata, watches, and signed upload/download URLs.
+- Add persistent volumes that can outlive a sandbox and attach to later executions.
+
+### P2 product scope
+
+- Add template CLI and SDK workflows, build logs, version tags, build history, and template lifecycle management.
+- Provide Python and TypeScript SDKs with typed errors, retries, and connection helpers.
+- Add user-facing sandbox metrics, logs, lifecycle events, webhooks, and dashboard integration.
+- Evaluate Code Interpreter, Desktop, SSH, cloud bucket mounts, and other higher-level agent scenarios.
+
+## 6. Implementation status (2026-11-21)
+
+The requested delivery order was applied. The three P0 items remain deferred. P1 was implemented first, followed by the P2 foundation work.
+
+### Delivered P1
+
+- [x] `ktd` retains background stdout and stderr, exposes process logs, supports process termination, and provides NDJSON process-log streaming.
+- [x] The guest filesystem API supports stat, directory listing, mkdir, remove, rename, raw streaming read and write, and polling change watches.
+- [x] The API supports sandbox listing with pagination, state and template filters, metadata, connect, timeout updates, explicit persistent snapshots, snapshot restore, lifecycle events, and sandbox log queries.
+- [x] Fork requests accept per-child IDs, environment, metadata, timeout, resource, and volume configuration. Responses include child-specific success or error records when a batch is only partially successful.
+- [x] Persistent volumes have API and metadata-store support, survive sandbox deletion, and attach through gVisor or CRI runtime mounts.
+- [x] Incompatible restore fingerprints can use a filesystem-only rootfs path when enabled. The standalone gVisor driver composes the base rootfs and extracted upper layer.
+
+### Delivered P2 foundation
+
+- [x] Go, Python, and TypeScript clients include typed lifecycle models, API errors, retries, template operations, volume operations, signed file URLs, Webhook management, and sandbox connection helpers.
+- [x] Public SDKs expose E2B-compatible resource entry points. `Sandbox.create`, `Sandbox.connect`, `sandbox.commands`, `sandbox.files`, lifecycle helpers, background command handles, and explicit `E2B` clients are available in Python and TypeScript. Go keeps the existing flat client and adds the same resource operations through `NewE2B` and `Client.Sandboxes`.
+- [x] The three SDKs expose interactive WebSocket PTY sessions with input, resize, kill, output callbacks, ready events, natural exit codes, and cross-process `connect(pid)` reattachment. Browser clients use the `kontinue-auth` subprotocol so the Gateway can authenticate without custom WebSocket headers.
+- [x] `ktctl` includes template create, list, get, rebuild, build history, logs, tags, delete, sandbox list, connect, snapshot, signed file URL, and dashboard summary commands.
+- [x] Prometheus metrics, lifecycle event responses, guest process log queries, signed file transfer URLs, persistent template build logs and history, HMAC-signed Webhook delivery with retries, and a tenant-scoped `/v1/dashboard` summary are exposed.
+
+### Remaining follow-up
+
+- CRI filesystem-only restore currently starts from the base image without the standalone gVisor rootfs overlay. The fallback path needs a CRI-compatible overlay implementation before it is enabled for that driver.
+- Volume durability across nodes depends on the configured worker volume root being backed by shared or replicated storage.
+- Signed file URL verification uses `KONTINUE_FILE_URL_SECRET` when configured. Replicas need the same value for URLs issued by one API replica to work on another.
+- Webhook deliveries are asynchronous and retry three times. Registration and secrets persist in PostgreSQL, while an in-flight delivery does not survive API process loss.
+- Snapshot ownership is persisted with the tenant so a snapshot remains addressable after its source sandbox is deleted. Existing databases receive the tenant column with a `local` default during schema initialization.
+- Rust workspace compilation and tests run through the Docker Rust toolchain. Go tests, Go vet, Python syntax compilation, TypeScript type checking, and diff checks pass in the current workspace.
+
+### Product scenario evaluation
+
+| Scenario | Current path | Product decision |
+| :--- | :--- | :--- |
+| Code Interpreter | `ktd` exec, retained process logs, filesystem streaming, signed file URLs, snapshots, Fork, and persistent Volumes | Usable as the first higher-level integration. Add language-specific helpers and artifact conventions later. |
+| Desktop | PTY and application-port forwarding exist, but there is no framebuffer, input device, or desktop session lifecycle | Requires a separate desktop runtime and browser or VNC integration. |
+| SSH | PTY and command execution exist through the gateway, but there is no SSH server or key lifecycle | Keep gateway auth as the supported path until SSH identity management is designed. |
+| Cloud bucket mounts | Persistent Volumes and signed file transfer exist, but there is no S3 or object-storage mount adapter | Requires a worker-side mount or sync component with tenant credentials. |

@@ -24,3 +24,8 @@ tmp/
 .DS_Store
 .idea/
 .vscode/
+
+# Language runtime artifacts
+__pycache__/
+*.py[cod]
+node_modules/

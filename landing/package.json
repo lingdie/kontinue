@@ -1,0 +1,10 @@
+{
+  "name": "kontinue-landing",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "sync-architecture": "cp ../ilograph.yaml public/ilograph.yaml"
+  }
+}

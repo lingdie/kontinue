@@ -168,7 +168,7 @@ Fork and resume use the same `HydrateSlot` path. Only the snapshot id and execut
 ## 7. Invariants
 
 1. **Warm-pool activation reuses a Carrier.** Carrier replenishment runs in the background. On release, the API keeps the old assignment until it receives a UID-fenced deletion acknowledgement or confirms the old Pod is gone.
-2. **Hardware is a hard filter.** An incompatible CPU or `runsc` version is rejected. There is no filesystem-only restore.
+2. **Hardware is a hard filter.** An incompatible CPU or `runsc` version is rejected unless the caller opts into the standalone gVisor filesystem-only rootfs path.
 3. **Secrets are injected after restore.** They are not in the template `pages.img`.
 4. **`ExecutionID` fences routes, deletes, and `ktd` init.** A stale restore cannot overwrite a newer one.
 5. **Shared reads, private writes.** Instances share L1 and L2 pages. Rootfs writes go to `overlay2=root:self`.
