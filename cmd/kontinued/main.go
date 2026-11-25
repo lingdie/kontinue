@@ -37,6 +37,7 @@ func main() {
 		l1Dir         = flag.String("l1-tmpfs-dir", "/run/kontinue-arena/l1-tmpfs", "L1 tmpfs directory for pinned golden templates")
 		l2Dir         = flag.String("l2-cas-dir", "/var/lib/kontinue-arena/cas", "L2 NVMe CAS chunk directory")
 		viewsDir      = flag.String("views-dir", "/var/lib/kontinue-arena/views", "Restore views & ArenaFS mount root")
+		volumeRoot    = flag.String("volume-root-dir", "/var/lib/kontinue-volumes", "Persistent volume root shared by sandbox executions")
 		arenaHelper   = flag.String("arena-helper", "/usr/local/bin/kontinue-arena-helper", "Path to Rust kontinue-arena-helper binary")
 		runscWrapper  = flag.String("runsc-bin", "/usr/local/bin/kontinue-runsc", "Path to Rust kontinue-runsc wrapper")
 		redisAddr     = flag.String("redis-addr", os.Getenv("REDIS_ADDR"), "Redis address (empty uses in-memory catalog)")
@@ -118,18 +119,20 @@ func main() {
 		RunscStateRoot:  "/run/kontinue/runsc",
 		BundlesDir:      "/var/lib/kontinue-arena/bundles",
 		BaseRootfsCache: "/var/lib/kontinue-arena/base-rootfs",
+		VolumeRootDir:   *volumeRoot,
 	})
 	svc := hydrator.NewService(hydrator.ServiceConfig{
-		Carriers:     criRT,
-		NodeID:       *nodeID,
-		NodeIP:       *nodeIP,
-		NodeGRPCAddr: advertiseGRPC,
-		ScratchDir:   scratch,
-		ShimAdminURL: *shimAdminSock,
-		Fingerprint:  fp,
-		Arena:        arenaMgr,
-		Driver:       driver,
-		Routes:       catalog,
+		Carriers:      criRT,
+		NodeID:        *nodeID,
+		NodeIP:        *nodeIP,
+		NodeGRPCAddr:  advertiseGRPC,
+		ScratchDir:    scratch,
+		VolumeRootDir: *volumeRoot,
+		ShimAdminURL:  *shimAdminSock,
+		Fingerprint:   fp,
+		Arena:         arenaMgr,
+		Driver:        driver,
+		Routes:        catalog,
 	})
 
 	watcher := hydrator.NewCarrierPodWatcher(criRT, catalog, hydrator.WatcherConfig{

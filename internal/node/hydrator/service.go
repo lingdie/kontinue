@@ -37,18 +37,21 @@ type RuntimeDriver interface {
 }
 
 type SwapContainerOptions struct {
-	ContainerID    string
-	ExecutionID    int64
-	LifecycleID    string
-	Slot           protocol.CarrierSlot
-	SandboxID      string
-	BaseImage      string
-	RestoreViewDir string
-	RestoreMode    string
-	BootstrapToken string
-	AccessToken    string
-	CPUMillis      int64
-	MemoryBytes    int64
+	ContainerID      string
+	ExecutionID      int64
+	LifecycleID      string
+	Slot             protocol.CarrierSlot
+	SandboxID        string
+	BaseImage        string
+	RestoreViewDir   string
+	RestoreMode      string
+	BootstrapToken   string
+	AccessToken      string
+	CPUMillis        int64
+	MemoryBytes      int64
+	RootfsOverlayDir string
+	Volumes          []protocol.VolumeMount
+	VolumeRootDir    string
 }
 
 // RoutePublisher updates Redis route records with ExecutionID Lua fencing when a slot goes live.
@@ -66,17 +69,18 @@ type activeSlotState struct {
 }
 
 type ServiceConfig struct {
-	Carriers     runtimeapi.RuntimeServiceClient
-	NodeID       string
-	NodeIP       string
-	NodeGRPCAddr string
-	ScratchDir   string
-	ShimAdminURL string
-	Fingerprint  protocol.CompatibilityFingerprint
-	Arena        *arena.Manager
-	Driver       RuntimeDriver
-	Routes       RoutePublisher
-	KtdClient    *protocol.KtdClient
+	Carriers      runtimeapi.RuntimeServiceClient
+	NodeID        string
+	NodeIP        string
+	NodeGRPCAddr  string
+	ScratchDir    string
+	VolumeRootDir string
+	ShimAdminURL  string
+	Fingerprint   protocol.CompatibilityFingerprint
+	Arena         *arena.Manager
+	Driver        RuntimeDriver
+	Routes        RoutePublisher
+	KtdClient     *protocol.KtdClient
 	// CarrierWatcher is optional; when set, ResyncIdleCarriers forces an immediate idle-pool sync.
 	CarrierWatcher *CarrierPodWatcher
 }
@@ -99,6 +103,9 @@ func NewService(cfg ServiceConfig) *Service {
 	}
 	if cfg.ScratchDir == "" {
 		cfg.ScratchDir = filepath.Join(os.TempDir(), "kontinued-scratch")
+	}
+	if cfg.VolumeRootDir == "" {
+		cfg.VolumeRootDir = "/var/lib/kontinue-volumes"
 	}
 	_ = os.MkdirAll(cfg.ScratchDir, 0o700)
 	return &Service{
@@ -373,6 +380,7 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 
 	var copiedBytes int64
 	var viewDir string
+	var rootfsOverlayDir string
 	arenaTier := "COLD_BOOT"
 	restoreMode := req.RestoreMode
 	if restoreMode == "" {
@@ -456,6 +464,16 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 		if baseImage == "" && mf.BaseImage != "" {
 			baseImage = mf.BaseImage
 		}
+	} else if req.SnapshotID != "" && restoreMode == protocol.RestoreModeFilesystemOnly {
+		rootfsOverlayDir, err = s.cfg.Arena.PrepareFilesystemRootfs(ctx, req.SnapshotID, filepath.Join(s.cfg.ScratchDir, "rootfs-"+st.ContainerID))
+		if err != nil {
+			retErr = fmt.Errorf("prepare filesystem restore: %w", err)
+			return nil, retErr
+		}
+		st.FilesystemRootfsDir = rootfsOverlayDir
+		if err := s.journal.write(st.ownership, false); err != nil {
+			return nil, err
+		}
 	}
 	if bootstrapToken == "" {
 		bootstrapToken = "kontinue-default-bootstrap-token"
@@ -467,18 +485,21 @@ func (s *Service) HydrateSlot(ctx context.Context, req *protocol.HydrateSlotRequ
 	}
 
 	newCID, ktdEndpoint, err := s.cfg.Driver.SwapAndStartSandboxContainer(ctx, SwapContainerOptions{
-		ContainerID:    st.ContainerID,
-		ExecutionID:    req.ExecutionID,
-		LifecycleID:    req.LifecycleID,
-		Slot:           req.Slot,
-		SandboxID:      req.SandboxID,
-		BaseImage:      baseImage,
-		RestoreViewDir: viewDir,
-		RestoreMode:    restoreMode,
-		BootstrapToken: bootstrapToken,
-		AccessToken:    req.AccessToken,
-		CPUMillis:      req.CPUMillis,
-		MemoryBytes:    req.MemoryBytes,
+		ContainerID:      st.ContainerID,
+		ExecutionID:      req.ExecutionID,
+		LifecycleID:      req.LifecycleID,
+		Slot:             req.Slot,
+		SandboxID:        req.SandboxID,
+		BaseImage:        baseImage,
+		RestoreViewDir:   viewDir,
+		RestoreMode:      restoreMode,
+		BootstrapToken:   bootstrapToken,
+		AccessToken:      req.AccessToken,
+		CPUMillis:        req.CPUMillis,
+		MemoryBytes:      req.MemoryBytes,
+		RootfsOverlayDir: rootfsOverlayDir,
+		Volumes:          req.Volumes,
+		VolumeRootDir:    s.cfg.VolumeRootDir,
 	})
 	if err != nil {
 		retErr = fmt.Errorf("swap carrier container: %w", err)
@@ -702,6 +723,11 @@ func (s *Service) persistReleaseReceipt(ctx context.Context, st *activeSlotState
 			return nil, err
 		}
 	}
+	if st.FilesystemRootfsDir != "" {
+		if err := os.RemoveAll(st.FilesystemRootfsDir); err != nil {
+			return nil, err
+		}
+	}
 	response := &protocol.ReleaseSlotResponse{Released: true, Tainted: st.ReleaseTainted, PodUID: st.Slot.PodUID}
 	if err := s.journal.persist(receiptPath, response, false); err != nil {
 		return nil, err
@@ -866,6 +892,7 @@ type CRIRuntimeDriver struct {
 	imageClient   runtimeapi.ImageServiceClient
 	runscBin      string
 	runscRoot     string
+	volumeRootDir string
 }
 
 func NewCRIRuntimeDriver(rt runtimeapi.RuntimeServiceClient, img runtimeapi.ImageServiceClient, runscBin, runscRoot string) *CRIRuntimeDriver {
@@ -880,6 +907,7 @@ func NewCRIRuntimeDriver(rt runtimeapi.RuntimeServiceClient, img runtimeapi.Imag
 		imageClient:   img,
 		runscBin:      runscBin,
 		runscRoot:     runscRoot,
+		volumeRootDir: os.Getenv("KONTINUE_VOLUME_ROOT"),
 	}
 }
 
@@ -904,6 +932,21 @@ func (d *CRIRuntimeDriver) SwapAndStartSandboxContainer(ctx context.Context, opt
 	if opts.Slot.ExpectedContainerHash != "" {
 		labels[protocol.K8sLabelContainerHash] = opts.Slot.ExpectedContainerHash
 	}
+	volumeRoot := opts.VolumeRootDir
+	if volumeRoot == "" {
+		volumeRoot = d.volumeRootDir
+	}
+	var mounts []*runtimeapi.Mount
+	for _, volume := range opts.Volumes {
+		if volume.VolumeID == "" || filepath.Base(volume.VolumeID) != volume.VolumeID || volume.MountPath == "" || !filepath.IsAbs(volume.MountPath) {
+			return "", "", fmt.Errorf("invalid volume mount")
+		}
+		hostPath := filepath.Join(volumeRoot, volume.VolumeID)
+		if err := os.MkdirAll(hostPath, 0o700); err != nil {
+			return "", "", err
+		}
+		mounts = append(mounts, &runtimeapi.Mount{HostPath: hostPath, ContainerPath: volume.MountPath, Readonly: volume.ReadOnly})
+	}
 
 	annotations := telemetry.InjectAnnotations(ctx, map[string]string{
 		protocol.AnnotationSandboxID: opts.SandboxID,
@@ -921,6 +964,7 @@ func (d *CRIRuntimeDriver) SwapAndStartSandboxContainer(ctx context.Context, opt
 			Labels:      labels,
 			Annotations: annotations,
 			LogPath:     opts.Slot.LogPath,
+			Mounts:      mounts,
 			Envs: []*runtimeapi.KeyValue{
 				{Key: "KTD_BOOTSTRAP_TOKEN", Value: opts.BootstrapToken},
 				{Key: "KTD_INITIAL_ACCESS_TOKEN", Value: opts.AccessToken},

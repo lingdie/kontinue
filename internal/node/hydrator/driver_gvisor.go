@@ -27,6 +27,7 @@ type GVisorDriverConfig struct {
 	BaseRootfsCache string
 	CtrBinary       string
 	UseHostNsenter  bool
+	VolumeRootDir   string
 }
 
 // GVisorSandboxDriver runs standalone single-root gVisor sandboxes via Rust `kontinue-runsc`
@@ -52,12 +53,16 @@ func NewGVisorSandboxDriver(cfg GVisorDriverConfig) *GVisorSandboxDriver {
 	if cfg.CtrBinary == "" {
 		cfg.CtrBinary = "ctr"
 	}
+	if cfg.VolumeRootDir == "" {
+		cfg.VolumeRootDir = "/var/lib/kontinue-volumes"
+	}
 	if os.Getenv("KONTINUE_HOST_NSENTER") == "true" {
 		cfg.UseHostNsenter = true
 	}
 	_ = os.MkdirAll(cfg.RunscStateRoot, 0o700)
 	_ = os.MkdirAll(cfg.BundlesDir, 0o700)
 	_ = os.MkdirAll(cfg.BaseRootfsCache, 0o700)
+	_ = os.MkdirAll(cfg.VolumeRootDir, 0o700)
 	return &GVisorSandboxDriver{cfg: cfg}
 }
 
@@ -125,6 +130,19 @@ func (d *GVisorSandboxDriver) SwapAndStartSandboxContainer(ctx context.Context, 
 	if err := os.Mkdir(bundleDir, 0o700); err != nil {
 		return "", "", err
 	}
+	if opts.RestoreMode == protocol.RestoreModeFilesystemOnly && opts.RootfsOverlayDir != "" {
+		isolatedRootfs := filepath.Join(bundleDir, "rootfs")
+		if err := os.MkdirAll(isolatedRootfs, 0o755); err != nil {
+			return "", "", err
+		}
+		if err := d.copyRootfs(ctx, rootfsDir, isolatedRootfs); err != nil {
+			return "", "", err
+		}
+		if err := d.copyRootfs(ctx, opts.RootfsOverlayDir, isolatedRootfs); err != nil {
+			return "", "", err
+		}
+		rootfsDir = isolatedRootfs
+	}
 
 	// The wrapper strips control-plane annotations before runsc compares OCI
 	// specs during restore. Keep ownership outside the checkpointed spec.
@@ -144,6 +162,32 @@ func (d *GVisorSandboxDriver) SwapAndStartSandboxContainer(ctx context.Context, 
 	if opts.RestoreViewDir != "" && opts.RestoreMode == protocol.RestoreModeMemory {
 		annotations[protocol.GVisorAnnotationRestoreHostPath] = opts.RestoreViewDir
 		annotations[protocol.GVisorAnnotationRestoreDirect] = "false"
+	}
+	mounts := []map[string]any{
+		{"destination": "/proc", "type": "proc", "source": "proc"},
+		{"destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": []string{"nosuid", "strictatime", "mode=755"}},
+		{"destination": "/sys", "type": "sysfs", "source": "sysfs", "options": []string{"nosuid", "noexec", "nodev", "ro"}},
+		{"destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": []string{"nosuid", "nodev", "mode=1777"}},
+	}
+	volumeRoot := opts.VolumeRootDir
+	if volumeRoot == "" {
+		volumeRoot = d.cfg.VolumeRootDir
+	}
+	for _, volume := range opts.Volumes {
+		if volume.VolumeID == "" || filepath.Base(volume.VolumeID) != volume.VolumeID || volume.MountPath == "" || !filepath.IsAbs(volume.MountPath) {
+			return "", "", fmt.Errorf("invalid volume mount")
+		}
+		hostPath := filepath.Join(volumeRoot, volume.VolumeID)
+		if err := os.MkdirAll(hostPath, 0o700); err != nil {
+			return "", "", err
+		}
+		options := []string{"rbind", "nosuid", "nodev"}
+		if volume.ReadOnly {
+			options = append(options, "ro")
+		} else {
+			options = append(options, "rw")
+		}
+		mounts = append(mounts, map[string]any{"destination": volume.MountPath, "type": "bind", "source": hostPath, "options": options})
 	}
 
 	namespaces := []map[string]string{
@@ -194,12 +238,7 @@ func (d *GVisorSandboxDriver) SwapAndStartSandboxContainer(ctx context.Context, 
 				"ambient":     defaultCaps(),
 			},
 		},
-		"mounts": []map[string]any{
-			{"destination": "/proc", "type": "proc", "source": "proc"},
-			{"destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": []string{"nosuid", "strictatime", "mode=755"}},
-			{"destination": "/sys", "type": "sysfs", "source": "sysfs", "options": []string{"nosuid", "noexec", "nodev", "ro"}},
-			{"destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": []string{"nosuid", "nodev", "mode=1777"}},
-		},
+		"mounts": mounts,
 		"linux": map[string]any{
 			"namespaces": namespaces,
 		},
@@ -234,6 +273,14 @@ func (d *GVisorSandboxDriver) SwapAndStartSandboxContainer(ctx context.Context, 
 	}
 
 	return cid, fmt.Sprintf("%s:%d", opts.Slot.PodIP, protocol.DefaultKtdPort), nil
+}
+
+func (d *GVisorSandboxDriver) copyRootfs(ctx context.Context, source, target string) error {
+	cmd := d.hostCommand(ctx, "cp", "-a", source+"/.", target+"/")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("copy rootfs %s into %s: %w (%s)", source, target, err, output)
+	}
+	return nil
 }
 
 func (d *GVisorSandboxDriver) CheckpointSandboxContainer(ctx context.Context, containerID, rawOutputDir string, leaveRunning bool) error {

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -741,6 +742,82 @@ func (m *Manager) loadCoreArtifacts(ctx context.Context, mf *protocol.SnapshotMa
 		return nil, nil, err
 	}
 	return ckptBytes, metaBytes, nil
+}
+
+// PrepareFilesystemRootfs extracts the durable filesystem layer for a snapshot.
+// It is used when a memory snapshot cannot run on the selected node fingerprint.
+func (m *Manager) PrepareFilesystemRootfs(ctx context.Context, snapshotID, targetDir string) (string, error) {
+	mf, err := m.ResolveManifest(ctx, snapshotID)
+	if err != nil {
+		return "", err
+	}
+	if mf.RootfsUpperTarHash == "" || mf.RootfsUpperTarSize == 0 {
+		return "", nil
+	}
+	var raw []byte
+	localPath := filepath.Join(m.cfg.L2CASDir, storage.ArtifactKey(snapshotID, protocol.RootfsUpperTar))
+	raw, err = os.ReadFile(localPath)
+	if errors.Is(err, os.ErrNotExist) && m.cfg.RemoteStore != nil {
+		raw, err = m.cfg.RemoteStore.GetBlob(ctx, storage.ArtifactKey(snapshotID, protocol.RootfsUpperTar))
+	}
+	if err != nil {
+		return "", err
+	}
+	if int64(len(raw)) != mf.RootfsUpperTarSize {
+		return "", fmt.Errorf("rootfs layer size mismatch for snapshot %s", snapshotID)
+	}
+	sum := blake3.Sum256(raw)
+	if hex.EncodeToString(sum[:]) != mf.RootfsUpperTarHash {
+		return "", fmt.Errorf("rootfs layer hash mismatch for snapshot %s", snapshotID)
+	}
+	if err := os.RemoveAll(targetDir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		return "", err
+	}
+	reader := tar.NewReader(bytes.NewReader(raw))
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		name := filepath.Clean(header.Name)
+		if name == "." || filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("unsafe rootfs layer path %q", header.Name)
+		}
+		dest := filepath.Join(targetDir, name)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(dest, os.FileMode(header.Mode)&0o777); err != nil {
+				return "", err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+				return "", err
+			}
+			file, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode)&0o777)
+			if err != nil {
+				return "", err
+			}
+			_, copyErr := io.Copy(file, reader)
+			closeErr := file.Close()
+			if err := errors.Join(copyErr, closeErr); err != nil {
+				return "", err
+			}
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+				return "", err
+			}
+			if err := os.Symlink(header.Linkname, dest); err != nil && !errors.Is(err, os.ErrExist) {
+				return "", err
+			}
+		}
+	}
+	return targetDir, nil
 }
 
 // chunkAndDiffGo is the pure-Go 2MiB Blake3 fallback matching crates/kontinue-arena byte-for-byte.
